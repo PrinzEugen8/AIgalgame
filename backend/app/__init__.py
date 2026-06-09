@@ -1,0 +1,2 @@
+"""AI Galgame backend package."""
+

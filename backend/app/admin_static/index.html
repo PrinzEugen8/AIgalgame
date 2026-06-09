@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Galgame 后端管理台</title>
+  <link rel="stylesheet" href="/admin/assets/admin.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">AI Galgame Demo</p>
+        <h1>后端管理台</h1>
+        <p class="subcopy">在这里配置真实在线服务、执行连通性测试，并把电脑后端地址提供给 Android Demo。</p>
+      </div>
+      <div class="pairing">
+        <span>手机连接地址</span>
+        <strong id="serverUrl">加载中...</strong>
+        <small id="adminUrl"></small>
+      </div>
+    </section>
+
+    <section class="status">
+      <div><span>LLM</span><strong id="status-llm">-</strong></div>
+      <div><span>TTS</span><strong id="status-tts">-</strong></div>
+      <div><span>联网搜索</span><strong id="status-search">-</strong></div>
+      <div><span>图片生成</span><strong id="status-image">-</strong></div>
+    </section>
+
+    <section class="grid" id="providerGrid" aria-label="在线服务配置"></section>
+
+    <section class="debug">
+      <div>
+        <p class="eyebrow">验收工具</p>
+        <h2>调试触发</h2>
+      </div>
+      <div class="debug-actions">
+        <button data-debug="/api/debug/run-daily-cycle">触发日程/朋友圈</button>
+        <button data-debug="/api/debug/generate-proactive">生成主动消息</button>
+        <button data-debug="/api/debug/advance-time">模拟时间推进</button>
+      </div>
+      <pre id="debugResult">等待操作...</pre>
+    </section>
+  </main>
+
+  <script src="/admin/assets/admin.js"></script>
+</body>
+</html>
