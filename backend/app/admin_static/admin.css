@@ -54,7 +54,8 @@ button:disabled {
 .hero,
 .debug,
 .status,
-.card {
+.card,
+.manager {
   border: 1px solid rgba(102, 70, 64, 0.14);
   box-shadow: 0 16px 40px rgba(80, 55, 50, 0.08);
 }
@@ -151,7 +152,15 @@ label {
   gap: 18px;
 }
 
+.management-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
 .card,
+.manager,
 .debug {
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.86);
@@ -165,11 +174,19 @@ label {
 }
 
 .card header,
+.manager header,
 .debug {
   display: flex;
   gap: 14px;
   align-items: center;
   justify-content: space-between;
+}
+
+.manager {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
 }
 
 .badge {
@@ -191,6 +208,105 @@ label {
   gap: 6px;
   font-size: 13px;
   font-weight: 700;
+}
+
+label[hidden],
+.model-picker[hidden] {
+  display: none;
+}
+
+.tab-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tab-row button {
+  background: #f1e3dd;
+  color: #5d403b;
+}
+
+.tab-row button.active {
+  background: #df6f8a;
+  color: #fff;
+}
+
+.editor-placeholder {
+  color: #83635c;
+  line-height: 1.7;
+}
+
+.character-form,
+.voice-form {
+  display: grid;
+  gap: 12px;
+}
+
+.character-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.character-form label.wide {
+  grid-column: 1 / -1;
+}
+
+.voice-form {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.voice-form .actions,
+.voice-form .inline-check {
+  align-self: end;
+}
+
+.inline-check {
+  display: flex;
+  min-height: 42px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.inline-check input {
+  width: auto;
+}
+
+.voice-list {
+  display: grid;
+  gap: 10px;
+}
+
+.voice-item {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(102, 70, 64, 0.14);
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff9f6;
+}
+
+.voice-item header {
+  align-items: flex-start;
+}
+
+.voice-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: #735852;
+  font-size: 12px;
+}
+
+.voice-meta span {
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #f1e3dd;
+}
+
+.voice-test {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 8px;
 }
 
 .provider-row {
@@ -220,10 +336,27 @@ label {
   line-height: 1.6;
 }
 
+.field-help,
+.model-picker small {
+  color: #8f716a;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
 .fields,
 .advanced-fields {
   display: grid;
   gap: 12px;
+}
+
+.model-picker {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(102, 70, 64, 0.16);
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff9f6;
 }
 
 input,
@@ -294,7 +427,11 @@ pre {
 @media (max-width: 860px) {
   .hero,
   .grid,
+  .management-grid,
   .status,
+  .character-form,
+  .voice-form,
+  .voice-test,
   .provider-row {
     grid-template-columns: 1fr;
   }

@@ -33,15 +33,30 @@ data class MomentItem(
     val text: String,
     val mediaUrl: String,
     val likes: Int,
-    val comments: List<String>,
+    val likeActors: List<String> = emptyList(),
+    val comments: List<MomentComment>,
     val createdAt: String
+)
+
+data class MomentComment(
+    val actorName: String,
+    val content: String
 )
 
 data class MemoryItem(
     val id: String,
     val layer: String,
     val content: String,
-    val confidence: Double
+    val confidence: Double,
+    val importance: Double = 0.0,
+    val createdAt: String = ""
+)
+
+data class OutfitPlacement(
+    val scale: Float = 1.12f,
+    val offsetX: Float = 0f,
+    val offsetY: Float = 0f,
+    val bottomInset: Float = 48f
 )
 
 data class CalendarItem(

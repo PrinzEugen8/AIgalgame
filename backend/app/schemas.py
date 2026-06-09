@@ -47,6 +47,50 @@ class ProviderTestResult(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class TtsVoiceProfileIn(BaseModel):
+    voice_id: str | None = None
+    provider_id: str = ""
+    label: str = ""
+    speaker: str
+    resource_id: str
+    language: Literal["zh", "ja"] = "zh"
+    enabled: bool = True
+
+
+class TtsVoiceProfileOut(BaseModel):
+    voice_id: str
+    provider_id: str = ""
+    label: str = ""
+    speaker: str
+    resource_id: str
+    language: str = "zh"
+    enabled: bool
+    last_test_ok: bool = False
+    last_test_message: str = ""
+    updated_at: str = ""
+
+
+class CharacterAdminIn(BaseModel):
+    name: str | None = None
+    persona_prompt: str | None = None
+    speech_style: str | None = None
+    relationship_boundary: str | None = None
+    tts_voice_profile_id: str | None = None
+    key_reply_threshold: int | None = None
+
+
+class CharacterAdminOut(BaseModel):
+    character_id: str
+    name: str
+    age_setting: str = "18+"
+    persona_prompt: str
+    speech_style: str
+    relationship_boundary: str
+    tts_voice_type: str = ""
+    tts_voice_profile_id: str = ""
+    key_reply_threshold: int = 75
+
+
 class EventIn(BaseModel):
     event_type: str
     event_id: str | None = None
@@ -88,6 +132,8 @@ class DialoguePayload(BaseModel):
     key_replies: list[ReplyOption] = Field(default_factory=list)
     relation_delta: RelationDelta = Field(default_factory=RelationDelta)
     media_asset_id: str = ""
+    reply_mode: str = "normal"
+    pace_reason: str = ""
 
 
 class AppEventOut(BaseModel):

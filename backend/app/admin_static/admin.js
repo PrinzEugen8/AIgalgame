@@ -9,6 +9,11 @@ const state = {
   presets: {},
   providers: [],
   cards: new Map(),
+  characters: [],
+  voices: [],
+  ttsProviders: [],
+  activeCharacterId: "",
+  editingVoiceId: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -28,6 +33,16 @@ async function api(path, options = {}) {
 
 function pretty(value) {
   return JSON.stringify(value, null, 2);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  }[char]));
 }
 
 function providerList(kind) {
@@ -73,6 +88,9 @@ function createField(field, value) {
   label.className = field.section === "advanced" ? "advanced-field" : "";
   label.dataset.section = field.section;
   label.dataset.name = field.name;
+  if (field.show_when && Object.keys(field.show_when).length) {
+    label.dataset.showWhen = JSON.stringify(field.show_when);
+  }
 
   const title = document.createElement("span");
   title.textContent = field.required ? `${field.label} *` : field.label;
@@ -81,10 +99,11 @@ function createField(field, value) {
   let input;
   if (field.type === "select") {
     input = document.createElement("select");
-    for (const optionValue of field.options || []) {
+    for (const optionItem of field.options || []) {
+      const optionValue = typeof optionItem === "object" ? optionItem.value : optionItem;
       const option = document.createElement("option");
       option.value = optionValue;
-      option.textContent = optionValue;
+      option.textContent = typeof optionItem === "object" ? (optionItem.label || optionValue) : optionValue;
       input.appendChild(option);
     }
     input.value = value || field.default || "";
@@ -110,7 +129,30 @@ function createField(field, value) {
   if (field.placeholder && field.section !== "secret") input.placeholder = field.placeholder;
   if (field.required) input.required = true;
   label.appendChild(input);
+  if (field.help) {
+    const help = document.createElement("small");
+    help.className = "field-help";
+    help.textContent = field.help;
+    label.appendChild(help);
+  }
   return label;
+}
+
+function fieldInput(card, name) {
+  return [...card.querySelectorAll("input, select, textarea")].find((input) => input.dataset.name === name) || null;
+}
+
+function updateConditionalFields(card) {
+  card.querySelectorAll("label[data-show-when]").forEach((label) => {
+    const conditions = JSON.parse(label.dataset.showWhen || "{}");
+    const visible = Object.entries(conditions).every(([name, expected]) => {
+      const input = fieldInput(card, name);
+      if (!input) return false;
+      const value = input.dataset.type === "checkbox" ? String(input.checked) : input.value;
+      return value === String(expected);
+    });
+    label.hidden = !visible;
+  });
 }
 
 function parseFieldValue(input) {
@@ -187,6 +229,9 @@ async function saveProvider(kind, card, test = false) {
     });
     setCardResult(card, result);
     await loadStatus();
+    if (kind === "tts") {
+      await loadVoices();
+    }
   } catch (error) {
     setCardResult(card, { ok: false, message: error.message });
   } finally {
@@ -203,6 +248,9 @@ async function loadModels(kind, card) {
   try {
     const result = await api(`/api/config/providers/models?provider_id=${encodeURIComponent(card.dataset.providerId)}`);
     setCardResult(card, result);
+    if (result.ok && Array.isArray(result.models)) {
+      renderModelPicker(card, result.models);
+    }
   } catch (error) {
     setCardResult(card, { ok: false, message: error.message });
   } finally {
@@ -210,15 +258,40 @@ async function loadModels(kind, card) {
   }
 }
 
+function renderModelPicker(card, models) {
+  const picker = $(".model-picker", card);
+  const select = $(".model-select", card);
+  const input = fieldInput(card, "model");
+  select.innerHTML = "";
+  if (!models.length || !input) {
+    picker.hidden = true;
+    return;
+  }
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    select.appendChild(option);
+  }
+  select.value = models.includes(input.value) ? input.value : models[0];
+  input.value = select.value;
+  picker.hidden = false;
+  select.onchange = () => {
+    input.value = select.value;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+}
+
 function renderFields(card, kind, providerName) {
   const preset = presetFor(kind, providerName);
-  const existing = state.providers.find((item) => item.kind === kind && item.provider === providerName) || currentProvider(kind);
-  card.dataset.providerId = existing && existing.provider === providerName ? existing.provider_id : "";
+  const existing = state.providers.find((item) => item.kind === kind && item.provider === providerName) || null;
+  card.dataset.providerId = existing ? existing.provider_id : "";
   $(".provider-title", card).textContent = preset.label || providerName;
   $(".description", card).textContent = preset.description || "";
   $(".doc-link", card).href = preset.docs || "#";
   $(".doc-link", card).style.display = preset.docs ? "" : "none";
   $(".models", card).style.display = preset.supports_models ? "" : "none";
+  $(".model-picker", card).hidden = true;
 
   const fields = $(".fields", card);
   fields.innerHTML = "";
@@ -231,9 +304,13 @@ function renderFields(card, kind, providerName) {
   const advanced = $(".advanced-fields", card);
   advanced.innerHTML = "";
   advancedFields.forEach((node) => advanced.appendChild(node));
+  card.querySelectorAll("input, select, textarea").forEach((input) => {
+    input.addEventListener("change", () => updateConditionalFields(card));
+  });
+  updateConditionalFields(card);
 
   const badge = $(".badge", card);
-  if (existing && existing.provider === providerName) {
+  if (existing) {
     const missing = [...(existing.missing_secret_fields || []), ...(existing.missing_required_fields || [])];
     badge.textContent = existing.ready ? "已配置" : (missing.length ? `缺少 ${missing.join(", ")}` : "未完成");
     badge.classList.toggle("ok", Boolean(existing.ready));
@@ -251,12 +328,215 @@ function renderFields(card, kind, providerName) {
   }
 }
 
+function voiceProviderOptions(selectedId = "") {
+  const providers = state.ttsProviders.length
+    ? state.ttsProviders
+    : state.providers.filter((item) => item.kind === "tts");
+  const options = ['<option value="">使用当前启用 TTS Provider</option>'];
+  for (const provider of providers) {
+    const label = provider.label || provider.provider_id || provider.provider;
+    const ready = provider.ready ? "已配置" : "未完成";
+    options.push(
+      `<option value="${escapeHtml(provider.provider_id)}" ${provider.provider_id === selectedId ? "selected" : ""}>${escapeHtml(label)} · ${escapeHtml(provider.model || provider.provider)} · ${ready}</option>`
+    );
+  }
+  return options.join("");
+}
+
+function renderCharacterManager() {
+  const tabs = $("#characterTabs");
+  const editor = $("#characterEditor");
+  const status = $("#characterStatus");
+  tabs.innerHTML = "";
+  if (!state.characters.length) {
+    status.textContent = "无角色";
+    editor.textContent = "还没有角色数据。";
+    return;
+  }
+  status.textContent = `${state.characters.length} 个角色`;
+  status.classList.add("ok");
+  if (!state.activeCharacterId || !state.characters.some((item) => item.character_id === state.activeCharacterId)) {
+    state.activeCharacterId = state.characters[0].character_id;
+  }
+  for (const character of state.characters) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = character.name || character.character_id;
+    button.classList.toggle("active", character.character_id === state.activeCharacterId);
+    button.addEventListener("click", () => {
+      state.activeCharacterId = character.character_id;
+      renderCharacterManager();
+    });
+    tabs.appendChild(button);
+  }
+  const character = state.characters.find((item) => item.character_id === state.activeCharacterId);
+  if (!character) return;
+  editor.innerHTML = `
+    <form class="character-form">
+      <label><span>角色名</span><input name="name" value="${escapeHtml(character.name)}"></label>
+      <label><span>特殊回复阈值</span><input name="key_reply_threshold" type="number" min="0" max="100" value="${escapeHtml(character.key_reply_threshold ?? 75)}"></label>
+      <label><span>当前音色</span><select name="tts_voice_profile_id"></select></label>
+      <label><span>兼容旧 voice_type</span><input value="${escapeHtml(character.tts_voice_type || "")}" disabled></label>
+      <label class="wide"><span>角色设定</span><textarea name="persona_prompt">${escapeHtml(character.persona_prompt || "")}</textarea></label>
+      <label class="wide"><span>表达风格</span><textarea name="speech_style">${escapeHtml(character.speech_style || "")}</textarea></label>
+      <label class="wide"><span>关系边界</span><textarea name="relationship_boundary">${escapeHtml(character.relationship_boundary || "")}</textarea></label>
+      <div class="actions">
+        <button type="submit">保存角色设定</button>
+      </div>
+    </form>
+  `;
+  const form = $("form", editor);
+  const voiceSelect = form.elements.tts_voice_profile_id;
+  voiceSelect.innerHTML = `<option value="">未选择：使用旧 voice_type / Provider 默认</option>` + state.voices
+    .map((voice) => `<option value="${escapeHtml(voice.voice_id)}" ${voice.voice_id === character.tts_voice_profile_id ? "selected" : ""}>${escapeHtml(voice.label || voice.speaker)} · ${voice.language === "ja" ? "日文 TTS" : "中文 TTS"}</option>`)
+    .join("");
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = {
+      name: form.elements.name.value.trim(),
+      persona_prompt: form.elements.persona_prompt.value.trim(),
+      speech_style: form.elements.speech_style.value.trim(),
+      relationship_boundary: form.elements.relationship_boundary.value.trim(),
+      tts_voice_profile_id: form.elements.tts_voice_profile_id.value,
+      key_reply_threshold: Number(form.elements.key_reply_threshold.value || 75),
+    };
+    try {
+      const updated = await api(`/api/admin/characters/${encodeURIComponent(character.character_id)}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      state.characters = state.characters.map((item) => item.character_id === updated.character_id ? updated : item);
+      renderCharacterManager();
+    } catch (error) {
+      editor.insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+    }
+  });
+}
+
+function setVoiceForm(voice = null) {
+  const form = $("#voiceForm");
+  state.editingVoiceId = voice ? voice.voice_id : "";
+  form.elements.voice_id.value = voice ? voice.voice_id : "";
+  form.elements.voice_id.disabled = Boolean(voice);
+  form.elements.provider_id.innerHTML = voiceProviderOptions(voice ? voice.provider_id : "");
+  form.elements.label.value = voice ? (voice.label || "") : "";
+  form.elements.speaker.value = voice ? voice.speaker : "";
+  form.elements.resource_id.value = voice ? voice.resource_id : "";
+  form.elements.language.value = voice ? voice.language : "zh";
+  form.elements.enabled.checked = voice ? Boolean(voice.enabled) : true;
+}
+
+function renderVoiceManager() {
+  const status = $("#voiceStatus");
+  const list = $("#voiceList");
+  status.textContent = `${state.voices.length} 个音色`;
+  status.classList.toggle("ok", state.voices.some((voice) => voice.enabled));
+  list.innerHTML = "";
+  if (!state.voices.length) {
+    list.innerHTML = `<div class="editor-placeholder">先添加一个中文或日文音色。日文音色会额外生成日文 TTS 文本，首页仍显示中文。</div>`;
+  }
+  for (const voice of state.voices) {
+    const item = document.createElement("article");
+    item.className = "voice-item";
+    item.innerHTML = `
+      <header>
+        <div>
+          <h3>${escapeHtml(voice.label || voice.speaker)}</h3>
+          <div class="voice-meta">
+            <span>${voice.language === "ja" ? "日文 TTS" : "中文 TTS"}</span>
+            <span>${voice.enabled ? "启用" : "停用"}</span>
+            <span>speaker: ${escapeHtml(voice.speaker)}</span>
+            <span>resource: ${escapeHtml(voice.resource_id)}</span>
+          </div>
+        </div>
+        <span class="badge ${voice.last_test_ok ? "ok" : ""}">${voice.last_test_message ? (voice.last_test_ok ? "测试通过" : "测试失败") : "未测试"}</span>
+      </header>
+      <small>${escapeHtml(voice.last_test_message || "还没有测试结果")}</small>
+      <div class="voice-test">
+        <input data-test-text value="${voice.language === "ja" ? "今日は少し声を聞かせたいです。" : "今天也想听你说说话。"}">
+        <button type="button" data-action="edit">编辑</button>
+        <button type="button" class="secondary" data-action="test">测试</button>
+        <button type="button" class="secondary" data-action="delete">删除</button>
+      </div>
+    `;
+    item.querySelector('[data-action="edit"]').addEventListener("click", () => setVoiceForm(voice));
+    item.querySelector('[data-action="test"]').addEventListener("click", () => testVoice(voice.voice_id, item.querySelector("[data-test-text]").value));
+    item.querySelector('[data-action="delete"]').addEventListener("click", () => deleteVoice(voice.voice_id));
+    list.appendChild(item);
+  }
+  setVoiceForm(state.editingVoiceId ? state.voices.find((voice) => voice.voice_id === state.editingVoiceId) : null);
+}
+
+async function saveVoice(event) {
+  event.preventDefault();
+  const form = $("#voiceForm");
+  const payload = {
+    voice_id: form.elements.voice_id.value.trim(),
+    provider_id: form.elements.provider_id.value,
+    label: form.elements.label.value.trim(),
+    speaker: form.elements.speaker.value.trim(),
+    resource_id: form.elements.resource_id.value.trim(),
+    language: form.elements.language.value,
+    enabled: form.elements.enabled.checked,
+  };
+  const editing = Boolean(state.editingVoiceId);
+  const path = editing ? `/api/admin/tts-voices/${encodeURIComponent(state.editingVoiceId)}` : "/api/admin/tts-voices";
+  try {
+    const saved = await api(path, { method: editing ? "PUT" : "POST", body: JSON.stringify(payload) });
+    $("#voiceResult").textContent = pretty(saved);
+    await loadVoices();
+    await loadCharacters();
+  } catch (error) {
+    $("#voiceResult").textContent = pretty({ ok: false, message: error.message });
+  }
+}
+
+async function testVoice(voiceId, text) {
+  try {
+    const result = await api(`/api/admin/tts-voices/${encodeURIComponent(voiceId)}/test`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    $("#voiceResult").textContent = pretty(result);
+    await loadVoices();
+  } catch (error) {
+    $("#voiceResult").textContent = pretty({ ok: false, message: error.message });
+  }
+}
+
+async function deleteVoice(voiceId) {
+  if (!window.confirm("确定删除这个音色？角色中引用它的设置会被清空。")) return;
+  try {
+    const result = await api(`/api/admin/tts-voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" });
+    $("#voiceResult").textContent = pretty(result);
+    await loadVoices();
+    await loadCharacters();
+  } catch (error) {
+    $("#voiceResult").textContent = pretty({ ok: false, message: error.message });
+  }
+}
+
+async function loadVoices() {
+  const payload = await api("/api/admin/tts-voices");
+  state.voices = payload.items || [];
+  state.ttsProviders = payload.providers || [];
+  renderVoiceManager();
+}
+
+async function loadCharacters() {
+  const payload = await api("/api/admin/characters");
+  state.characters = payload.items || [];
+  renderCharacterManager();
+}
+
 function renderCards() {
   const grid = $("#providerGrid");
   grid.innerHTML = "";
+  state.cards.clear();
   for (const kind of kinds) {
     const card = document.createElement("article");
     card.className = "card";
+    card.dataset.kind = kind.id;
     const current = currentProvider(kind.id);
     const presets = providerList(kind.id);
     const selected = current ? current.provider : (presets[0] || {}).provider;
@@ -275,6 +555,10 @@ function renderCards() {
       <h3 class="provider-title"></h3>
       <p class="description"></p>
       <div class="fields"></div>
+      <div class="model-picker" hidden>
+        <label><span>已拉取模型</span><select class="model-select"></select></label>
+        <small>选择后会自动写入模型字段，保存后生效。</small>
+      </div>
       <details class="advanced">
         <summary>Advanced JSON / 可选扩展字段</summary>
         <div class="advanced-fields"></div>
@@ -317,8 +601,17 @@ function renderCards() {
 function renderStatus(configured) {
   for (const kind of kinds) {
     const node = $(`#status-${kind.id}`);
+    const provider = currentProvider(kind.id);
+    const metadata = provider?.metadata || {};
     node.textContent = configured[kind.id] ? "已就绪" : "未完成";
     node.style.color = configured[kind.id] ? "#286241" : "#a65359";
+    node.parentElement.title = provider
+      ? [
+        `${provider.label || provider.provider} / ${provider.model || provider.provider_id}`,
+        metadata.last_test_message ? `最近测试：${metadata.last_test_ok ? "通过" : "失败"} · ${metadata.last_test_message}` : "",
+        metadata.last_test_endpoint ? `Endpoint: ${metadata.last_test_endpoint}` : "",
+      ].filter(Boolean).join("\n")
+      : "";
   }
 }
 
@@ -351,9 +644,13 @@ async function boot() {
   try {
     state.presets = await api("/api/config/provider-presets");
     await Promise.all([loadPairing(), loadStatus()]);
+    await loadVoices();
+    await loadCharacters();
   } catch (error) {
     $("#debugResult").textContent = pretty({ ok: false, message: error.message });
   }
+  $("#voiceForm").addEventListener("submit", saveVoice);
+  $("#voiceNew").addEventListener("click", () => setVoiceForm(null));
   document.querySelectorAll("[data-debug]").forEach((button) => {
     button.addEventListener("click", () => runDebug(button.dataset.debug));
   });

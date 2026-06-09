@@ -6,12 +6,16 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Experience, Memory, Moment, ScheduleSlot
-from .providers import ImageProvider, get_enabled_provider
-from .utils import load_json, uid
+from .diagnostics import write_diagnostic
+from .models import Character, Experience, Memory, Moment, MomentInteraction, ScheduleSlot
+from .proactive import create_schedule_proactive_event
+from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider
+from .utils import uid
 
 
 logger = logging.getLogger(__name__)
+
+NPC_FALLBACK_NAMES = ["同桌同学", "社团前辈", "路过的朋友"]
 
 
 def _day_start(day: datetime) -> datetime:
@@ -85,13 +89,76 @@ def mark_interruption(session: Session, *, user_id: str, session_id: str, local_
         session.commit()
 
 
+def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, slot: ScheduleSlot, exp: Experience) -> dict[str, object] | None:
+    config = get_enabled_provider(session, "llm")
+    if config is None:
+        write_diagnostic("moment_skipped", reason="llm_not_configured", slot_id=slot.slot_id, activity=slot.activity_title)
+        return None
+    character = session.get(Character, character_id)
+    memories = session.execute(
+        select(Memory)
+        .where(Memory.user_id == user_id, Memory.character_id == character_id, Memory.hidden == False)  # noqa: E712
+        .order_by(Memory.created_at.desc())
+        .limit(8)
+    ).scalars().all()
+    memory_lines = [f"- {memory.layer}: {memory.content}" for memory in memories] or ["- 暂无近期记忆"]
+    prompt = f"""
+你要为 Galgame 伴侣 APP 生成一条真实朋友圈动态和 AI NPC 互动。必须只输出 JSON。
+
+角色：{character.persona_prompt if character else "小樱，Galgame 式 AI 伴侣。"}
+虚拟日程：{slot.activity_title}
+地点：{slot.location}
+经历摘要：{exp.summary}
+近期记忆：
+{chr(10).join(memory_lines)}
+
+输出格式：
+{{
+  "text": "小樱发的朋友圈正文，中文，1到2句，不要像公告",
+  "mood": "开心|平静|害羞|低落|兴奋",
+  "photo_prompt": "可选，给图片生成模型的简短中文或英文提示词",
+  "likes": ["AI NPC 名称1", "AI NPC 名称2"],
+  "comments": [
+    {{"actor_name": "AI NPC 名称", "content": "自然短评论"}}
+  ]
+}}
+点赞和评论必须是 AI NPC，不要伪装成用户“你”。不要使用小明、小红这种占位名。
+"""
+    try:
+        payload = OpenAICompatibleClient(config).chat_json(
+            [{"role": "system", "content": "你是 Galgame 朋友圈内容生成器，只输出 JSON。"}, {"role": "user", "content": prompt}],
+            max_tokens=700,
+            temperature=0.8,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("moment LLM generation failed slot_id=%s", slot.slot_id)
+        write_diagnostic("moment_skipped", reason="llm_error", slot_id=slot.slot_id, activity=slot.activity_title, error=str(exc))
+        return None
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        write_diagnostic("moment_skipped", reason="llm_empty_text", slot_id=slot.slot_id, activity=slot.activity_title)
+        return None
+    return payload
+
+
+def _npc_name(value: object, index: int) -> str:
+    name = str(value or "").strip()
+    return name[:24] if name else NPC_FALLBACK_NAMES[index % len(NPC_FALLBACK_NAMES)]
+
+
 def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     slots = session.execute(
-        select(ScheduleSlot).where(ScheduleSlot.user_id == user_id, ScheduleSlot.can_generate_moment == True)  # noqa: E712
+        select(ScheduleSlot).where(
+            ScheduleSlot.user_id == user_id,
+            ScheduleSlot.character_id == character_id,
+            ScheduleSlot.can_generate_moment == True,  # noqa: E712
+        )
     ).scalars().all()
     created_experiences = 0
     created_moments = 0
+    created_proactive_events = 0
+    skipped_moments = 0
     for slot in slots:
         if slot.actual_status != "completed":
             continue
@@ -119,29 +186,84 @@ def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: d
                 confidence=0.9,
             )
         )
+        proactive = create_schedule_proactive_event(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            source_id=exp.experience_id,
+            title="小樱有一件日常想告诉你",
+            summary=exp.summary,
+            activity_title=slot.activity_title,
+            priority=slot.salience,
+        )
+        if proactive is not None and proactive.source_id == exp.experience_id:
+            created_proactive_events += 1
+        payload = _llm_moment_payload(session, user_id=user_id, character_id=character_id, slot=slot, exp=exp)
+        if payload is None:
+            skipped_moments += 1
+            created_experiences += 1
+            continue
         media_asset_id = ""
-        if slot.can_generate_photo:
+        photo_prompt = str(payload.get("photo_prompt") or "").strip()
+        if slot.can_generate_photo and photo_prompt:
             image_config = get_enabled_provider(session, "image")
             if image_config is not None:
                 try:
-                    image = ImageProvider(image_config).generate(
-                        session,
-                        f"adult anime galgame CG, Sakura, {slot.activity_title}, {slot.location}, cherry blossom color grade",
-                    )
+                    image = ImageProvider(image_config).generate(session, photo_prompt)
                     media_asset_id = image.asset_id
                 except Exception:
                     logger.exception("daily cycle image generation failed slot_id=%s", slot.slot_id)
+                    write_diagnostic("moment_image_error", slot_id=slot.slot_id, activity=slot.activity_title)
                     media_asset_id = ""
-        session.add(
-            Moment(
-                moment_id=uid("moment"),
-                text=f"{slot.activity_title}结束啦。总觉得如果告诉你，你会笑着说我做得不错。",
-                media_asset_id=media_asset_id,
-                source_experience_id=exp.experience_id,
-                mood_snapshot=exp.emotional_result,
-            )
+        moment = Moment(
+            moment_id=uid("moment"),
+            text=str(payload.get("text") or "").strip(),
+            media_asset_id=media_asset_id,
+            source_experience_id=exp.experience_id,
+            mood_snapshot=str(payload.get("mood") or exp.emotional_result),
         )
+        session.add(moment)
+        for index, name in enumerate((payload.get("likes") or [])[:8]):
+            actor_name = _npc_name(name, index)
+            session.add(
+                MomentInteraction(
+                    interaction_id=uid("mi"),
+                    moment_id=moment.moment_id,
+                    actor_type="npc",
+                    actor_id=f"npc_like_{index}",
+                    actor_name=actor_name,
+                    interaction_type="like",
+                )
+            )
+        for index, item in enumerate((payload.get("comments") or [])[:8]):
+            actor_name = ""
+            content = ""
+            if isinstance(item, dict):
+                actor_name = str(item.get("actor_name") or item.get("name") or "").strip()
+                content = str(item.get("content") or item.get("text") or "").strip()
+            else:
+                content = str(item or "").strip()
+            if not content:
+                continue
+            actor_name = _npc_name(actor_name, index)
+            session.add(
+                MomentInteraction(
+                    interaction_id=uid("mi"),
+                    moment_id=moment.moment_id,
+                    actor_type="npc",
+                    actor_id=f"npc_comment_{index}",
+                    actor_name=actor_name,
+                    interaction_type="comment",
+                    content=content[:160],
+                )
+            )
+        write_diagnostic("moment_created", slot_id=slot.slot_id, moment_id=moment.moment_id, activity=slot.activity_title)
         created_experiences += 1
         created_moments += 1
     session.commit()
-    return {"experiences": created_experiences, "moments": created_moments}
+    return {
+        "experiences": created_experiences,
+        "moments": created_moments,
+        "proactive_events": created_proactive_events,
+        "skipped_moments": skipped_moments,
+    }

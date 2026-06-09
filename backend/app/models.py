@@ -44,6 +44,24 @@ class Character(Base):
     standing_assets_json: Mapped[str] = mapped_column(Text, default="{}")
     chibi_widget_assets_json: Mapped[str] = mapped_column(Text, default="{}")
     tts_voice_type: Mapped[str] = mapped_column(String, default="")
+    tts_voice_profile_id: Mapped[str] = mapped_column(String, default="")
+    key_reply_threshold: Mapped[int] = mapped_column(Integer, default=75)
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class TtsVoiceProfile(Base):
+    __tablename__ = "tts_voice_profiles"
+
+    voice_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String, default="", index=True)
+    label: Mapped[str] = mapped_column(String, default="")
+    speaker: Mapped[str] = mapped_column(String)
+    resource_id: Mapped[str] = mapped_column(String)
+    language: Mapped[str] = mapped_column(String, default="zh")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_test_ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_test_message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
@@ -140,10 +158,34 @@ class MomentInteraction(Base):
     moment_id: Mapped[str] = mapped_column(String, index=True)
     actor_type: Mapped[str] = mapped_column(String, default="user")
     actor_id: Mapped[str] = mapped_column(String, default="demo_user")
+    actor_name: Mapped[str] = mapped_column(String, default="")
     interaction_type: Mapped[str] = mapped_column(String)
     content: Mapped[str] = mapped_column(Text, default="")
     reflected_in_chat: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class ProactiveEvent(Base):
+    __tablename__ = "proactive_events"
+
+    proactive_event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    source_type: Mapped[str] = mapped_column(String, index=True)
+    source_id: Mapped[str] = mapped_column(String, default="", index=True)
+    title: Mapped[str] = mapped_column(String)
+    text: Mapped[str] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=50, index=True)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    dedupe_key: Mapped[str] = mapped_column(String, default="", index=True)
+    scheduled_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+    expires_at: Mapped[str] = mapped_column(String, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    delivered_at: Mapped[str] = mapped_column(String, default="")
+    opened_at: Mapped[str] = mapped_column(String, default="")
+    reflected_at: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
 class Message(Base):
@@ -194,4 +236,3 @@ class ProviderConfig(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
-

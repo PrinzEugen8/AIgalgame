@@ -9,6 +9,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.time.OffsetDateTime
 import java.util.concurrent.TimeUnit
 
 class ApiClient(private val baseUrl: String) {
@@ -27,22 +30,28 @@ class ApiClient(private val baseUrl: String) {
     suspend fun bootstrap(): JSONObject = get("/api/bootstrap")
     suspend fun homeState(): JSONObject = get("/api/state/home")
     suspend fun moments(): JSONObject = get("/api/moments")
-    suspend fun calendar(): JSONObject = get("/api/calendar")
+    suspend fun calendar(month: String = ""): JSONObject {
+        return if (month.isBlank()) get("/api/calendar") else get("/api/calendar?month=$month")
+    }
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
+    suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
 
-    suspend fun postEvent(type: String, text: String = "", replyId: String = "", storyIndex: Int = 0): JSONObject {
+    suspend fun postEvent(type: String, text: String = "", replyId: String = "", storyIndex: Int = 0, proactiveEventId: String = ""): JSONObject {
         val payload = JSONObject()
         if (text.isNotBlank()) payload.put("text", text)
         if (replyId.isNotBlank()) payload.put("reply_id", replyId)
         if (storyIndex > 0) payload.put("story_index", storyIndex)
+        if (proactiveEventId.isNotBlank()) payload.put("proactive_event_id", proactiveEventId)
         val body = JSONObject()
             .put("event_type", type)
             .put("session_id", "android")
             .put("payload", payload)
-            .put("client_context", JSONObject().put("app_state", "foreground"))
+            .put("client_context", JSONObject().put("app_state", "foreground").put("local_time", OffsetDateTime.now().toString()))
         return post("/api/events", body)
     }
+
+    suspend fun markProactiveDelivered(eventId: String): JSONObject = post("/api/proactive/$eventId/delivered", JSONObject())
 
     suspend fun likeMoment(momentId: String): JSONObject = post("/api/moments/$momentId/like", JSONObject())
 
@@ -53,6 +62,10 @@ class ApiClient(private val baseUrl: String) {
     private suspend fun get(path: String): JSONObject = request("GET", path, null)
 
     private suspend fun post(path: String, json: JSONObject): JSONObject = request("POST", path, json)
+
+    private fun encodedLocalTime(): String {
+        return URLEncoder.encode(OffsetDateTime.now().toString(), StandardCharsets.UTF_8.name())
+    }
 
     private suspend fun request(method: String, path: String, json: JSONObject?): JSONObject = withContext(Dispatchers.IO) {
         val builder = Request.Builder().url(absoluteUrl(path))
@@ -67,6 +80,23 @@ class ApiClient(private val baseUrl: String) {
                 throw IOException("HTTP ${response.code}: $text")
             }
             if (text.isBlank()) JSONObject() else JSONObject(text)
+        }
+    }
+}
+
+object HttpDownloader {
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    suspend fun bytes(url: String): ByteArray = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(url).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code}")
+            }
+            response.body?.bytes() ?: ByteArray(0)
         }
     }
 }

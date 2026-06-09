@@ -12,10 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import secret_store
+from .diagnostics import write_diagnostic
 from .media import media_from_base64, save_media
 from .models import MediaAsset, ProviderConfig
 from .schemas import ProviderConfigIn, ProviderConfigOut, ProviderTestResult
-from .utils import dump_json, load_json, stable_hash, uid
+from .utils import clamp, dump_json, load_json, stable_hash, uid, utc_now
 
 
 class ProviderError(RuntimeError):
@@ -47,6 +48,12 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     if value is None or value == "":
         return default
     return float(value)
+
+
+def _as_tts_rate(value: Any, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    return clamp(round(float(value)), -50, 100)
 
 
 def _split_sources(value: Any) -> list[str]:
@@ -128,25 +135,80 @@ def provider_presets() -> dict[str, Any]:
                 "label": "豆包语音合成 V3",
                 "base_url": "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
                 "model": "",
-                "docs": "https://www.volcengine.com/docs/6561/2227958?lang=zh",
+                "docs": "https://www.volcengine.com/docs/6561/1598757?lang=zh",
                 "supports_models": False,
-                "description": "按 V3 HTTP Chunked 接口提交 user.uid 与 req_params.speaker/audio_params。",
+                "description": "按 V3 HTTP Chunked 接口提交 user.uid 与 req_params.speaker/audio_params；默认由 AI 台词情绪自动设置 TTS 情绪与语音风格。",
                 "fields": [
                     _field("label", "显示名称", "core", default="豆包语音合成 V3"),
                     _field("base_url", "TTS Endpoint", "core", default="https://openspeech.bytedance.com/api/v3/tts/unidirectional", required=True),
-                    _field("x_api_key", "X-Api-Key（如控制台给的是单 Key）", "secret", placeholder="二选一：填这个，或填 App ID + Access Key"),
-                    _field("app_id", "X-Api-App-Id", "secret", placeholder="二选一：App ID"),
-                    _field("access_key", "X-Api-Access-Key", "secret", placeholder="二选一：Access Key"),
-                    _field("app_key", "X-Api-App-Key（可选）", "secret", placeholder="留空时使用 App ID"),
-                    _field("resource_id", "X-Api-Resource-Id", "metadata", required=True, placeholder="控制台资源 ID"),
-                    _field("speaker", "speaker 音色 ID", "metadata", required=True, placeholder="例如 zh_female_xxx"),
-                    _field("format", "音频格式", "metadata", type_="select", default="mp3", options=["mp3", "ogg_opus", "pcm", "wav"]),
-                    _field("sample_rate", "采样率", "metadata", type_="number", default=24000),
-                    _field("speech_rate", "语速", "metadata", type_="number", default=0),
-                    _field("loudness_rate", "音量/响度", "metadata", type_="number", default=0),
-                    _field("pitch_rate", "音高", "metadata", type_="number", default=0),
-                    _field("emotion", "情绪（可选）", "metadata", placeholder="happy / sad / angry ..."),
-                    _field("context_texts", "上下文文本（每行一条，可选）", "metadata", type_="textarea"),
+                    _field(
+                        "credential_mode",
+                        "控制台凭据类型",
+                        "metadata",
+                        type_="select",
+                        default="single_key",
+                        options=[
+                            {"value": "single_key", "label": "新控制台：X-Api-Key"},
+                            {"value": "app_credentials", "label": "旧控制台：App ID + Access Key"},
+                        ],
+                        help_text="新控制台通常只给一个 X-Api-Key；旧控制台使用 App ID + Access Key，App Key 可选。",
+                    ),
+                    _field(
+                        "x_api_key",
+                        "X-Api-Key",
+                        "secret",
+                        placeholder="新控制台给出的单 Key",
+                        show_when={"credential_mode": "single_key"},
+                    ),
+                    _field(
+                        "app_id",
+                        "X-Api-App-Id",
+                        "secret",
+                        placeholder="旧控制台 App ID",
+                        show_when={"credential_mode": "app_credentials"},
+                    ),
+                    _field(
+                        "access_key",
+                        "X-Api-Access-Key",
+                        "secret",
+                        placeholder="旧控制台 Access Key",
+                        show_when={"credential_mode": "app_credentials"},
+                    ),
+                    _field(
+                        "app_key",
+                        "X-Api-App-Key（可选）",
+                        "secret",
+                        placeholder="留空时使用 App ID",
+                        show_when={"credential_mode": "app_credentials"},
+                    ),
+                    _field("resource_id", "默认 X-Api-Resource-Id（兼容旧配置）", "metadata", placeholder="新音色库会优先使用每个音色自己的资源 ID"),
+                    _field("speaker", "默认 speaker 音色 ID（兼容旧配置）", "metadata", placeholder="新音色库会优先使用每个音色自己的 speaker"),
+                    _field("format", "音频格式", "metadata", type_="select", default="mp3", options=["mp3", "ogg_opus", "pcm", "wav"], help_text="生成音频的编码格式；默认 mp3 兼容性最好。"),
+                    _field("sample_rate", "采样率", "metadata", type_="number", default=24000, help_text="每秒采样点数量；默认 24000，通常不用改。"),
+                    _field(
+                        "parameter_mode",
+                        "TTS 参数模式",
+                        "metadata",
+                        type_="select",
+                        default="ai_auto",
+                        options=[
+                            {"value": "ai_auto", "label": "AI 自动：按台词情绪"},
+                            {"value": "manual", "label": "手动固定：使用下方参数"},
+                        ],
+                        help_text="AI 自动模式会读取每句台词的 emotion，并自动套用官方 V3 的情绪、语速和音量；手动模式固定使用下方参数。",
+                    ),
+                    _field("speech_rate", "语速", "metadata", type_="number", default=0, help_text="官方 V3 档位：-50 到 100；100 表示 2 倍速，-50 表示 0.5 倍速。", show_when={"parameter_mode": "manual"}),
+                    _field("loudness_rate", "音量/响度", "metadata", type_="number", default=0, help_text="官方 V3 档位：-50 到 100；100 表示 2 倍音量，-50 表示 0.5 倍音量。", show_when={"parameter_mode": "manual"}),
+                    _field("emotion_scale", "情绪强度", "metadata", type_="number", default=4, help_text="官方 V3 emotion_scale，范围 1 到 5。", show_when={"parameter_mode": "manual"}),
+                    _field("emotion", "固定情绪", "metadata", placeholder="happy / sad / angry ...", help_text="仅手动模式使用。AI 自动模式会优先使用每句台词的 emotion。", show_when={"parameter_mode": "manual"}),
+                    _field("context_texts", "上下文文本（每行一条，可选）", "advanced", type_="textarea"),
+                    _field(
+                        "emotion_map",
+                        "AI 情绪到 TTS 情绪映射",
+                        "advanced",
+                        type_="json",
+                        default={"happy": "happy", "shy": "happy", "thinking": "calm", "calm": "calm", "sad": "sad"},
+                    ),
                     _field("uid", "user.uid", "metadata", default="aigalgame"),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
                 ],
@@ -159,12 +221,12 @@ def provider_presets() -> dict[str, Any]:
                 "base_url": "https://ark.cn-beijing.volces.com/api/v3",
                 "model": "",
                 "docs": "https://www.volcengine.com/docs/82379/1756990",
-                "supports_models": False,
+                "supports_models": True,
                 "description": "走 Ark Responses API tools:[{\"type\":\"web_search\"}]，测试必须返回来源与发布时间。",
                 "fields": [
                     _field("label", "显示名称", "core", default="火山方舟 Web Search"),
                     _field("base_url", "Responses API Base URL", "core", default="https://ark.cn-beijing.volces.com/api/v3", required=True),
-                    _field("model", "Responses 模型", "core", required=True, placeholder="支持 Responses/Web Search 的方舟模型"),
+                    _field("model", "Responses 模型", "core", required=True, placeholder="支持 Responses/Web Search 的方舟模型", help_text="保存 API Key 后可点击“拉取模型”，像 LLM 一样从 /models 选择。"),
                     _field("api_key", "Ark API Key", "secret", required=True),
                     _field("max_keyword", "max_keyword", "metadata", type_="number", default=3),
                     _field("limit", "limit", "metadata", type_="number", default=5),
@@ -264,7 +326,9 @@ def _field(
     default: Any = "",
     required: bool = False,
     placeholder: str = "",
-    options: list[str] | None = None,
+    options: list[Any] | None = None,
+    help_text: str = "",
+    show_when: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -275,6 +339,8 @@ def _field(
         "required": required,
         "placeholder": placeholder,
         "options": options or [],
+        "help": help_text,
+        "show_when": show_when or {},
     }
 
 
@@ -316,6 +382,17 @@ def _missing_secret_fields(config: ProviderConfig) -> list[str]:
     if _preset(config.kind, config.provider) is None:
         return ["unsupported_provider"]
     if config.kind == "tts" and config.provider == "volc_seed_tts":
+        metadata = load_json(config.metadata_json, {})
+        credential_mode = str(metadata.get("credential_mode") or "").strip()
+        if credential_mode == "single_key":
+            return [] if (_secret(config, "x_api_key") or _secret(config, "api_key")) else ["x_api_key"]
+        if credential_mode == "app_credentials":
+            missing = []
+            if not _secret(config, "app_id"):
+                missing.append("app_id")
+            if not _secret(config, "access_key"):
+                missing.append("access_key")
+            return missing
         return [] if _has_tts_credentials(config) else ["x_api_key 或 app_id/access_key"]
     fields = _required_secret_fields(config.kind, config.provider)
     return [field for field in fields if not _secret(config, field)]
@@ -359,6 +436,11 @@ def provider_to_out(config: ProviderConfig) -> ProviderConfigOut:
     has_secret_fields = _has_secret_fields(config)
     missing_secrets = _missing_secret_fields(config)
     missing_required = _missing_required_fields(config)
+    metadata = load_json(config.metadata_json, {})
+    if config.kind == "tts" and config.provider == "volc_seed_tts" and not metadata.get("credential_mode"):
+        has_app_credentials = _secret(config, "app_id") and _secret(config, "access_key")
+        has_single_key = _secret(config, "x_api_key") or _secret(config, "api_key")
+        metadata["credential_mode"] = "app_credentials" if has_app_credentials and not has_single_key else "single_key"
     return ProviderConfigOut(
         provider_id=config.provider_id,
         kind=config.kind,
@@ -366,7 +448,7 @@ def provider_to_out(config: ProviderConfig) -> ProviderConfigOut:
         label=config.label,
         base_url=config.base_url,
         model=config.model,
-        metadata=load_json(config.metadata_json, {}),
+        metadata=metadata,
         enabled=config.enabled,
         has_secret=any(has_secret_fields.values()),
         has_secret_fields=has_secret_fields,
@@ -405,6 +487,7 @@ def upsert_provider(session: Session, payload: ProviderConfigIn) -> ProviderConf
     existing.metadata_json = dump_json(metadata)
     existing.enabled = payload.enabled
     existing.secret_ref = provider_id
+    existing.updated_at = utc_now()
 
     if old_secret_ref and old_secret_ref != provider_id:
         old_value = secret_store.get(old_secret_ref)
@@ -416,14 +499,40 @@ def upsert_provider(session: Session, payload: ProviderConfigIn) -> ProviderConf
         secrets["api_key"] = payload.api_key
     if secrets:
         secret_store.set_many(provider_id, secrets)
+    if payload.enabled:
+        for other in session.execute(
+            select(ProviderConfig).where(
+                ProviderConfig.kind == payload.kind,
+                ProviderConfig.provider_id != provider_id,
+                ProviderConfig.enabled == True,  # noqa: E712
+            )
+        ).scalars():
+            other.enabled = False
+            other.updated_at = utc_now()
     session.commit()
     return existing
 
 
+def _enabled_provider_score(config: ProviderConfig) -> tuple[int, int, str, str]:
+    preset_supported = _preset(config.kind, config.provider) is not None
+    ready = preset_supported and not _missing_secret_fields(config) and not _missing_required_fields(config)
+    return (int(ready), int(preset_supported), config.updated_at or config.created_at or "", config.provider_id)
+
+
 def get_enabled_provider(session: Session, kind: str) -> ProviderConfig | None:
-    return session.execute(
+    configs = session.execute(
         select(ProviderConfig).where(ProviderConfig.kind == kind, ProviderConfig.enabled == True)  # noqa: E712
-    ).scalar_one_or_none()
+    ).scalars().all()
+    if not configs:
+        return None
+    selected = max(configs, key=_enabled_provider_score)
+    if len(configs) > 1:
+        for config in configs:
+            if config.provider_id != selected.provider_id:
+                config.enabled = False
+                config.updated_at = utc_now()
+        session.commit()
+    return selected
 
 
 class OpenAICompatibleClient:
@@ -459,18 +568,88 @@ class OpenAICompatibleClient:
         extra_body = self.metadata.get("extra_body")
         if isinstance(extra_body, dict):
             body.update(extra_body)
+        started = time.monotonic()
         with _client(float(self.metadata.get("timeout", 30.0))) as client:
-            response = client.post(
-                self._url("chat/completions"),
-                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json=body,
-            )
-            response.raise_for_status()
+            try:
+                response = client.post(
+                    self._url("chat/completions"),
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=body,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                write_diagnostic(
+                    "llm_error",
+                    provider_id=self.config.provider_id,
+                    model=self.config.model,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                raise
         content = response.json()["choices"][0]["message"]["content"]
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
         except json.JSONDecodeError as exc:
+            write_diagnostic(
+                "llm_error",
+                provider_id=self.config.provider_id,
+                model=self.config.model,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                error_type="json_decode",
+                message=str(exc),
+                raw_preview=content[:180],
+            )
             raise ProviderError(f"LLM did not return valid JSON: {content[:180]}") from exc
+        write_diagnostic(
+            "llm_ok",
+            provider_id=self.config.provider_id,
+            model=self.config.model,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            keys=list(parsed.keys()) if isinstance(parsed, dict) else [],
+        )
+        return parsed
+
+    def chat_text(self, messages: list[dict[str, str]], *, max_tokens: int = 240, temperature: float = 0.2) -> str:
+        if not self.config.model:
+            raise ProviderError("LLM model is not selected")
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        extra_body = self.metadata.get("extra_body")
+        if isinstance(extra_body, dict):
+            body.update({key: value for key, value in extra_body.items() if key != "response_format"})
+        started = time.monotonic()
+        with _client(float(self.metadata.get("timeout", 30.0))) as client:
+            try:
+                response = client.post(
+                    self._url("chat/completions"),
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=body,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                write_diagnostic(
+                    "llm_text_error",
+                    provider_id=self.config.provider_id,
+                    model=self.config.model,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                raise
+        content = str(response.json()["choices"][0]["message"]["content"] or "").strip()
+        write_diagnostic(
+            "llm_text_ok",
+            provider_id=self.config.provider_id,
+            model=self.config.model,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            chars=len(content),
+        )
+        return content
 
 
 def _find_base64_audio(value: Any) -> str:
@@ -555,6 +734,14 @@ def _decode_tts_response(response: httpx.Response) -> bytes:
 
 
 class VolcSeedTtsClient:
+    AUTO_STYLE_PARAMS: dict[str, dict[str, Any]] = {
+        "happy": {"speech_rate": 8, "loudness_rate": 5, "emotion_scale": 4},
+        "shy": {"speech_rate": -4, "loudness_rate": -4, "emotion_scale": 3},
+        "thinking": {"speech_rate": -6, "loudness_rate": -2, "emotion_scale": 2},
+        "calm": {"speech_rate": 0, "loudness_rate": 0, "emotion_scale": 2},
+        "sad": {"speech_rate": -10, "loudness_rate": -8, "emotion_scale": 3},
+    }
+
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
         self.metadata = load_json(config.metadata_json, {})
@@ -583,30 +770,58 @@ class VolcSeedTtsClient:
         )
         return headers
 
-    def synthesize(self, session: Session, text: str, *, voice_type: str = "") -> MediaAsset:
+    def _style_for_line(self, line_emotion: str) -> tuple[dict[str, Any], str]:
+        audio_params = {
+            "format": str(self.metadata.get("format") or "mp3").strip(),
+            "sample_rate": _as_int(self.metadata.get("sample_rate"), 24000),
+            "speech_rate": _as_tts_rate(self.metadata.get("speech_rate"), 0),
+            "loudness_rate": _as_tts_rate(self.metadata.get("loudness_rate"), 0),
+        }
+        if str(self.metadata.get("parameter_mode") or "ai_auto") != "ai_auto":
+            scale = self.metadata.get("emotion_scale")
+            if scale not in (None, ""):
+                audio_params["emotion_scale"] = clamp(round(float(scale)), 1, 5)
+            return audio_params, str(self.metadata.get("emotion") or "").strip()
+
+        normalized = str(line_emotion or "calm").strip().lower()
+        style = self.AUTO_STYLE_PARAMS.get(normalized, self.AUTO_STYLE_PARAMS["calm"])
+        for field in ("speech_rate", "loudness_rate"):
+            audio_params[field] = style[field]
+        audio_params["emotion_scale"] = style["emotion_scale"]
+        emotion_map = _json_or_empty(self.metadata.get("emotion_map")) or {
+            "happy": "happy",
+            "shy": "happy",
+            "thinking": "calm",
+            "calm": "calm",
+            "sad": "sad",
+        }
+        return audio_params, str(emotion_map.get(normalized) or emotion_map.get("calm") or "").strip()
+
+    def synthesize(
+        self,
+        session: Session,
+        text: str,
+        *,
+        voice_type: str = "",
+        resource_id: str = "",
+        line_emotion: str = "calm",
+    ) -> MediaAsset:
         endpoint = self.config.base_url or "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
-        resource_id = str(self.metadata.get("resource_id") or "").strip()
+        resource_id = str(resource_id or self.metadata.get("resource_id") or "").strip()
         speaker = str(voice_type or self.metadata.get("speaker") or self.config.model or "").strip()
-        audio_format = str(self.metadata.get("format") or "mp3").strip()
         if not resource_id:
             raise ProviderError("TTS resource_id is required")
         if not speaker:
             raise ProviderError("TTS speaker is required")
-        audio_params = {
-            "format": audio_format,
-            "sample_rate": _as_int(self.metadata.get("sample_rate"), 24000),
-            "speech_rate": _as_float(self.metadata.get("speech_rate"), 0),
-            "loudness_rate": _as_float(self.metadata.get("loudness_rate"), 0),
-            "pitch_rate": _as_float(self.metadata.get("pitch_rate"), 0),
-        }
+        audio_params, emotion = self._style_for_line(line_emotion)
+        audio_format = str(audio_params["format"])
         req_params: dict[str, Any] = {
             "text": text,
             "speaker": speaker,
             "audio_params": audio_params,
         }
-        emotion = str(self.metadata.get("emotion") or "").strip()
         if emotion:
-            req_params["emotion"] = emotion
+            audio_params["emotion"] = emotion
         context_texts = self.metadata.get("context_texts")
         if isinstance(context_texts, str):
             context = [line.strip() for line in context_texts.splitlines() if line.strip()]
@@ -622,12 +837,40 @@ class VolcSeedTtsClient:
         if existing is not None:
             return existing
         body = {"user": {"uid": uid_value}, "req_params": req_params}
+        headers = self._headers(resource_id)
+        started = time.monotonic()
         with _client(float(self.metadata.get("timeout", 30.0))) as client:
-            response = client.post(endpoint, headers=self._headers(resource_id), json=body)
-            response.raise_for_status()
+            try:
+                response = client.post(endpoint, headers=headers, json=body)
+                response.raise_for_status()
+            except Exception as exc:
+                write_diagnostic(
+                    "tts_error",
+                    provider_id=self.config.provider_id,
+                    endpoint=endpoint,
+                    resource_id=resource_id,
+                    speaker=speaker,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    request_id=headers.get("X-Api-Request-Id"),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    audio_params=audio_params,
+                )
+                raise
         audio_bytes = _decode_tts_response(response)
         if len(audio_bytes) < 128:
             raise ProviderError("Volc TTS returned too few audio bytes")
+        write_diagnostic(
+            "tts_ok",
+            provider_id=self.config.provider_id,
+            endpoint=endpoint,
+            resource_id=resource_id,
+            speaker=speaker,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            request_id=headers.get("X-Api-Request-Id"),
+            bytes=len(audio_bytes),
+            audio_params=audio_params,
+        )
         return save_media(session, asset_type="tts_audio", content=audio_bytes, extension=audio_format, cache_key=cache_key)
 
 
@@ -754,7 +997,27 @@ class VolcArkWebSearchClient:
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json=body,
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                write_diagnostic(
+                    "search_error",
+                    provider_id=self.config.provider_id,
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    endpoint=self._url(),
+                    status_code=response.status_code,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    response_preview=response.text[:300],
+                )
+                if response.status_code == 404:
+                    raise ProviderError(
+                        "Ark Web Search failed: model/Endpoint does not support Responses or Web Search, "
+                        "or the region/model ID is unavailable. Check the 火山方舟 Responses/Web Search model "
+                        f"and base URL. endpoint={self._url()} model={self.config.model}"
+                    ) from exc
+                raise
         payload = response.json()
         results = _collect_sources(payload)
         if require_published_at:
@@ -899,6 +1162,7 @@ class ImageProvider:
 
 def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: str) -> ProviderTestResult:
     started = time.monotonic()
+    config: ProviderConfig | None = None
     try:
         config = upsert_provider(session, payload)
         if config.kind == "llm":
@@ -940,8 +1204,38 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
         ok = False
         message = str(exc)
         details = {"error_type": type(exc).__name__}
+        if payload.kind == "search":
+            base_url = (config.base_url if config is not None else payload.base_url).rstrip("/")
+            details.update(
+                {
+                    "provider_id": config.provider_id if config is not None else payload.provider_id,
+                    "model": config.model if config is not None else payload.model,
+                    "endpoint": f"{base_url}/responses" if base_url else "",
+                }
+            )
     else:
         kind = config.kind
         provider = config.provider
     elapsed = int((time.monotonic() - started) * 1000)
+    if config is not None:
+        metadata = load_json(config.metadata_json, {})
+        metadata.update(
+            {
+                "last_test_ok": ok,
+                "last_test_message": message,
+                "last_test_elapsed_ms": elapsed,
+                "last_test_at": utc_now(),
+            }
+        )
+        if config.kind == "search":
+            metadata.update(
+                {
+                    "last_test_provider": config.provider,
+                    "last_test_model": config.model,
+                    "last_test_endpoint": f"{config.base_url.rstrip('/')}/responses",
+                }
+            )
+        config.metadata_json = dump_json(metadata)
+        config.updated_at = utc_now()
+        session.commit()
     return ProviderTestResult(ok=ok, kind=kind, provider=provider, message=message, elapsed_ms=elapsed, details=details)

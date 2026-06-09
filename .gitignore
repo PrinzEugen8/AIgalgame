@@ -18,6 +18,7 @@ backend/app.db
 *.sqlite
 *.sqlite3
 backend/.test-data/
+**/.test-data/
 
 android/local.properties
 android/**/build/

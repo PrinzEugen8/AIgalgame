@@ -17,8 +17,10 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import get_session, init_db
+from .diagnostics import tail_diagnostics, write_diagnostic
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
+    Character,
     MediaAsset,
     Memory,
     Moment,
@@ -26,25 +28,36 @@ from .models import (
     ProviderConfig,
     RelationState,
     ScheduleSlot,
+    TtsVoiceProfile,
     User,
 )
 from .pipeline import handle_event
+from .proactive import create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
 from .providers import (
     OpenAICompatibleClient,
     ProviderError,
-    VolcArkWebSearchClient,
+    VolcSeedTtsClient,
     get_enabled_provider,
     provider_presets,
-    provider_ready,
     provider_to_out,
     run_provider_test,
     upsert_provider,
 )
-from .schemas import EventIn, ProviderConfigIn, ProviderConfigOut, ProviderTestRequest, ProviderTestResult
+from .schemas import (
+    CharacterAdminIn,
+    CharacterAdminOut,
+    EventIn,
+    ProviderConfigIn,
+    ProviderConfigOut,
+    ProviderTestRequest,
+    ProviderTestResult,
+    TtsVoiceProfileIn,
+    TtsVoiceProfileOut,
+)
 from .schedule import ensure_schedule, run_daily_cycle
 from .scheduler import start_scheduler, stop_scheduler
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
-from .utils import dump_json, load_json, uid
+from .utils import clamp, dump_json, load_json, uid
 
 
 setup_logging()
@@ -183,6 +196,159 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     return {"ok": True, "providers": providers, "configured": configured}
 
 
+def _voice_to_out(voice: TtsVoiceProfile) -> TtsVoiceProfileOut:
+    return TtsVoiceProfileOut(
+        voice_id=voice.voice_id,
+        provider_id=voice.provider_id,
+        label=voice.label,
+        speaker=voice.speaker,
+        resource_id=voice.resource_id,
+        language=voice.language,
+        enabled=voice.enabled,
+        last_test_ok=voice.last_test_ok,
+        last_test_message=voice.last_test_message,
+        updated_at=voice.updated_at,
+    )
+
+
+def _character_to_out(character: Character) -> CharacterAdminOut:
+    return CharacterAdminOut(
+        character_id=character.character_id,
+        name=character.name,
+        age_setting=character.age_setting,
+        persona_prompt=character.persona_prompt,
+        speech_style=character.speech_style,
+        relationship_boundary=character.relationship_boundary,
+        tts_voice_type=character.tts_voice_type,
+        tts_voice_profile_id=character.tts_voice_profile_id,
+        key_reply_threshold=character.key_reply_threshold,
+    )
+
+
+@app.get("/api/admin/tts-voices")
+def list_tts_voices(session: Session = Depends(get_session)) -> dict[str, Any]:
+    voices = session.execute(select(TtsVoiceProfile).order_by(TtsVoiceProfile.updated_at.desc())).scalars().all()
+    providers = [
+        provider_to_out(item).model_dump()
+        for item in session.execute(select(ProviderConfig).where(ProviderConfig.kind == "tts")).scalars().all()
+    ]
+    return {"ok": True, "items": [_voice_to_out(item).model_dump() for item in voices], "providers": providers}
+
+
+@app.post("/api/admin/tts-voices", response_model=TtsVoiceProfileOut)
+def create_tts_voice(payload: TtsVoiceProfileIn, session: Session = Depends(get_session)) -> TtsVoiceProfileOut:
+    provider_id = payload.provider_id
+    if not provider_id:
+        provider = get_enabled_provider(session, "tts")
+        provider_id = provider.provider_id if provider is not None else ""
+    voice_id = payload.voice_id or f"voice_{uid('tts')[-8:]}"
+    if session.get(TtsVoiceProfile, voice_id) is not None:
+        raise HTTPException(status_code=409, detail="voice_id already exists")
+    voice = TtsVoiceProfile(
+        voice_id=voice_id,
+        provider_id=provider_id,
+        label=payload.label or payload.speaker,
+        speaker=payload.speaker.strip(),
+        resource_id=payload.resource_id.strip(),
+        language=payload.language,
+        enabled=payload.enabled,
+    )
+    if not voice.speaker or not voice.resource_id:
+        raise HTTPException(status_code=400, detail="speaker and resource_id are required")
+    session.add(voice)
+    session.commit()
+    return _voice_to_out(voice)
+
+
+@app.put("/api/admin/tts-voices/{voice_id}", response_model=TtsVoiceProfileOut)
+def update_tts_voice(voice_id: str, payload: TtsVoiceProfileIn, session: Session = Depends(get_session)) -> TtsVoiceProfileOut:
+    voice = session.get(TtsVoiceProfile, voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="voice not found")
+    voice.provider_id = payload.provider_id or voice.provider_id
+    voice.label = payload.label or payload.speaker
+    voice.speaker = payload.speaker.strip()
+    voice.resource_id = payload.resource_id.strip()
+    voice.language = payload.language
+    voice.enabled = payload.enabled
+    voice.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    if not voice.speaker or not voice.resource_id:
+        raise HTTPException(status_code=400, detail="speaker and resource_id are required")
+    session.commit()
+    return _voice_to_out(voice)
+
+
+@app.delete("/api/admin/tts-voices/{voice_id}")
+def delete_tts_voice(voice_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    voice = session.get(TtsVoiceProfile, voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="voice not found")
+    for character in session.execute(select(Character).where(Character.tts_voice_profile_id == voice_id)).scalars():
+        character.tts_voice_profile_id = ""
+    session.delete(voice)
+    session.commit()
+    return {"ok": True}
+
+
+@app.post("/api/admin/tts-voices/{voice_id}/test", response_model=TtsVoiceProfileOut)
+def test_tts_voice(voice_id: str, payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> TtsVoiceProfileOut:
+    voice = session.get(TtsVoiceProfile, voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="voice not found")
+    config = session.get(ProviderConfig, voice.provider_id) if voice.provider_id else get_enabled_provider(session, "tts")
+    if config is None:
+        raise HTTPException(status_code=400, detail="tts provider is not configured")
+    text = str((payload or {}).get("text") or ("今日は少しだけ声の調子を試します。" if voice.language == "ja" else "今天也想听你说说话。"))
+    try:
+        asset = VolcSeedTtsClient(config).synthesize(session, text, voice_type=voice.speaker, resource_id=voice.resource_id)
+    except Exception as exc:  # noqa: BLE001
+        voice.last_test_ok = False
+        voice.last_test_message = str(exc)
+    else:
+        voice.last_test_ok = True
+        voice.last_test_message = f"OK: {asset.url}"
+    voice.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    session.commit()
+    return _voice_to_out(voice)
+
+
+@app.get("/api/admin/characters")
+def list_characters(session: Session = Depends(get_session)) -> dict[str, Any]:
+    ensure_seed(session)
+    characters = session.execute(select(Character).order_by(Character.character_id)).scalars().all()
+    return {"ok": True, "items": [_character_to_out(item).model_dump() for item in characters]}
+
+
+@app.put("/api/admin/characters", response_model=CharacterAdminOut)
+def update_default_character(payload: CharacterAdminIn, session: Session = Depends(get_session)) -> CharacterAdminOut:
+    return update_character(DEFAULT_CHARACTER_ID, payload, session)
+
+
+@app.put("/api/admin/characters/{character_id}", response_model=CharacterAdminOut)
+def update_character(character_id: str, payload: CharacterAdminIn, session: Session = Depends(get_session)) -> CharacterAdminOut:
+    ensure_seed(session, character_id=character_id)
+    character = session.get(Character, character_id)
+    if character is None:
+        raise HTTPException(status_code=404, detail="character not found")
+    if payload.name is not None:
+        character.name = payload.name.strip() or character.name
+    if payload.persona_prompt is not None:
+        character.persona_prompt = payload.persona_prompt.strip()
+    if payload.speech_style is not None:
+        character.speech_style = payload.speech_style.strip()
+    if payload.relationship_boundary is not None:
+        character.relationship_boundary = payload.relationship_boundary.strip()
+    if payload.tts_voice_profile_id is not None:
+        if payload.tts_voice_profile_id and session.get(TtsVoiceProfile, payload.tts_voice_profile_id) is None:
+            raise HTTPException(status_code=400, detail="tts voice profile not found")
+        character.tts_voice_profile_id = payload.tts_voice_profile_id
+    if payload.key_reply_threshold is not None:
+        character.key_reply_threshold = clamp(payload.key_reply_threshold, 0, 100)
+    character.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    session.commit()
+    return _character_to_out(character)
+
+
 @app.get("/api/bootstrap")
 def bootstrap(
     user_id: str = DEFAULT_USER_ID,
@@ -191,6 +357,7 @@ def bootstrap(
 ) -> dict[str, Any]:
     ensure_seed(session, user_id=user_id, character_id=character_id)
     user = session.get(User, user_id)
+    character = session.get(Character, character_id)
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
     ).scalar_one()
@@ -200,7 +367,11 @@ def bootstrap(
             "story_completed": bool(user and user.story_completed),
             "interest_topics": load_json(user.interest_topics_json if user else "[]", []),
         },
-        "character": {"character_id": character_id, "name": "小樱", "age_setting": "18+"},
+        "character": {
+            "character_id": character_id,
+            "name": character.name if character else "小樱",
+            "age_setting": character.age_setting if character else "18+",
+        },
         "relation": {
             "affection": relation.affection,
             "trust": relation.trust,
@@ -242,6 +413,7 @@ def provider_models(provider_id: str, session: Session = Depends(get_session)) -
 def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
         result = handle_event(session, event)
+        write_diagnostic("event_ok", event_type=event.event_type, session_id=event.session_id, result_type=result.event_type)
         return result.model_dump()
     except ProviderError as exc:
         logger.warning(
@@ -250,7 +422,41 @@ def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[
             event.session_id,
             exc,
         )
+        write_diagnostic("event_error", event_type=event.event_type, session_id=event.session_id, error_type=type(exc).__name__, message=str(exc))
         return {"event_type": "error", "event_id": uid("evt"), "session_id": event.session_id, "payload": {"message": str(exc)}}
+
+
+def _parse_client_time(value: str = "") -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+@app.get("/api/proactive/pending")
+def proactive_pending(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    local_time: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    return pending_proactive_response(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        local_time=_parse_client_time(local_time),
+    )
+
+
+@app.post("/api/proactive/{event_id}/delivered")
+def proactive_delivered(event_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    event = mark_proactive_delivered(session, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="proactive event not found")
+    return {"ok": True, "event": {"proactive_event_id": event.proactive_event_id, "status": event.status}}
 
 
 @app.websocket("/ws/app")
@@ -325,8 +531,24 @@ def moments(session: Session = Depends(get_session)) -> dict[str, Any]:
                 "mood_snapshot": row.mood_snapshot,
                 "created_at": row.created_at,
                 "likes": len([item for item in interactions if item.interaction_type == "like"]),
+                "like_actors": [
+                    {
+                        "actor_type": item.actor_type,
+                        "actor_id": item.actor_id,
+                        "actor_name": item.actor_name or item.actor_id,
+                        "created_at": item.created_at,
+                    }
+                    for item in interactions
+                    if item.interaction_type == "like"
+                ],
                 "comments": [
-                    {"actor_id": item.actor_id, "content": item.content, "created_at": item.created_at}
+                    {
+                        "actor_type": item.actor_type,
+                        "actor_id": item.actor_id,
+                        "actor_name": item.actor_name or item.actor_id,
+                        "content": item.content,
+                        "created_at": item.created_at,
+                    }
                     for item in interactions
                     if item.interaction_type == "comment"
                 ],
@@ -339,9 +561,16 @@ def moments(session: Session = Depends(get_session)) -> dict[str, Any]:
 def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     if session.get(Moment, moment_id) is None:
         raise HTTPException(status_code=404, detail="moment not found")
-    interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, interaction_type="like")
+    interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="like")
     session.add(interaction)
     session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content="用户点赞了小樱的朋友圈。", source_event_id=interaction.interaction_id, importance=0.6, confidence=0.9))
+    create_moment_feedback_event(
+        session,
+        user_id=user_id,
+        character_id=DEFAULT_CHARACTER_ID,
+        interaction_id=interaction.interaction_id,
+        interaction_type="like",
+    )
     session.commit()
     return {"ok": True, "interaction_id": interaction.interaction_id}
 
@@ -353,9 +582,17 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
     content = str(payload.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="content required")
-    interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, interaction_type="comment", content=content)
+    interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="comment", content=content)
     session.add(interaction)
     session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content=f"用户评论了小樱的朋友圈：{content}", source_event_id=interaction.interaction_id, importance=0.8, confidence=0.95))
+    create_moment_feedback_event(
+        session,
+        user_id=user_id,
+        character_id=DEFAULT_CHARACTER_ID,
+        interaction_id=interaction.interaction_id,
+        interaction_type="comment",
+        content=content,
+    )
     session.commit()
     return {"ok": True, "interaction_id": interaction.interaction_id}
 
@@ -426,32 +663,16 @@ def debug_daily(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHAR
     return {"ok": True, **result}
 
 
+@app.get("/api/debug/logs")
+def debug_logs(limit: int = 200) -> dict[str, Any]:
+    return {"ok": True, "items": tail_diagnostics(limit)}
+
+
 @app.post("/api/debug/generate-proactive")
 def debug_proactive(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     logger.info("debug proactive requested user_id=%s", user_id)
-    user = session.get(User, user_id)
-    topics = load_json(user.interest_topics_json if user else "[]", [])
-    search = get_enabled_provider(session, "search")
-    if topics and user and user.news_enabled:
-        if search is None:
-            return {"ok": False, "message": "Search provider is not configured; cannot generate news proactive message."}
-        if search.provider != "volc_ark_web_search" or not provider_ready(search):
-            return {"ok": False, "message": "Search provider must be a tested Volc Ark Web Search configuration."}
-        try:
-            result = VolcArkWebSearchClient(search).search(
-                f"请联网搜索与「{topics[-1]}」相关的最新内容，必须返回标题、链接、发布时间。",
-                require_published_at=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("debug proactive search failed user_id=%s", user_id)
-            return {"ok": False, "message": str(exc)}
-        sources = result.get("sources") or []
-        if not sources:
-            return {"ok": False, "message": "Search result did not include verifiable sources."}
-        text = f"我刚看到和「{topics[-1]}」有关的新内容：{result.get('summary') or sources[0].get('title')}"
-    else:
-        text = "今天有一件小事想告诉你。"
-    return {"ok": True, "event": {"event_type": "proactive_message", "payload": {"title": "小樱想和你说话", "text": text}}}
+    ensure_seed(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID)
+    return pending_proactive_response(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID, generate_news=True)
 
 
 @app.post("/api/debug/advance-time")

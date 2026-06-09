@@ -4,7 +4,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/widget_bg"
-    android:padding="12dp">
+    android:padding="10dp">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -14,10 +14,11 @@
 
         <ImageView
             android:id="@+id/widget_icon"
-            android:layout_width="78dp"
-            android:layout_height="78dp"
+            android:layout_width="112dp"
+            android:layout_height="96dp"
             android:contentDescription="@string/app_name"
-            android:src="@drawable/ic_chibi_sakura" />
+            android:scaleType="fitCenter"
+            android:src="@drawable/chibi_sakura_widget" />
 
         <LinearLayout
             android:layout_width="0dp"
@@ -32,7 +33,7 @@
                 android:layout_height="wrap_content"
                 android:text="小樱"
                 android:textColor="#4A2A2B"
-                android:textSize="18sp"
+                android:textSize="17sp"
                 android:textStyle="bold" />
 
             <TextView
@@ -52,7 +53,21 @@
                 android:padding="7dp"
                 android:text="今天也想听你说说话。"
                 android:textColor="#563238"
-                android:textSize="13sp" />
+                android:textSize="13sp"
+                android:maxLines="2" />
         </LinearLayout>
     </LinearLayout>
+
+    <TextView
+        android:id="@+id/widget_badge"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:layout_gravity="top|end"
+        android:background="@drawable/widget_badge"
+        android:gravity="center"
+        android:text="1"
+        android:textColor="#FFFFFFFF"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
 </FrameLayout>

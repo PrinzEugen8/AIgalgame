@@ -28,6 +28,45 @@
       <div><span>图片生成</span><strong id="status-image">-</strong></div>
     </section>
 
+    <section class="management-grid" aria-label="角色与音色管理">
+      <article class="manager" id="characterManager">
+        <header>
+          <div>
+            <p class="eyebrow">Character</p>
+            <h2>角色设定管理</h2>
+          </div>
+          <span class="badge" id="characterStatus">等待加载</span>
+        </header>
+        <div class="tab-row" id="characterTabs"></div>
+        <div id="characterEditor" class="editor-placeholder">正在加载角色设定...</div>
+      </article>
+
+      <article class="manager" id="voiceManager">
+        <header>
+          <div>
+            <p class="eyebrow">TTS Voices</p>
+            <h2>音色库</h2>
+          </div>
+          <span class="badge" id="voiceStatus">等待加载</span>
+        </header>
+        <form class="voice-form" id="voiceForm">
+          <label><span>voice_id（新增可留空）</span><input name="voice_id" placeholder="voice_sakura_zh"></label>
+          <label><span>TTS Provider</span><select name="provider_id"></select></label>
+          <label><span>显示名称</span><input name="label" placeholder="小樱中文音色"></label>
+          <label><span>speaker 音色 ID *</span><input name="speaker" required></label>
+          <label><span>resource_id *</span><input name="resource_id" required></label>
+          <label><span>语言</span><select name="language"><option value="zh">中文</option><option value="ja">日文</option></select></label>
+          <label class="inline-check"><input type="checkbox" name="enabled" checked><span>启用</span></label>
+          <div class="actions">
+            <button type="submit">保存音色</button>
+            <button type="button" class="secondary" id="voiceNew">新建</button>
+          </div>
+        </form>
+        <div class="voice-list" id="voiceList"></div>
+        <pre id="voiceResult">等待音色操作...</pre>
+      </article>
+    </section>
+
     <section class="grid" id="providerGrid" aria-label="在线服务配置"></section>
 
     <section class="debug">
