@@ -41,9 +41,9 @@ import androidx.webkit.WebViewAssetLoader
 import org.json.JSONObject
 
 private val Live2DStageBaseHeight = 650.dp
-private const val Live2DWebStageUrl = "https://appassets.androidplatform.net/assets/live2d-web/official/index.html"
+private const val Live2DWebStageUrl = "https://appassets.androidplatform.net/assets/live2d-web/index.html"
 private const val Live2DWebTag = "Live2DWebStage"
-private const val Live2DWebStageVersion = "official-core-direct-v1"
+private const val Live2DWebStageVersion = "pixi-cubism4-runtime-v3"
 private const val Live2DWebClassroomBackground = "live2d-web/backgrounds/classroom.png"
 private const val Live2DDefaultModelAssetPath = "live2d/models/Haru/Haru.model3.json"
 
@@ -169,7 +169,7 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
             modelAssetPath = Live2DDefaultModelAssetPath,
             modelAssetPresent = true,
             rendererAvailable = true,
-            statusMessage = "Live2D official self test"
+            statusMessage = "Live2D Pixi runtime self test"
         )
     }
     Live2DWebStage(

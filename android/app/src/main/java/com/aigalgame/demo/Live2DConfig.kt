@@ -1,9 +1,17 @@
 package com.aigalgame.demo
 
 object Live2DCharacterConfigs {
-    const val OfficialCoreAssetPath = "live2d/sdk/live2dcubismcore.min.js"
-    const val OfficialStageAssetPath = "live2d-web/official/index.html"
+    const val OfficialCoreAssetPath = "live2d-web/vendor/live2dcubismcore.min.js"
+    const val OfficialStageAssetPath = "live2d-web/index.html"
+    const val PixiAssetPath = "live2d-web/vendor/pixi.min.js"
+    const val CubismRuntimeAssetPath = "live2d-web/vendor/cubism4.min.js"
     const val DefaultModelAssetPath = "live2d/models/Haru/Haru.model3.json"
+    val RequiredRuntimeAssetPaths = listOf(
+        OfficialCoreAssetPath,
+        OfficialStageAssetPath,
+        PixiAssetPath,
+        CubismRuntimeAssetPath
+    )
 
     private val defaultEmotionBindings = mapOf(
         "calm" to Live2DEmotionBinding(expression = "Neutral", motion = "Idle"),
