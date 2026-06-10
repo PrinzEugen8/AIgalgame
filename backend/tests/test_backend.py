@@ -19,11 +19,11 @@ from app import providers  # noqa: E402
 from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User  # noqa: E402
-from app.opening import consume_ready_opening, prepare_opening  # noqa: E402
+from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User  # noqa: E402
+from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
-from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, provider_presets, upsert_provider  # noqa: E402
+from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
 from app.schemas import EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
@@ -62,6 +62,7 @@ def test_admin_routes_do_not_expose_secrets() -> None:
 def test_provider_presets() -> None:
     payload = client.get("/api/config/provider-presets").json()
     assert payload["llm"][0]["provider"] == "volc_ark"
+    assert [item["provider"] for item in payload["llm_task"]] == ["volc_ark", "deepseek", "openai_compatible"]
     tts_fields = {item["name"] for item in payload["tts"][0]["fields"]}
     assert {"credential_mode", "parameter_mode", "resource_id", "speaker", "x_api_key", "access_key", "emotion_map"}.issubset(tts_fields)
     search_fields = {item["name"] for item in payload["search"][0]["fields"]}
@@ -69,6 +70,38 @@ def test_provider_presets() -> None:
     assert payload["search"][0]["supports_models"] is True
     assert [item["provider"] for item in payload["image"]] == ["doubao_seedream", "openai_gpt_image", "gemini_image"]
     assert "supports_web_search" not in str(payload)
+
+
+def test_task_llm_prefers_task_provider_and_falls_back_to_chat_provider() -> None:
+    with SessionLocal() as session:
+        chat = upsert_provider(
+            session,
+            ProviderConfigIn(
+                provider_id="test_task_fallback_llm",
+                kind="llm",
+                provider="deepseek",
+                base_url="https://api.deepseek.com",
+                model="chat-model",
+            ),
+        )
+        task = upsert_provider(
+            session,
+            ProviderConfigIn(
+                provider_id="test_task_primary_llm",
+                kind="llm_task",
+                provider="deepseek",
+                base_url="https://api.deepseek.com",
+                model="task-model",
+            ),
+        )
+        selected = get_task_llm_provider(session)
+        assert selected is not None
+        assert selected.provider_id == task.provider_id
+        task.enabled = False
+        session.commit()
+        selected = get_task_llm_provider(session)
+        assert selected is not None
+        assert selected.provider_id == chat.provider_id
 
 
 def test_provider_enablement_is_exclusive_and_legacy_duplicates_are_deduped() -> None:
@@ -868,6 +901,323 @@ def test_normal_reply_option_does_not_apply_relation_delta() -> None:
         providers.HTTP_TRANSPORT = None
 
 
+def test_free_user_message_does_not_apply_relation_delta() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "lines": [{"text": "我听见啦。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 3, "trust": 2, "dependency": 1, "mood": 3},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="free_delta_user", character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_free_delta_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, "free_delta_user")
+            relation = session.execute(
+                select(RelationState).where(RelationState.user_id == "free_delta_user", RelationState.character_id == "sakura")
+            ).scalar_one()
+            user.story_completed = True
+            user.tts_enabled = False
+            before = (relation.affection, relation.trust, relation.dependency, relation.mood)
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id="free_delta_user",
+                    character_id="sakura",
+                    session_id="free_delta_session",
+                    payload={"text": "今天在做什么？"},
+                    client_context={"local_time": "2026-06-10T10:15:00+08:00"},
+                ),
+            )
+            session.refresh(relation)
+            assert (relation.affection, relation.trust, relation.dependency, relation.mood) == before
+            assert result.payload["relation_delta"] == {"affection": 0, "trust": 0, "dependency": 0, "mood": 0}
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_option_selected_can_apply_relation_delta() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "reply_mode": "key_moment",
+                "lines": [{"text": "嗯，这个约定我会认真记住。", "emotion": "shy", "pose": "shy"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 3, "trust": 2, "dependency": 1, "mood": 3},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="option_delta_user", character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_option_delta_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, "option_delta_user")
+            relation = session.execute(
+                select(RelationState).where(RelationState.user_id == "option_delta_user", RelationState.character_id == "sakura")
+            ).scalar_one()
+            user.story_completed = True
+            user.tts_enabled = False
+            before = (relation.affection, relation.trust, relation.dependency, relation.mood)
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="option_selected",
+                    user_id="option_delta_user",
+                    character_id="sakura",
+                    session_id="option_delta_session",
+                    payload={"reply_text": "那我们周末约会吧。"},
+                ),
+            )
+            session.refresh(relation)
+            assert (relation.affection, relation.trust, relation.dependency, relation.mood) == (
+                before[0] + 3,
+                before[1] + 2,
+                before[2] + 1,
+                before[3] + 3,
+            )
+            assert result.payload["relation_delta"] == {"affection": 3, "trust": 2, "dependency": 1, "mood": 3}
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_schedule_question_prompt_includes_actual_slot_context() -> None:
+    seen_prompt = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        body = json.loads(request.content.decode())
+        seen_prompt = body["messages"][1]["content"]
+        assert "【今日真实日程】" in seen_prompt
+        assert "当前：10:15-10:30 上课和整理笔记" in seen_prompt
+        assert "刚刚/上一段：10:00-10:15 上课和整理笔记" in seen_prompt
+        content = json.dumps(
+            {
+                "lines": [{"text": "刚刚是在教室上课和整理笔记。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="schedule_prompt_user", character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_schedule_prompt_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, "schedule_prompt_user")
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id="schedule_prompt_user",
+                    character_id="sakura",
+                    session_id="schedule_prompt_session",
+                    payload={"text": "刚刚的日程安排是什么？"},
+                    client_context={"local_time": "2026-06-10T10:15:00+08:00"},
+                ),
+            )
+            assert "上课和整理笔记" in result.payload["lines"][0]["text"]
+            assert "像素解谜" not in seen_prompt
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_memory_interest_requires_explicit_user_interest() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"interest_filter_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "lines": [{"text": "我会按真实日程回答你。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [{"layer": "chat", "content": "用户最近关注：像素解谜", "importance": 0.9, "confidence": 0.9}],
+                "interest_topics": ["像素解谜"],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_interest_filter_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+
+            handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id="interest_filter_session",
+                    payload={"text": "刚刚的日程安排是什么？"},
+                    client_context={"local_time": "2026-06-10T10:15:00+08:00"},
+                ),
+            )
+            leaked = session.query(Memory).filter(Memory.user_id == user_id, Memory.content.contains("像素解谜")).all()
+            assert leaked == []
+
+            handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id="interest_filter_session",
+                    payload={"text": "我最近关注像素解谜。"},
+                    client_context={"local_time": "2026-06-10T10:15:00+08:00"},
+                ),
+            )
+            saved = session.query(Memory).filter(Memory.user_id == user_id, Memory.content.contains("像素解谜")).all()
+            assert saved
+            assert "像素解谜" in json.loads(user.interest_topics_json)
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_subject_hint_prevents_ambiguous_user_message_from_role_memory() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"subject_hint_user_{suffix}"
+    seen_prompt = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        body = json.loads(request.content.decode())
+        seen_prompt = body["messages"][1]["content"]
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "按用户自己的陈述回应。",
+                "lines": [{"text": "诶？你刚刚这么说，我会有点在意啦。", "emotion": "shy", "pose": "shy"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [
+                    {"layer": "temporary", "content": "用户调侃我去找别的女人，我解释了我在玩像素解谜", "importance": 0.9, "confidence": 0.9}
+                ],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_subject_hint_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+
+            handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id=f"subject_hint_session_{suffix}",
+                    payload={"text": "刚刚找别的女人去了"},
+                ),
+            )
+            assert "目标消息没有明确主语时，默认动作主体是用户自己" in seen_prompt
+            assert "不要把用户自己的陈述改写成" in seen_prompt
+            leaked = session.query(Memory).filter(Memory.user_id == user_id, Memory.content.contains("调侃我去找别的女人")).all()
+            assert leaked == []
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         content = json.dumps(
@@ -1232,6 +1582,96 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
             session.refresh(cache)
             assert cache.status == "consumed"
             assert tts_bodies
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_prepare_due_openings_prewarms_proactive_cache() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"opening_prewarm_user_{suffix}"
+    llm_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal llm_calls
+        llm_calls += 1
+        body = json.loads(request.content.decode())
+        assert "主动想告诉用户" in body["messages"][1]["content"]
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "服务端预生成主动开场。",
+                "lines": [{"text": "我刚刚想把这件小事提前告诉你。", "emotion": "happy", "pose": "happy"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_opening_prewarm_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"prewarm_memory_{suffix}",
+                title="小樱有话想说",
+                text="主动想告诉用户：我想起了一件适合打开时说的小事。",
+                priority=90,
+                scheduled_at=datetime.fromisoformat("2026-06-09T11:50:00+08:00"),
+            )
+            assert event is not None
+            session.commit()
+
+            prewarmed = prepare_due_openings(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+            )
+            assert prewarmed["prepared"] == 1
+            session.refresh(event)
+            assert event.prepared_at
+            assert json.loads(event.prepared_payload_json)
+            cache = session.execute(
+                select(OpeningCache).where(OpeningCache.proactive_event_id == event.proactive_event_id, OpeningCache.status == "ready")
+            ).scalar_one()
+            assert cache.kind == "proactive"
+
+            ready = consume_ready_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                session_id=f"opening_prewarm_session_{suffix}",
+                local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
+            )
+            assert ready.payload["cached"] is True
+            assert ready.payload["opening_kind"] == "proactive"
+            assert ready.payload["proactive_event_id"] == event.proactive_event_id
+            assert llm_calls == 1
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -1621,3 +2061,110 @@ def test_moment_feedback_writes_memory() -> None:
         proactive = session.query(ProactiveEvent).filter(ProactiveEvent.source_type == "moment_interaction", ProactiveEvent.status == "pending").order_by(ProactiveEvent.created_at.desc()).first()
         assert proactive is not None
         assert "朋友圈" in proactive.text
+
+
+def test_calendar_returns_only_important_events() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"calendar_event_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="sakura")
+        session.add(
+            CalendarEvent(
+                event_id=f"cal_test_date_event_{suffix}",
+                user_id=user_id,
+                character_id="sakura",
+                event_date="2026-06-12",
+                title="第一次约会",
+                category="relationship",
+                description="你们约好一起去看展。",
+                salience=95,
+                source_type="admin",
+            )
+        )
+        session.commit()
+
+    june = client.get(f"/api/calendar?month=2026-06&user_id={user_id}&character_id=sakura").json()
+    titles = [item["title"] for item in june["days"]]
+    assert "第一次约会" in titles
+    assert "端午节" in titles
+    assert "睡觉" not in titles
+    assert "想和你聊天" not in titles
+    date_event = next(item for item in june["days"] if item["title"] == "第一次约会")
+    assert date_event["category"] == "relationship"
+    assert date_event["day_note"]
+
+    with SessionLocal() as session:
+        user = session.get(User, user_id)
+        anniversary_month = str(user.created_at)[:7]
+    anniversary = client.get(f"/api/calendar?month={anniversary_month}&user_id={user_id}&character_id=sakura").json()
+    assert "相识纪念日" in [item["title"] for item in anniversary["days"]]
+
+
+def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"admin_user_{suffix}"
+    created = client.post(
+        "/api/admin/users",
+        json={
+            "user_id": user_id,
+            "display_name": "测试用户",
+            "story_completed": True,
+            "interest_topics": ["日程调试"],
+            "proactive_daily_limit": "medium",
+        },
+    ).json()
+    assert created["user_id"] == user_id
+    assert created["display_name"] == "测试用户"
+    users_page = client.get(f"/api/admin/users?q={user_id}&page=1&page_size=5").json()
+    assert users_page["total"] >= 1
+    assert users_page["page"] == 1
+    assert any(item["user_id"] == user_id for item in users_page["items"])
+
+    updated = client.put(
+        f"/api/admin/users/{user_id}",
+        json={"display_name": "测试用户改", "tts_enabled": False, "news_enabled": False, "proactive_daily_limit": "high"},
+    ).json()
+    assert updated["display_name"] == "测试用户改"
+    assert updated["tts_enabled"] is False
+    assert updated["proactive_daily_limit"] == "high"
+
+    relation = client.put(
+        f"/api/admin/users/{user_id}/relation",
+        json={"affection": 321, "trust": 222, "dependency": 111, "mood": -12, "relationship_stage": "测试阶段"},
+    ).json()
+    assert relation["affection"] == 321
+    assert relation["relationship_stage"] == "测试阶段"
+
+    memory = client.post(
+        f"/api/admin/users/{user_id}/memories",
+        json={"content": "用户手动添加的测试记忆", "layer": "core", "importance": 0.8, "confidence": 0.9},
+    ).json()
+    assert memory["content"] == "用户手动添加的测试记忆"
+    memories_page = client.get(f"/api/admin/users/{user_id}/memories?q=测试记忆&page=1&page_size=5").json()
+    assert memories_page["total"] == 1
+    assert memories_page["items"][0]["memory_id"] == memory["memory_id"]
+    hidden = client.put(f"/api/admin/memories/{memory['memory_id']}", json={"hidden": True}).json()
+    assert hidden["hidden"] is True
+    assert client.delete(f"/api/admin/memories/{memory['memory_id']}").json()["ok"] is True
+
+    event = client.post(
+        "/api/admin/calendar-events",
+        json={
+            "user_id": user_id,
+            "character_id": "sakura",
+            "date": "2026-06-18",
+            "title": "测试约会日",
+            "category": "relationship",
+            "salience": 88,
+        },
+    ).json()
+    assert event["title"] == "测试约会日"
+    calendar_page = client.get(f"/api/admin/calendar-events?user_id={user_id}&character_id=sakura&q=测试约会日&page=1&page_size=5").json()
+    assert calendar_page["total"] == 1
+    assert calendar_page["items"][0]["event_id"] == event["event_id"]
+    changed = client.put(f"/api/admin/calendar-events/{event['event_id']}", json={"hidden": True, "title": "测试约会日改"}).json()
+    assert changed["hidden"] is True
+    assert changed["title"] == "测试约会日改"
+    assert client.delete(f"/api/admin/calendar-events/{event['event_id']}").json()["ok"] is True
+
+    assert client.delete(f"/api/admin/users/{user_id}").json()["ok"] is True

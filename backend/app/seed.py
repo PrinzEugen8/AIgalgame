@@ -5,6 +5,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .calendar_events import ensure_calendar_events
 from .models import Character, MediaAsset, Moment, MomentInteraction, RelationState, User
 
 
@@ -136,3 +137,4 @@ def ensure_seed(session: Session, user_id: str = DEFAULT_USER_ID, character_id: 
         session.add(RelationState(user_id=user_id, character_id=character_id))
     _ensure_initial_moments(session, character_id)
     session.commit()
+    ensure_calendar_events(session, user_id=user_id, character_id=character_id)

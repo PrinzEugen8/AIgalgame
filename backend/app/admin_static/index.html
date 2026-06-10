@@ -23,12 +23,21 @@
 
     <section class="status">
       <div><span>LLM</span><strong id="status-llm">-</strong></div>
+      <div><span>任务模型</span><strong id="status-llm_task">-</strong></div>
       <div><span>TTS</span><strong id="status-tts">-</strong></div>
       <div><span>联网搜索</span><strong id="status-search">-</strong></div>
       <div><span>图片生成</span><strong id="status-image">-</strong></div>
     </section>
 
-    <section class="management-grid" aria-label="角色与音色管理">
+    <nav class="admin-nav" aria-label="管理台分页">
+      <button type="button" class="active" data-page-target="users">用户数据</button>
+      <button type="button" data-page-target="character">角色与音色</button>
+      <button type="button" data-page-target="providers">在线服务</button>
+      <button type="button" data-page-target="debug">调试与日志</button>
+    </nav>
+
+    <section class="admin-page" data-page="character" hidden>
+      <div class="management-grid" aria-label="角色与音色管理">
       <article class="manager" id="characterManager">
         <header>
           <div>
@@ -65,11 +74,67 @@
         <div class="voice-list" id="voiceList"></div>
         <pre id="voiceResult">等待音色操作...</pre>
       </article>
+      </div>
     </section>
 
-    <section class="grid" id="providerGrid" aria-label="在线服务配置"></section>
+    <section class="admin-page test-data manager" id="testDataManager" data-page="users" aria-label="测试数据管理">
+      <header>
+        <div>
+          <p class="eyebrow">Test Data</p>
+          <h2>用户数据库</h2>
+        </div>
+        <span class="badge" id="testDataStatus">等待加载</span>
+      </header>
+      <div class="table-toolbar">
+        <label><span>搜索用户</span><input id="userSearch" placeholder="user_id / 显示名"></label>
+        <label><span>每页</span><select id="userPageSize"><option>10</option><option selected>20</option><option>50</option></select></label>
+        <button type="button" class="secondary" id="userRefresh">刷新</button>
+        <button type="button" id="userCreate">新建用户</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="userTable">
+          <thead>
+            <tr>
+              <th>用户</th>
+              <th>时区</th>
+              <th>主动频率</th>
+              <th>开场</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="pager" id="userPager"></div>
+      <div class="test-data-grid">
+        <section>
+          <h3>用户详情</h3>
+          <div id="userEditor" class="editor-placeholder">正在加载用户...</div>
+        </section>
+        <section>
+          <h3>关系数值</h3>
+          <div id="relationEditor" class="editor-placeholder">请选择用户。</div>
+        </section>
+        <section>
+          <h3>记忆</h3>
+          <div id="memoryEditor" class="editor-placeholder">请选择用户。</div>
+        </section>
+        <section>
+          <h3>日历关系事件</h3>
+          <div id="calendarEventEditor" class="editor-placeholder">请选择用户。</div>
+        </section>
+        <section>
+          <h3>主动消息</h3>
+          <div id="proactiveEditor" class="editor-placeholder">请选择用户。</div>
+        </section>
+      </div>
+    </section>
 
-    <section class="debug">
+    <section class="admin-page" data-page="providers" hidden>
+      <div class="grid" id="providerGrid" aria-label="在线服务配置"></div>
+    </section>
+
+    <section class="admin-page debug" data-page="debug" hidden>
       <div>
         <p class="eyebrow">验收工具</p>
         <h2>调试触发</h2>

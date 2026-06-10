@@ -12,26 +12,31 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, update_calendar_event
 from .database import get_session, init_db
 from .diagnostics import tail_diagnostics, write_diagnostic
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
+    CalendarEvent,
     MediaAsset,
     Memory,
     Moment,
     MomentInteraction,
+    Message,
+    OpeningCache,
     ProviderConfig,
+    ProactiveEvent,
     RelationState,
     ScheduleSlot,
     TtsVoiceProfile,
     User,
 )
-from .opening import consume_ready_opening, prepare_opening
+from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
 from .pipeline import handle_event
 from .proactive import consume_proactive_event, create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
 from .providers import (
@@ -192,7 +197,7 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     providers = [provider_to_out(item).model_dump() for item in session.execute(select(ProviderConfig)).scalars().all()]
     configured = {
         kind: any(item["kind"] == kind and item["ready"] for item in providers)
-        for kind in ("llm", "tts", "search", "image")
+        for kind in ("llm", "llm_task", "tts", "search", "image")
     }
     return {"ok": True, "providers": providers, "configured": configured}
 
@@ -223,6 +228,373 @@ def _character_to_out(character: Character) -> CharacterAdminOut:
         tts_voice_type=character.tts_voice_type,
         tts_voice_profile_id=character.tts_voice_profile_id,
         key_reply_threshold=character.key_reply_threshold,
+    )
+
+
+def _user_to_out(user: User) -> dict[str, Any]:
+    return {
+        "user_id": user.user_id,
+        "display_name": user.display_name,
+        "timezone": user.timezone,
+        "sleep_start": user.sleep_start,
+        "sleep_end": user.sleep_end,
+        "interest_topics": load_json(user.interest_topics_json, []),
+        "proactive_daily_limit": user.proactive_daily_limit,
+        "notifications_enabled": user.notifications_enabled,
+        "widget_bubbles_enabled": user.widget_bubbles_enabled,
+        "news_enabled": user.news_enabled,
+        "tts_enabled": user.tts_enabled,
+        "story_completed": user.story_completed,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+    }
+
+
+def _relation_to_out(relation: RelationState) -> dict[str, Any]:
+    return {
+        "id": relation.id,
+        "user_id": relation.user_id,
+        "character_id": relation.character_id,
+        "affection": relation.affection,
+        "trust": relation.trust,
+        "dependency": relation.dependency,
+        "mood": relation.mood,
+        "relationship_stage": relation.relationship_stage,
+        "last_interaction_at": relation.last_interaction_at,
+        "updated_at": relation.updated_at,
+    }
+
+
+def _memory_to_out(memory: Memory) -> dict[str, Any]:
+    return {
+        "memory_id": memory.memory_id,
+        "user_id": memory.user_id,
+        "character_id": memory.character_id,
+        "layer": memory.layer,
+        "content": memory.content,
+        "source_event_id": memory.source_event_id,
+        "importance": memory.importance,
+        "confidence": memory.confidence,
+        "hidden": memory.hidden,
+        "created_at": memory.created_at,
+    }
+
+
+def _calendar_event_to_out(event: CalendarEvent) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "user_id": event.user_id,
+        "character_id": event.character_id,
+        "date": event.event_date,
+        "title": event.title,
+        "category": event.category,
+        "description": event.description,
+        "salience": event.salience,
+        "repeats_yearly": event.repeats_yearly,
+        "source_type": event.source_type,
+        "source_id": event.source_id,
+        "hidden": event.hidden,
+        "created_at": event.created_at,
+        "updated_at": event.updated_at,
+    }
+
+
+def _proactive_event_to_out(event: ProactiveEvent) -> dict[str, Any]:
+    return {
+        "proactive_event_id": event.proactive_event_id,
+        "user_id": event.user_id,
+        "character_id": event.character_id,
+        "source_type": event.source_type,
+        "source_id": event.source_id,
+        "title": event.title,
+        "text": event.text,
+        "priority": event.priority,
+        "status": event.status,
+        "dedupe_key": event.dedupe_key,
+        "scheduled_at": event.scheduled_at,
+        "expires_at": event.expires_at,
+        "prepared": bool(load_json(event.prepared_payload_json, {}) and event.prepared_at),
+        "prepared_at": event.prepared_at,
+        "prepare_error": event.prepare_error,
+        "delivered_at": event.delivered_at,
+        "opened_at": event.opened_at,
+        "reflected_at": event.reflected_at,
+        "created_at": event.created_at,
+        "updated_at": event.updated_at,
+    }
+
+
+def _page_bounds(page: int, page_size: int) -> tuple[int, int]:
+    safe_page = max(1, int(page or 1))
+    safe_size = max(1, min(int(page_size or 20), 100))
+    return safe_page, safe_size
+
+
+def _page_response(items: list[Any], total: int, page: int, page_size: int) -> dict[str, Any]:
+    return {"ok": True, "items": items, "total": total, "page": page, "page_size": page_size}
+
+
+def _paginate_scalars(session: Session, stmt: Any, *, page: int, page_size: int) -> tuple[list[Any], int, int, int]:
+    page, page_size = _page_bounds(page, page_size)
+    total = int(session.execute(select(func.count()).select_from(stmt.order_by(None).subquery())).scalar_one() or 0)
+    rows = session.execute(stmt.offset((page - 1) * page_size).limit(page_size)).scalars().all()
+    return rows, total, page, page_size
+
+
+def _ensure_relation(session: Session, user_id: str, character_id: str = DEFAULT_CHARACTER_ID) -> RelationState:
+    relation = session.execute(
+        select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
+    ).scalar_one_or_none()
+    if relation is None:
+        relation = RelationState(user_id=user_id, character_id=character_id)
+        session.add(relation)
+        session.commit()
+    return relation
+
+
+def _update_user_fields(user: User, payload: dict[str, Any]) -> None:
+    for field in ("display_name", "timezone", "sleep_start", "sleep_end"):
+        if field in payload:
+            setattr(user, field, str(payload.get(field) or "").strip())
+    if "proactive_daily_limit" in payload:
+        user.proactive_daily_limit = str(payload.get("proactive_daily_limit") or "low").strip() or "low"
+    for field in ("notifications_enabled", "widget_bubbles_enabled", "news_enabled", "tts_enabled", "story_completed"):
+        if field in payload:
+            setattr(user, field, bool(payload.get(field)))
+    if "interest_topics" in payload:
+        topics = [str(item).strip() for item in payload.get("interest_topics") or [] if str(item).strip()]
+        user.interest_topics_json = dump_json(topics[-20:])
+    user.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+
+@app.get("/api/admin/users")
+def admin_users(page: int = 1, page_size: int = 20, q: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    ensure_seed(session)
+    stmt = select(User)
+    query = q.strip()
+    if query:
+        like = f"%{query}%"
+        stmt = stmt.where(or_(User.user_id.like(like), User.display_name.like(like)))
+    stmt = stmt.order_by(User.created_at.desc())
+    users, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    user_ids = [item.user_id for item in users]
+    relation_stmt = select(RelationState).where(RelationState.user_id.in_(user_ids)).order_by(RelationState.user_id)
+    relations = session.execute(relation_stmt).scalars().all() if user_ids else []
+    return {
+        **_page_response([_user_to_out(item) for item in users], total, page, page_size),
+        "relations": [_relation_to_out(item) for item in relations],
+    }
+
+
+@app.post("/api/admin/users")
+def admin_create_user(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    user_id = str(payload.get("user_id") or "").strip() or uid("user")
+    if session.get(User, user_id) is not None:
+        raise HTTPException(status_code=409, detail="user_id already exists")
+    user = User(user_id=user_id)
+    _update_user_fields(user, payload)
+    session.add(user)
+    session.commit()
+    ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    return _user_to_out(session.get(User, user_id))
+
+
+@app.put("/api/admin/users/{user_id}")
+def admin_update_user(user_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    user = session.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    _update_user_fields(user, payload)
+    session.commit()
+    return _user_to_out(user)
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    user = session.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    for model, field in (
+        (RelationState, RelationState.user_id),
+        (Memory, Memory.user_id),
+        (ScheduleSlot, ScheduleSlot.user_id),
+        (Message, Message.user_id),
+        (ProactiveEvent, ProactiveEvent.user_id),
+        (OpeningCache, OpeningCache.user_id),
+        (CalendarEvent, CalendarEvent.user_id),
+    ):
+        session.query(model).filter(field == user_id).delete(synchronize_session=False)
+    session.delete(user)
+    session.commit()
+    return {"ok": True}
+
+
+@app.put("/api/admin/users/{user_id}/relation")
+def admin_update_relation(user_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = str(payload.get("character_id") or DEFAULT_CHARACTER_ID)
+    if session.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    relation = _ensure_relation(session, user_id, character_id)
+    for field in ("affection", "trust", "dependency"):
+        if field in payload:
+            setattr(relation, field, clamp(int(payload.get(field) or 0), 0, 1000))
+    if "mood" in payload:
+        relation.mood = clamp(int(payload.get("mood") or 0), -100, 100)
+    if "relationship_stage" in payload:
+        relation.relationship_stage = str(payload.get("relationship_stage") or "").strip() or relation.relationship_stage
+    relation.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    session.commit()
+    return _relation_to_out(relation)
+
+
+@app.get("/api/admin/users/{user_id}/memories")
+def admin_memories(user_id: str, page: int = 1, page_size: int = 20, q: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    stmt = select(Memory).where(Memory.user_id == user_id)
+    query = q.strip()
+    if query:
+        like = f"%{query}%"
+        stmt = stmt.where(or_(Memory.content.like(like), Memory.layer.like(like), Memory.character_id.like(like)))
+    stmt = stmt.order_by(Memory.created_at.desc())
+    memories, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_memory_to_out(item) for item in memories], total, page, page_size)
+
+
+@app.post("/api/admin/users/{user_id}/memories")
+def admin_create_memory(user_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    if session.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content required")
+    memory = Memory(
+        memory_id=str(payload.get("memory_id") or uid("mem")),
+        user_id=user_id,
+        character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID),
+        layer=str(payload.get("layer") or "chat"),
+        content=content,
+        source_event_id=str(payload.get("source_event_id") or "admin"),
+        importance=float(payload.get("importance") or 0.5),
+        confidence=float(payload.get("confidence") or 0.8),
+        hidden=bool(payload.get("hidden", False)),
+    )
+    session.add(memory)
+    session.commit()
+    return _memory_to_out(memory)
+
+
+@app.put("/api/admin/memories/{memory_id}")
+def admin_update_memory(memory_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    memory = session.get(Memory, memory_id)
+    if memory is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    for field in ("layer", "content", "source_event_id"):
+        if field in payload:
+            setattr(memory, field, str(payload.get(field) or "").strip())
+    if "importance" in payload:
+        memory.importance = float(payload.get("importance") or 0)
+    if "confidence" in payload:
+        memory.confidence = float(payload.get("confidence") or 0)
+    if "hidden" in payload:
+        memory.hidden = bool(payload.get("hidden"))
+    session.commit()
+    return _memory_to_out(memory)
+
+
+@app.delete("/api/admin/memories/{memory_id}")
+def admin_delete_memory(memory_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    memory = session.get(Memory, memory_id)
+    if memory is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    session.delete(memory)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/admin/calendar-events")
+def admin_calendar_events(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    ensure_calendar_events(session, user_id=user_id, character_id=character_id)
+    stmt = select(CalendarEvent).where(CalendarEvent.user_id.in_(["", user_id]), CalendarEvent.character_id.in_(["", character_id]))
+    query = q.strip()
+    if query:
+        like = f"%{query}%"
+        stmt = stmt.where(or_(CalendarEvent.title.like(like), CalendarEvent.description.like(like), CalendarEvent.category.like(like)))
+    stmt = stmt.order_by(CalendarEvent.event_date, CalendarEvent.salience.desc())
+    events, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_calendar_event_to_out(item) for item in events], total, page, page_size)
+
+
+@app.post("/api/admin/calendar-events")
+def admin_create_calendar_event(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    try:
+        event = create_calendar_event(session, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _calendar_event_to_out(event)
+
+
+@app.put("/api/admin/calendar-events/{event_id}")
+def admin_update_calendar_event(event_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    event = update_calendar_event(session, event_id, payload)
+    if event is None:
+        raise HTTPException(status_code=404, detail="calendar event not found")
+    return _calendar_event_to_out(event)
+
+
+@app.delete("/api/admin/calendar-events/{event_id}")
+def admin_delete_calendar_event(event_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    event = session.get(CalendarEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="calendar event not found")
+    session.delete(event)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/admin/proactive-events")
+def admin_proactive_events(
+    user_id: str = "",
+    character_id: str = "",
+    status: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(ProactiveEvent)
+    if user_id:
+        stmt = stmt.where(ProactiveEvent.user_id == user_id)
+    if character_id:
+        stmt = stmt.where(ProactiveEvent.character_id == character_id)
+    if status:
+        stmt = stmt.where(ProactiveEvent.status == status)
+    query = q.strip()
+    if query:
+        like = f"%{query}%"
+        stmt = stmt.where(or_(ProactiveEvent.title.like(like), ProactiveEvent.text.like(like), ProactiveEvent.source_type.like(like)))
+    stmt = stmt.order_by(ProactiveEvent.created_at.desc())
+    events, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_proactive_event_to_out(item) for item in events], total, page, page_size)
+
+
+@app.post("/api/admin/proactive-events/prewarm")
+def admin_prewarm_proactive(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or "")
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    return prepare_due_openings(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        limit=int(body.get("limit") or 8),
+        generate_news=bool(body.get("generate_news", False)),
     )
 
 
@@ -652,20 +1024,17 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
 @app.get("/api/calendar")
 def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     day = datetime.now()
-    ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     prefix = month or day.strftime("%Y-%m")
-    rows = session.execute(select(ScheduleSlot).where(ScheduleSlot.user_id == user_id, ScheduleSlot.schedule_date.like(f"{prefix}%"))).scalars().all()
+    items = calendar_items(session, user_id=user_id, character_id=character_id, month=prefix)
+    notes = {item["date"]: day_note(session, day=item["date"]) for item in items}
     return {
         "month": prefix,
         "days": [
             {
-                "date": row.schedule_date,
-                "start_at": row.start_at,
-                "activity_title": row.activity_title,
-                "status": row.actual_status,
-                "salience": row.salience,
+                **item,
+                "day_note": notes.get(item["date"], ""),
             }
-            for row in rows
+            for item in items
         ],
     }
 
@@ -724,7 +1093,9 @@ def debug_logs(limit: int = 200) -> dict[str, Any]:
 def debug_proactive(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     logger.info("debug proactive requested user_id=%s", user_id)
     ensure_seed(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID)
-    return pending_proactive_response(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID, generate_news=True)
+    pending = pending_proactive_response(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID, generate_news=True)
+    prewarm = prepare_due_openings(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID, limit=1, generate_news=False)
+    return {"ok": True, "pending": pending, "prewarm": prewarm}
 
 
 @app.post("/api/debug/advance-time")

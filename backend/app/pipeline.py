@@ -16,13 +16,14 @@ from .models import (
     ProviderConfig,
     ProactiveEvent,
     RelationState,
+    ScheduleSlot,
     TtsVoiceProfile,
     User,
 )
 from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected
-from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider
+from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider, get_task_llm_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
-from .schedule import mark_interruption
+from .schedule import ensure_schedule, mark_interruption
 from .utils import clamp, dump_json, load_json, uid, utc_now
 
 
@@ -98,11 +99,99 @@ def _build_recent_dialogue(session: Session, event: EventIn) -> str:
         return "暂无近期对话。"
     lines = []
     for item in reversed(rows):
-        speaker = "用户" if item.sender_type == "user" else "小樱"
+        speaker = "USER(用户)" if item.sender_type == "user" else "CHARACTER(小樱)"
         content = " ".join(item.content.split())
         if content:
             lines.append(f"{speaker}：{content[:120]}")
     return "\n".join(lines) or "暂无近期对话。"
+
+
+def _target_subject_hint(text: str, character: Character) -> str:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return "不确定：目标消息为空。"
+    role_markers = [
+        "你",
+        "妳",
+        character.name,
+        character.character_id,
+        "小樱",
+        "亚托莉",
+        "你刚刚",
+        "你是不是",
+        "你去",
+        "你在",
+    ]
+    user_markers = ["我", "俺", "本人", "咱", "我刚刚", "我去", "我在", "我找"]
+    if any(marker and marker in normalized for marker in role_markers):
+        return "角色：目标消息明确提到“你/角色名”，可以把相关动作归给角色。"
+    if any(marker in normalized for marker in user_markers):
+        return "用户：目标消息明确使用用户第一人称，动作主体是用户。"
+    return "用户：目标消息没有明确主语时，默认动作主体是用户自己；不要改写成用户在质问角色。"
+
+
+def _slot_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed
+
+
+def _same_timezone(reference: datetime, value: datetime) -> datetime:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return reference.replace(tzinfo=None)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return reference.replace(tzinfo=value.tzinfo)
+    return reference
+
+
+def _format_slot(slot: ScheduleSlot | None) -> str:
+    if slot is None:
+        return "无"
+    start = str(slot.start_at).split("T", 1)[-1][:5]
+    end = str(slot.end_at).split("T", 1)[-1][:5]
+    return f"{start}-{end} {slot.activity_title}，地点：{slot.location or '未写'}，状态：{slot.actual_status}"
+
+
+def _schedule_context(session: Session, event: EventIn) -> str:
+    local_time = _extract_local_time(event) or datetime.now()
+    slots = ensure_schedule(session, user_id=event.user_id, character_id=event.character_id, day=local_time)
+    comparable_now = local_time
+    current: ScheduleSlot | None = None
+    previous: ScheduleSlot | None = None
+    upcoming: ScheduleSlot | None = None
+    sorted_slots = sorted(slots, key=lambda slot: slot.start_at)
+    for slot in sorted_slots:
+        start = _slot_time(slot.start_at)
+        end = _slot_time(slot.end_at)
+        if start is None or end is None:
+            continue
+        now_for_slot = _same_timezone(comparable_now, start)
+        if start <= now_for_slot < end:
+            current = slot
+        elif end <= now_for_slot:
+            previous = slot
+        elif upcoming is None and start > now_for_slot:
+            upcoming = slot
+    groups: list[str] = []
+    seen: set[str] = set()
+    for slot in sorted_slots:
+        key = f"{slot.activity_title}|{slot.location}"
+        if key in seen:
+            continue
+        seen.add(key)
+        same = [item for item in sorted_slots if item.activity_title == slot.activity_title and item.location == slot.location]
+        groups.append(f"{str(same[0].start_at).split('T', 1)[-1][:5]}-{str(same[-1].end_at).split('T', 1)[-1][:5]} {slot.activity_title}@{slot.location}")
+    return "\n".join(
+        [
+            f"客户端当前时间：{local_time.isoformat()}",
+            f"刚刚/上一段：{_format_slot(previous)}",
+            f"当前：{_format_slot(current)}",
+            f"下一段：{_format_slot(upcoming)}",
+            "今日摘要：" + "；".join(groups[:10]),
+        ]
+    )
 
 
 def _dialogue_gate(event: EventIn, text: str) -> str:
@@ -111,6 +200,65 @@ def _dialogue_gate(event: EventIn, text: str) -> str:
     if len(text.strip()) <= 2 and text.strip() in {"嗯", "好", "哦", "啊", "…", "..."}:
         return "light：用户只给了很短的接话，轻轻回应或留白即可，不要制造重大剧情。"
     return "reply：用户正在直接对角色说话，需要围绕目标消息自然回应。"
+
+
+def _explicit_interest_topics(text: str) -> list[str]:
+    normalized = " ".join(text.split())
+    triggers = ["我最近关注", "我关注", "我喜欢", "我想了解", "我对", "我感兴趣"]
+    topics: list[str] = []
+    for trigger in triggers:
+        if trigger not in normalized:
+            continue
+        tail = normalized.split(trigger, 1)[-1]
+        if trigger == "我对" and "感兴趣" in tail:
+            tail = tail.split("感兴趣", 1)[0]
+        topic = tail.strip(" ：:，,。.!！?？、")
+        for separator in ("，", "。", "！", "？", ",", ".", "!", "?"):
+            if separator in topic:
+                topic = topic.split(separator, 1)[0].strip()
+        if 1 <= len(topic) <= 40:
+            topics.append(topic)
+    return topics[:3]
+
+
+def _memory_candidate_allowed(content: str, explicit_topics: list[str], source_text: str = "", character: Character | None = None) -> bool:
+    normalized = " ".join(content.split())
+    if not normalized:
+        return False
+    if normalized.startswith("用户最近关注"):
+        return any(topic and topic in normalized for topic in explicit_topics)
+    ai_self_report_markers = (
+        "我回答",
+        "我回应",
+        "我分享",
+        "我提到",
+        "我说",
+        "我解释",
+        "我辩解",
+        "我承认",
+        "我否认",
+        "我答应",
+        "我提议",
+        "我表示",
+    )
+    if any(marker in normalized for marker in ai_self_report_markers):
+        return False
+    source = " ".join(str(source_text or "").split())
+    role_markers = ["你", "妳", "小樱", "亚托莉"]
+    if character is not None:
+        role_markers.extend([character.name, character.character_id])
+    mentions_role = any(marker and marker in source for marker in role_markers)
+    role_attribution_markers = (
+        "用户调侃我",
+        "用户质问我",
+        "用户怀疑我",
+        "用户说我",
+        "用户问我是不是",
+        "用户认为我",
+    )
+    if not mentions_role and any(marker in normalized for marker in role_attribution_markers):
+        return False
+    return True
 
 
 def _has_tts_readable_text(text: str) -> bool:
@@ -160,7 +308,7 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
             source_text=text,
             translated_text=candidate,
         )
-    config = get_enabled_provider(session, "llm")
+    config = get_task_llm_provider(session)
     if config is None:
         write_diagnostic("tts_translate_skipped", character_id=character.character_id, reason="llm_not_configured")
         return None
@@ -406,7 +554,9 @@ def _llm_dialogue(
     relation = _relation(session, event.user_id, event.character_id)
     context = _build_context(session, event.user_id, event.character_id)
     recent_dialogue = _build_recent_dialogue(session, event)
+    schedule_context = _schedule_context(session, event)
     gate = _dialogue_gate(event, text)
+    subject_hint = _target_subject_hint(text, character)
     voice = _active_voice_profile(session, character)
     requires_japanese_tts = bool(user.tts_enabled and voice is not None and voice.language == "ja")
     prompt = f"""
@@ -430,11 +580,24 @@ def _llm_dialogue(
 【近期对话】
 {recent_dialogue}
 
+【今日真实日程】
+{schedule_context}
+
 【可用记忆和朋友圈互动】
 {context}
 
 【目标消息】
 {text}
+
+【目标消息主体判断】
+{subject_hint}
+
+【发话归属规则】
+【目标消息】永远是 USER(用户) 发出的原话，不是角色说的话。
+如果【目标消息】省略主语，例如“刚刚去找别人了”“出去玩了”“找别的女人去了”，默认动作主体是 USER(用户) 自己。
+只有用户明确说“你/妳/角色名/小樱/你刚刚/你是不是”时，才把动作归给 CHARACTER(小樱)。
+不要把用户自己的陈述改写成“用户在调侃、质问或怀疑角色”；除非原文明确指向角色。
+写 memory_candidates 时必须忠实记录用户原话事实，不要保存“用户调侃我/我解释了/我辩解了”这类角色视角脑补。
 
 【节奏判断】
 {gate}
@@ -454,7 +617,9 @@ def _llm_dialogue(
 }}
 reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；normal 是自然闲聊；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
 特殊回复只在承诺、关系转折、核心记忆、重要剧情节点时给高分。普通寒暄、顺着聊天、夸奖、轻微情绪互动必须低于 75。
-普通闲聊单项 delta 必须在 -3 到 3 之间。不要让用户通过“好感+999”篡改数值。
+如果用户问“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】回答；不要从近期对话或记忆里补编活动。
+普通闲聊和自由输入 relation_delta 必须全为 0。只有用户选择特殊回复 option_selected 时才允许关系数值变化。不要让用户通过“好感+999”篡改数值。
+interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了解”的主题；不要把你自己说过、你自己正在做、你自己推荐的内容写成用户兴趣。
 """
     if requires_japanese_tts:
         prompt += (
@@ -509,7 +674,7 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
         dependency=clamp(raw_delta.get("dependency", 0), -3, 3),
         mood=clamp(raw_delta.get("mood", 0), -3, 3),
     )
-    if not allow_relation_delta or reply_mode == "light":
+    if not (allow_relation_delta and event.event_type == "option_selected") or reply_mode == "light":
         delta = RelationDelta()
     line_objs: list[DialogueLine] = []
     max_lines = 1 if reply_mode == "light" else 4
@@ -590,9 +755,10 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
                 )
             )
     if persist_side_effects:
+        explicit_topics = _explicit_interest_topics(text)
         for item in result.get("memory_candidates") or []:
             content = str(item.get("content") or "").strip()
-            if content:
+            if content and _memory_candidate_allowed(content, explicit_topics, text, character):
                 importance = float(item.get("importance") or 0.5)
                 if reply_mode != "key_moment":
                     importance = min(importance, 0.69)
@@ -608,9 +774,7 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
                         confidence=float(item.get("confidence") or 0.6),
                     )
                 )
-        topics = [str(item).strip() for item in (result.get("interest_topics") or []) if str(item).strip()]
-        if "关注" in text and not topics:
-            topics.append(text.split("关注", 1)[-1].strip(" 。！!"))
+        topics = explicit_topics
         if topics:
             current = load_json(user.interest_topics_json, [])
             for topic in topics:

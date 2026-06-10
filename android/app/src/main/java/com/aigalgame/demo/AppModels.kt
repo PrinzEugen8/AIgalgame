@@ -84,11 +84,15 @@ fun OutfitPlacement.coerceForStage(): OutfitPlacement {
 }
 
 data class CalendarItem(
+    val id: String = "",
     val date: String,
     val startAt: String,
     val title: String,
     val status: String,
-    val salience: Int
+    val salience: Int,
+    val category: String = "",
+    val description: String = "",
+    val dayNote: String = ""
 )
 
 enum class AppScreen {

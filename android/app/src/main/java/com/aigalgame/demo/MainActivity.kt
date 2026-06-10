@@ -442,11 +442,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val item = rows.optJSONObject(i) ?: continue
                 calendar.add(
                     CalendarItem(
+                        id = item.optString("event_id"),
                         date = item.optString("date"),
                         startAt = item.optString("start_at"),
-                        title = item.optString("activity_title"),
+                        title = item.optString("title", item.optString("activity_title")),
                         status = item.optString("status"),
-                        salience = item.optInt("salience")
+                        salience = item.optInt("salience"),
+                        category = item.optString("category"),
+                        description = item.optString("description"),
+                        dayNote = item.optString("day_note")
                     )
                 )
             }
@@ -1681,7 +1685,6 @@ fun CalendarDayCell(date: LocalDate?, events: List<CalendarItem>, selected: Bool
     }
     val today = date == LocalDate.now()
     val important = events.maxByOrNull { it.salience }
-    val festival = festivalLabel(date).takeIf { it != "樱花季" }
     val bg = when {
         selected -> Color(0xFFFFC8A8)
         today -> Color(0xFFFFEEE2)
@@ -1696,9 +1699,17 @@ fun CalendarDayCell(date: LocalDate?, events: List<CalendarItem>, selected: Bool
     ) {
         Column(Modifier.padding(5.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             Text(date.dayOfMonth.toString(), color = Color(0xFF4A2A2B), fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            val label = festival ?: important?.title.orEmpty()
+            val label = important?.title.orEmpty()
             if (label.isNotBlank()) {
-                Text(label, color = if ((important?.salience ?: 0) >= 60 || festival != null) Color(0xFFE86B8D) else Color(0xFF8F6B62), fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+                Text(
+                    label,
+                    color = if ((important?.salience ?: 0) >= 80) Color(0xFFE86B8D) else Color(0xFF8F6B62),
+                    fontSize = 8.sp,
+                    lineHeight = 9.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
             }
         }
     }
@@ -1707,8 +1718,8 @@ fun CalendarDayCell(date: LocalDate?, events: List<CalendarItem>, selected: Bool
 @Composable
 fun DayScheduleCard(date: LocalDate, events: List<CalendarItem>, modifier: Modifier = Modifier) {
     val summary = events
-        .distinctBy { it.title }
-        .sortedBy { it.startAt }
+        .distinctBy { it.id.ifBlank { it.title } }
+        .sortedByDescending { it.salience }
         .take(6)
     Card(
         modifier = modifier,
@@ -1719,15 +1730,13 @@ fun DayScheduleCard(date: LocalDate, events: List<CalendarItem>, modifier: Modif
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${date.monthValue}月${date.dayOfMonth}日 ${weekdayLabel(date)}", color = Color(0xFF5C2E24), fontSize = 20.sp, fontWeight = FontWeight.Bold)
             if (summary.isEmpty()) {
-                Text("今天暂时没有特别安排。", color = Color(0xFF8F6B62))
+                Text("这天暂时没有特别节点。", color = Color(0xFF8F6B62))
             } else {
                 summary.forEach { item ->
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(formatEventTime(item.startAt), color = Color(0xFFE86B8D), fontWeight = FontWeight.Bold, modifier = Modifier.width(54.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(item.title, color = Color(0xFF3D211D), fontWeight = FontWeight.Bold)
-                            Text(statusLabel(item.status), color = Color(0xFF8F6B62), fontSize = 12.sp)
-                        }
+                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(item.title, color = Color(0xFF3D211D), fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                        Text("${categoryLabel(item.category)} · ${statusLabel(item.status)}", color = Color(0xFFE86B8D), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text(dayEventNote(item), color = Color(0xFF8F6B62), fontSize = 14.sp, lineHeight = 20.sp)
                     }
                 }
             }
@@ -1756,8 +1765,30 @@ fun statusLabel(value: String): String {
     return when (value) {
         "completed" -> "已完成"
         "interrupted" -> "被打断"
+        "today" -> "今天"
         "pending" -> "待进行"
         else -> value.ifBlank { "待进行" }
+    }
+}
+
+fun categoryLabel(value: String): String {
+    return when (value) {
+        "holiday" -> "节假日"
+        "relationship" -> "关系节点"
+        "date" -> "约会"
+        "anniversary" -> "纪念日"
+        "special" -> "特殊日"
+        else -> "特别节点"
+    }
+}
+
+fun dayEventNote(item: CalendarItem): String {
+    if (item.dayNote.isNotBlank()) return item.dayNote
+    if (item.description.isNotBlank()) return item.description
+    return when (item.status) {
+        "completed" -> "小樱把这一天收进了回忆。"
+        "today" -> "小樱想认真感受今天。"
+        else -> "小樱对这一天有一点小小的期待。"
     }
 }
 

@@ -1,5 +1,6 @@
 const kinds = [
   { id: "llm", title: "LLM 对话模型" },
+  { id: "llm_task", title: "LLM 任务模型" },
   { id: "tts", title: "TTS 语音合成" },
   { id: "search", title: "联网搜索" },
   { id: "image", title: "图片生成" },
@@ -12,8 +13,20 @@ const state = {
   characters: [],
   voices: [],
   ttsProviders: [],
+  users: [],
+  relations: [],
+  memories: [],
+  calendarEvents: [],
+  proactiveEvents: [],
+  currentPage: "users",
+  userPage: { page: 1, pageSize: 20, total: 0, q: "" },
+  memoryPage: { page: 1, pageSize: 10, total: 0, q: "" },
+  calendarPage: { page: 1, pageSize: 10, total: 0, q: "" },
+  proactivePage: { page: 1, pageSize: 10, total: 0, q: "" },
   activeCharacterId: "",
+  activeUserId: "",
   editingVoiceId: "",
+  editingCalendarEventId: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -43,6 +56,35 @@ function escapeHtml(value) {
     "\"": "&quot;",
     "'": "&#39;",
   }[char]));
+}
+
+function pageCount(meta) {
+  return Math.max(1, Math.ceil((meta.total || 0) / (meta.pageSize || 20)));
+}
+
+function renderPager(node, meta, onChange) {
+  const totalPages = pageCount(meta);
+  node.innerHTML = `
+    <span>第 ${escapeHtml(meta.page)} / ${escapeHtml(totalPages)} 页 · 共 ${escapeHtml(meta.total || 0)} 条</span>
+    <button type="button" class="secondary" data-page-step="prev" ${meta.page <= 1 ? "disabled" : ""}>上一页</button>
+    <button type="button" class="secondary" data-page-step="next" ${meta.page >= totalPages ? "disabled" : ""}>下一页</button>
+  `;
+  node.querySelectorAll("[data-page-step]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const next = button.dataset.pageStep === "prev" ? meta.page - 1 : meta.page + 1;
+      onChange(Math.min(totalPages, Math.max(1, next)));
+    });
+  });
+}
+
+function switchPage(page) {
+  state.currentPage = page;
+  document.querySelectorAll("[data-page]").forEach((section) => {
+    section.hidden = section.dataset.page !== page;
+  });
+  document.querySelectorAll("[data-page-target]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.pageTarget === page);
+  });
 }
 
 function providerList(kind) {
@@ -529,6 +571,526 @@ async function loadCharacters() {
   renderCharacterManager();
 }
 
+function activeUser() {
+  return state.users.find((item) => item.user_id === state.activeUserId) || state.users[0] || null;
+}
+
+function activeRelation() {
+  const user = activeUser();
+  if (!user) return null;
+  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === "sakura")
+    || state.relations.find((item) => item.user_id === user.user_id)
+    || null;
+}
+
+function renderUserTabs() {
+  $("#userSearch").value = state.userPage.q;
+  $("#userPageSize").value = String(state.userPage.pageSize);
+  const tbody = $("#userTable tbody");
+  tbody.innerHTML = "";
+  for (const user of state.users) {
+    const row = document.createElement("tr");
+    row.classList.toggle("active", user.user_id === state.activeUserId);
+    row.innerHTML = `
+      <td><strong>${escapeHtml(user.display_name || user.user_id)}</strong><br><small>${escapeHtml(user.user_id)}</small></td>
+      <td>${escapeHtml(user.timezone || "")}</td>
+      <td>${escapeHtml(user.proactive_daily_limit || "")}</td>
+      <td>${user.story_completed ? "已完成" : "未完成"}</td>
+      <td><small>${escapeHtml(user.updated_at || user.created_at || "")}</small></td>
+    `;
+    row.addEventListener("click", async () => {
+      state.activeUserId = user.user_id;
+      state.memoryPage.page = 1;
+      state.calendarPage.page = 1;
+      state.proactivePage.page = 1;
+      await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+      renderTestData();
+    });
+    tbody.appendChild(row);
+  }
+  renderPager($("#userPager"), state.userPage, async (page) => {
+    state.userPage.page = page;
+    await loadTestData();
+  });
+}
+
+function renderUserEditor() {
+  const node = $("#userEditor");
+  const user = activeUser();
+  if (!user) {
+    node.textContent = "还没有用户。";
+    return;
+  }
+  node.innerHTML = `
+    <form class="compact-form" id="userForm">
+      <label><span>user_id</span><input name="user_id" value="${escapeHtml(user.user_id)}" disabled></label>
+      <label><span>显示名</span><input name="display_name" value="${escapeHtml(user.display_name || "")}"></label>
+      <label><span>时区</span><input name="timezone" value="${escapeHtml(user.timezone || "Asia/Hong_Kong")}"></label>
+      <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "low")}"></label>
+      <label><span>睡眠开始</span><input name="sleep_start" value="${escapeHtml(user.sleep_start || "00:30")}"></label>
+      <label><span>睡眠结束</span><input name="sleep_end" value="${escapeHtml(user.sleep_end || "08:00")}"></label>
+      <label class="wide"><span>兴趣主题（一行一个）</span><textarea name="interest_topics">${escapeHtml((user.interest_topics || []).join("\n"))}</textarea></label>
+      <label class="inline-check"><input type="checkbox" name="story_completed" ${user.story_completed ? "checked" : ""}><span>已完成开场剧情</span></label>
+      <label class="inline-check"><input type="checkbox" name="tts_enabled" ${user.tts_enabled ? "checked" : ""}><span>TTS</span></label>
+      <label class="inline-check"><input type="checkbox" name="notifications_enabled" ${user.notifications_enabled ? "checked" : ""}><span>通知</span></label>
+      <label class="inline-check"><input type="checkbox" name="news_enabled" ${user.news_enabled ? "checked" : ""}><span>新闻</span></label>
+      <div class="actions">
+        <button type="submit">保存用户</button>
+        <button type="button" class="secondary" id="deleteUser">删除用户</button>
+      </div>
+    </form>
+  `;
+  $("#userForm").addEventListener("submit", saveUser);
+  $("#deleteUser").addEventListener("click", deleteUser);
+}
+
+function renderRelationEditor() {
+  const node = $("#relationEditor");
+  const relation = activeRelation();
+  if (!relation) {
+    node.textContent = "还没有关系数据，保存一次用户后会自动补齐。";
+    return;
+  }
+  node.innerHTML = `
+    <form class="compact-form" id="relationForm">
+      <label><span>好感</span><input name="affection" type="number" value="${escapeHtml(relation.affection)}"></label>
+      <label><span>信任</span><input name="trust" type="number" value="${escapeHtml(relation.trust)}"></label>
+      <label><span>依赖</span><input name="dependency" type="number" value="${escapeHtml(relation.dependency)}"></label>
+      <label><span>心情</span><input name="mood" type="number" value="${escapeHtml(relation.mood)}"></label>
+      <label class="wide"><span>关系阶段</span><input name="relationship_stage" value="${escapeHtml(relation.relationship_stage || relation.stage || "")}"></label>
+      <div class="actions"><button type="submit">保存关系数值</button></div>
+    </form>
+  `;
+  $("#relationForm").addEventListener("submit", saveRelation);
+}
+
+function renderMemoryEditor() {
+  const node = $("#memoryEditor");
+  const user = activeUser();
+  if (!user) {
+    node.textContent = "请选择用户。";
+    return;
+  }
+  const items = state.memories.map((memory) => `
+    <article class="data-item ${memory.hidden ? "hidden" : ""}">
+      <strong>${escapeHtml(memory.layer)} · ${escapeHtml(memory.importance)}</strong>
+      <div>${escapeHtml(memory.content)}</div>
+      <small>${escapeHtml(memory.created_at || "")}</small>
+      <div class="actions">
+        <button type="button" class="secondary" data-memory-hide="${escapeHtml(memory.memory_id)}">${memory.hidden ? "恢复" : "隐藏"}</button>
+        <button type="button" class="secondary" data-memory-delete="${escapeHtml(memory.memory_id)}">删除</button>
+      </div>
+    </article>
+  `).join("");
+  node.innerHTML = `
+    <form class="memory-form" id="memoryForm">
+      <label><span>层级</span><input name="layer" value="chat"></label>
+      <label><span>重要度</span><input name="importance" type="number" step="0.01" value="0.5"></label>
+      <label><span>置信度</span><input name="confidence" type="number" step="0.01" value="0.8"></label>
+      <label><span>角色</span><input name="character_id" value="sakura"></label>
+      <label class="wide"><span>内容</span><textarea name="content"></textarea></label>
+      <div class="actions"><button type="submit">新增记忆</button></div>
+    </form>
+    <div class="table-toolbar">
+      <label><span>搜索记忆</span><input id="memorySearch" value="${escapeHtml(state.memoryPage.q)}" placeholder="内容 / 层级 / 角色"></label>
+      <label><span>每页</span><select id="memoryPageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.memoryPage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
+      <button type="button" class="secondary" id="memoryRefresh">刷新</button>
+      <span></span>
+    </div>
+    <div class="data-list">${items || "<small>暂无记忆</small>"}</div>
+    <div class="pager" id="memoryPager"></div>
+  `;
+  $("#memoryForm").addEventListener("submit", createMemory);
+  $("#memoryRefresh").addEventListener("click", async () => {
+    state.memoryPage.q = $("#memorySearch").value.trim();
+    state.memoryPage.pageSize = Number($("#memoryPageSize").value || 10);
+    state.memoryPage.page = 1;
+    await loadMemories();
+    renderMemoryEditor();
+  });
+  $("#memorySearch").addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    state.memoryPage.q = $("#memorySearch").value.trim();
+    state.memoryPage.page = 1;
+    await loadMemories();
+    renderMemoryEditor();
+  });
+  $("#memoryPageSize").addEventListener("change", async () => {
+    state.memoryPage.pageSize = Number($("#memoryPageSize").value || 10);
+    state.memoryPage.page = 1;
+    await loadMemories();
+    renderMemoryEditor();
+  });
+  renderPager($("#memoryPager"), state.memoryPage, async (page) => {
+    state.memoryPage.page = page;
+    await loadMemories();
+    renderMemoryEditor();
+  });
+  node.querySelectorAll("[data-memory-hide]").forEach((button) => button.addEventListener("click", () => toggleMemory(button.dataset.memoryHide)));
+  node.querySelectorAll("[data-memory-delete]").forEach((button) => button.addEventListener("click", () => deleteMemory(button.dataset.memoryDelete)));
+}
+
+function editableCalendarEvents() {
+  const user = activeUser();
+  if (!user) return [];
+  return state.calendarEvents.filter((item) => item.category !== "holiday" || item.user_id === user.user_id);
+}
+
+function renderCalendarEventEditor() {
+  const node = $("#calendarEventEditor");
+  const user = activeUser();
+  if (!user) {
+    node.textContent = "请选择用户。";
+    return;
+  }
+  const editing = state.calendarEvents.find((item) => item.event_id === state.editingCalendarEventId) || null;
+  const events = editableCalendarEvents().map((event) => `
+    <article class="data-item ${event.hidden ? "hidden" : ""}">
+      <strong>${escapeHtml(event.date)} · ${escapeHtml(event.title)}</strong>
+      <small>${escapeHtml(event.category)} · salience ${escapeHtml(event.salience)} ${event.repeats_yearly ? "· 每年重复" : ""}</small>
+      <div>${escapeHtml(event.description || "")}</div>
+      <div class="actions">
+        <button type="button" class="secondary" data-calendar-edit="${escapeHtml(event.event_id)}">编辑</button>
+        <button type="button" class="secondary" data-calendar-hide="${escapeHtml(event.event_id)}">${event.hidden ? "恢复" : "隐藏"}</button>
+        <button type="button" class="secondary" data-calendar-delete="${escapeHtml(event.event_id)}">删除</button>
+      </div>
+    </article>
+  `).join("");
+  node.innerHTML = `
+    <form class="calendar-event-form" id="calendarEventForm">
+      <label><span>日期</span><input name="date" type="date" value="${escapeHtml(editing?.date || new Date().toISOString().slice(0, 10))}"></label>
+      <label><span>标题</span><input name="title" value="${escapeHtml(editing?.title || "")}" placeholder="约会日"></label>
+      <label><span>分类</span><select name="category">
+        ${["relationship", "date", "anniversary", "special"].map((category) => `<option value="${category}" ${category === (editing?.category || "relationship") ? "selected" : ""}>${category}</option>`).join("")}
+      </select></label>
+      <label><span>显著度</span><input name="salience" type="number" value="${escapeHtml(editing?.salience ?? 86)}"></label>
+      <label class="inline-check"><input type="checkbox" name="repeats_yearly" ${editing?.repeats_yearly ? "checked" : ""}><span>每年重复</span></label>
+      <label class="inline-check"><input type="checkbox" name="hidden" ${editing?.hidden ? "checked" : ""}><span>隐藏</span></label>
+      <label class="wide"><span>描述/期待</span><textarea name="description">${escapeHtml(editing?.description || "")}</textarea></label>
+      <div class="actions">
+        <button type="submit">${editing ? "保存日历事件" : "新增日历事件"}</button>
+        <button type="button" class="secondary" id="calendarEventNew">新建</button>
+      </div>
+    </form>
+    <div class="table-toolbar">
+      <label><span>搜索事件</span><input id="calendarSearch" value="${escapeHtml(state.calendarPage.q)}" placeholder="标题 / 描述 / 分类"></label>
+      <label><span>每页</span><select id="calendarPageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.calendarPage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
+      <button type="button" class="secondary" id="calendarRefresh">刷新</button>
+      <span></span>
+    </div>
+    <div class="data-list">${events || "<small>暂无可编辑事件</small>"}</div>
+    <div class="pager" id="calendarPager"></div>
+  `;
+  $("#calendarEventForm").addEventListener("submit", saveCalendarEvent);
+  $("#calendarRefresh").addEventListener("click", async () => {
+    state.calendarPage.q = $("#calendarSearch").value.trim();
+    state.calendarPage.pageSize = Number($("#calendarPageSize").value || 10);
+    state.calendarPage.page = 1;
+    await loadCalendarEvents();
+    renderCalendarEventEditor();
+  });
+  $("#calendarSearch").addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    state.calendarPage.q = $("#calendarSearch").value.trim();
+    state.calendarPage.page = 1;
+    await loadCalendarEvents();
+    renderCalendarEventEditor();
+  });
+  $("#calendarPageSize").addEventListener("change", async () => {
+    state.calendarPage.pageSize = Number($("#calendarPageSize").value || 10);
+    state.calendarPage.page = 1;
+    await loadCalendarEvents();
+    renderCalendarEventEditor();
+  });
+  renderPager($("#calendarPager"), state.calendarPage, async (page) => {
+    state.calendarPage.page = page;
+    await loadCalendarEvents();
+    renderCalendarEventEditor();
+  });
+  $("#calendarEventNew").addEventListener("click", () => {
+    state.editingCalendarEventId = "";
+    renderCalendarEventEditor();
+  });
+  node.querySelectorAll("[data-calendar-edit]").forEach((button) => button.addEventListener("click", () => {
+    state.editingCalendarEventId = button.dataset.calendarEdit;
+    renderCalendarEventEditor();
+  }));
+  node.querySelectorAll("[data-calendar-hide]").forEach((button) => button.addEventListener("click", () => toggleCalendarEvent(button.dataset.calendarHide)));
+  node.querySelectorAll("[data-calendar-delete]").forEach((button) => button.addEventListener("click", () => deleteCalendarEvent(button.dataset.calendarDelete)));
+}
+
+function renderProactiveEditor() {
+  const node = $("#proactiveEditor");
+  const user = activeUser();
+  if (!user) {
+    node.textContent = "请选择用户。";
+    return;
+  }
+  const items = state.proactiveEvents.map((event) => `
+    <article class="data-item">
+      <strong>${escapeHtml(event.status)} · ${escapeHtml(event.source_type)} · priority ${escapeHtml(event.priority)}</strong>
+      <div>${escapeHtml(event.title || "")}</div>
+      <small>${escapeHtml(event.text || "")}</small>
+      <small>scheduled ${escapeHtml(event.scheduled_at || "")} · prepared ${event.prepared ? "yes" : "no"} ${event.prepare_error ? `· ${escapeHtml(event.prepare_error)}` : ""}</small>
+    </article>
+  `).join("");
+  node.innerHTML = `
+    <div class="table-toolbar">
+      <label><span>搜索主动消息</span><input id="proactiveSearch" value="${escapeHtml(state.proactivePage.q)}" placeholder="标题 / 内容 / 来源"></label>
+      <label><span>每页</span><select id="proactivePageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.proactivePage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
+      <button type="button" class="secondary" id="proactiveRefresh">刷新</button>
+      <button type="button" id="proactivePrewarm">预生成</button>
+    </div>
+    <div class="data-list">${items || "<small>暂无主动消息</small>"}</div>
+    <div class="pager" id="proactivePager"></div>
+  `;
+  $("#proactiveRefresh").addEventListener("click", async () => {
+    state.proactivePage.q = $("#proactiveSearch").value.trim();
+    state.proactivePage.pageSize = Number($("#proactivePageSize").value || 10);
+    state.proactivePage.page = 1;
+    await loadProactiveEvents();
+    renderProactiveEditor();
+  });
+  $("#proactiveSearch").addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    state.proactivePage.q = $("#proactiveSearch").value.trim();
+    state.proactivePage.page = 1;
+    await loadProactiveEvents();
+    renderProactiveEditor();
+  });
+  $("#proactivePageSize").addEventListener("change", async () => {
+    state.proactivePage.pageSize = Number($("#proactivePageSize").value || 10);
+    state.proactivePage.page = 1;
+    await loadProactiveEvents();
+    renderProactiveEditor();
+  });
+  $("#proactivePrewarm").addEventListener("click", async () => {
+    await api("/api/admin/proactive-events/prewarm", {
+      method: "POST",
+      body: JSON.stringify({ user_id: state.activeUserId, character_id: "sakura", limit: 4 }),
+    });
+    await loadProactiveEvents();
+    renderProactiveEditor();
+  });
+  renderPager($("#proactivePager"), state.proactivePage, async (page) => {
+    state.proactivePage.page = page;
+    await loadProactiveEvents();
+    renderProactiveEditor();
+  });
+}
+
+function renderTestData() {
+  $("#testDataStatus").textContent = `${state.userPage.total || state.users.length} 个用户`;
+  $("#testDataStatus").classList.toggle("ok", (state.userPage.total || state.users.length) > 0);
+  renderUserTabs();
+  renderUserEditor();
+  renderRelationEditor();
+  renderMemoryEditor();
+  renderCalendarEventEditor();
+  renderProactiveEditor();
+}
+
+async function loadUsers() {
+  const params = new URLSearchParams({
+    page: String(state.userPage.page),
+    page_size: String(state.userPage.pageSize),
+    q: state.userPage.q,
+  });
+  const payload = await api(`/api/admin/users?${params.toString()}`);
+  state.users = payload.items || [];
+  state.relations = payload.relations || [];
+  state.userPage.total = payload.total || state.users.length;
+  state.userPage.page = payload.page || state.userPage.page;
+  state.userPage.pageSize = payload.page_size || state.userPage.pageSize;
+  if (!state.activeUserId || !state.users.some((item) => item.user_id === state.activeUserId)) {
+    state.activeUserId = state.users[0]?.user_id || "";
+  }
+}
+
+async function loadMemories() {
+  if (!state.activeUserId) {
+    state.memories = [];
+    state.memoryPage.total = 0;
+    return;
+  }
+  const params = new URLSearchParams({
+    page: String(state.memoryPage.page),
+    page_size: String(state.memoryPage.pageSize),
+    q: state.memoryPage.q,
+  });
+  const payload = await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories?${params.toString()}`);
+  state.memories = payload.items || [];
+  state.memoryPage.total = payload.total || state.memories.length;
+  state.memoryPage.page = payload.page || state.memoryPage.page;
+  state.memoryPage.pageSize = payload.page_size || state.memoryPage.pageSize;
+}
+
+async function loadCalendarEvents() {
+  if (!state.activeUserId) {
+    state.calendarEvents = [];
+    state.calendarPage.total = 0;
+    return;
+  }
+  const params = new URLSearchParams({
+    user_id: state.activeUserId,
+    character_id: "sakura",
+    page: String(state.calendarPage.page),
+    page_size: String(state.calendarPage.pageSize),
+    q: state.calendarPage.q,
+  });
+  const payload = await api(`/api/admin/calendar-events?${params.toString()}`);
+  state.calendarEvents = payload.items || [];
+  state.calendarPage.total = payload.total || state.calendarEvents.length;
+  state.calendarPage.page = payload.page || state.calendarPage.page;
+  state.calendarPage.pageSize = payload.page_size || state.calendarPage.pageSize;
+}
+
+async function loadProactiveEvents() {
+  if (!state.activeUserId) {
+    state.proactiveEvents = [];
+    state.proactivePage.total = 0;
+    return;
+  }
+  const params = new URLSearchParams({
+    user_id: state.activeUserId,
+    character_id: "sakura",
+    page: String(state.proactivePage.page),
+    page_size: String(state.proactivePage.pageSize),
+    q: state.proactivePage.q,
+  });
+  const payload = await api(`/api/admin/proactive-events?${params.toString()}`);
+  state.proactiveEvents = payload.items || [];
+  state.proactivePage.total = payload.total || state.proactiveEvents.length;
+  state.proactivePage.page = payload.page || state.proactivePage.page;
+  state.proactivePage.pageSize = payload.page_size || state.proactivePage.pageSize;
+}
+
+async function loadTestData() {
+  await loadUsers();
+  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+  renderTestData();
+}
+
+async function createUser() {
+  const created = await api("/api/admin/users", { method: "POST", body: JSON.stringify({ display_name: "测试用户", story_completed: true }) });
+  state.activeUserId = created.user_id;
+  state.userPage.page = 1;
+  state.userPage.q = "";
+  await loadTestData();
+}
+
+async function saveUser(event) {
+  event.preventDefault();
+  const form = $("#userForm");
+  const payload = {
+    display_name: form.elements.display_name.value.trim(),
+    timezone: form.elements.timezone.value.trim(),
+    sleep_start: form.elements.sleep_start.value.trim(),
+    sleep_end: form.elements.sleep_end.value.trim(),
+    proactive_daily_limit: form.elements.proactive_daily_limit.value.trim(),
+    interest_topics: form.elements.interest_topics.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+    story_completed: form.elements.story_completed.checked,
+    tts_enabled: form.elements.tts_enabled.checked,
+    notifications_enabled: form.elements.notifications_enabled.checked,
+    news_enabled: form.elements.news_enabled.checked,
+  };
+  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}`, { method: "PUT", body: JSON.stringify(payload) });
+  await loadTestData();
+}
+
+async function deleteUser() {
+  if (!window.confirm("确定删除这个用户和关联测试数据？")) return;
+  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}`, { method: "DELETE" });
+  state.activeUserId = "";
+  await loadTestData();
+}
+
+async function saveRelation(event) {
+  event.preventDefault();
+  const form = $("#relationForm");
+  const payload = {
+    character_id: "sakura",
+    affection: Number(form.elements.affection.value || 0),
+    trust: Number(form.elements.trust.value || 0),
+    dependency: Number(form.elements.dependency.value || 0),
+    mood: Number(form.elements.mood.value || 0),
+    relationship_stage: form.elements.relationship_stage.value.trim(),
+  };
+  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/relation`, { method: "PUT", body: JSON.stringify(payload) });
+  await loadTestData();
+}
+
+async function createMemory(event) {
+  event.preventDefault();
+  const form = $("#memoryForm");
+  const payload = {
+    character_id: form.elements.character_id.value.trim() || "sakura",
+    layer: form.elements.layer.value.trim() || "chat",
+    content: form.elements.content.value.trim(),
+    importance: Number(form.elements.importance.value || 0.5),
+    confidence: Number(form.elements.confidence.value || 0.8),
+  };
+  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories`, { method: "POST", body: JSON.stringify(payload) });
+  state.memoryPage.page = 1;
+  await loadMemories();
+  renderMemoryEditor();
+}
+
+async function toggleMemory(memoryId) {
+  const memory = state.memories.find((item) => item.memory_id === memoryId);
+  await api(`/api/admin/memories/${encodeURIComponent(memoryId)}`, { method: "PUT", body: JSON.stringify({ hidden: !memory?.hidden }) });
+  await loadMemories();
+  renderMemoryEditor();
+}
+
+async function deleteMemory(memoryId) {
+  await api(`/api/admin/memories/${encodeURIComponent(memoryId)}`, { method: "DELETE" });
+  await loadMemories();
+  renderMemoryEditor();
+}
+
+async function saveCalendarEvent(event) {
+  event.preventDefault();
+  const form = $("#calendarEventForm");
+  const payload = {
+    user_id: state.activeUserId,
+    character_id: "sakura",
+    date: form.elements.date.value,
+    title: form.elements.title.value.trim(),
+    category: form.elements.category.value,
+    description: form.elements.description.value.trim(),
+    salience: Number(form.elements.salience.value || 80),
+    repeats_yearly: form.elements.repeats_yearly.checked,
+    hidden: form.elements.hidden.checked,
+    source_type: "admin",
+  };
+  const editing = Boolean(state.editingCalendarEventId);
+  await api(editing ? `/api/admin/calendar-events/${encodeURIComponent(state.editingCalendarEventId)}` : "/api/admin/calendar-events", {
+    method: editing ? "PUT" : "POST",
+    body: JSON.stringify(payload),
+  });
+  state.editingCalendarEventId = "";
+  state.calendarPage.page = 1;
+  await loadCalendarEvents();
+  renderCalendarEventEditor();
+}
+
+async function toggleCalendarEvent(eventId) {
+  const item = state.calendarEvents.find((event) => event.event_id === eventId);
+  await api(`/api/admin/calendar-events/${encodeURIComponent(eventId)}`, { method: "PUT", body: JSON.stringify({ hidden: !item?.hidden }) });
+  await loadCalendarEvents();
+  renderCalendarEventEditor();
+}
+
+async function deleteCalendarEvent(eventId) {
+  await api(`/api/admin/calendar-events/${encodeURIComponent(eventId)}`, { method: "DELETE" });
+  await loadCalendarEvents();
+  renderCalendarEventEditor();
+}
+
 function renderCards() {
   const grid = $("#providerGrid");
   grid.innerHTML = "";
@@ -640,12 +1202,40 @@ async function runDebug(path) {
   }
 }
 
+function bindAdminNavigation() {
+  document.querySelectorAll("[data-page-target]").forEach((button) => {
+    button.addEventListener("click", () => switchPage(button.dataset.pageTarget));
+  });
+  $("#userCreate").addEventListener("click", createUser);
+  $("#userRefresh").addEventListener("click", async () => {
+    state.userPage.q = $("#userSearch").value.trim();
+    state.userPage.pageSize = Number($("#userPageSize").value || 20);
+    state.userPage.page = 1;
+    await loadTestData();
+  });
+  $("#userSearch").addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    state.userPage.q = $("#userSearch").value.trim();
+    state.userPage.page = 1;
+    await loadTestData();
+  });
+  $("#userPageSize").addEventListener("change", async () => {
+    state.userPage.pageSize = Number($("#userPageSize").value || 20);
+    state.userPage.page = 1;
+    await loadTestData();
+  });
+  switchPage(state.currentPage);
+}
+
 async function boot() {
   try {
     state.presets = await api("/api/config/provider-presets");
+    bindAdminNavigation();
     await Promise.all([loadPairing(), loadStatus()]);
     await loadVoices();
     await loadCharacters();
+    await loadTestData();
   } catch (error) {
     $("#debugResult").textContent = pretty({ ok: false, message: error.message });
   }

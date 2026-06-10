@@ -99,14 +99,18 @@ def _find_ready_cache(
     proactive_event_id: str = "",
 ) -> OpeningCache | None:
     rows = session.execute(_fresh_cache_query(session, user_id, character_id, now_utc)).scalars().all()
+    fallback: OpeningCache | None = None
     for cache in rows:
         if proactive_event_id and cache.proactive_event_id != proactive_event_id:
             continue
         if _is_cache_fresh(cache, now_utc):
-            return cache
+            if proactive_event_id or cache.kind == "proactive":
+                return cache
+            fallback = fallback or cache
+            continue
         cache.status = "expired"
         cache.updated_at = utc_now()
-    return None
+    return fallback
 
 
 def _store_opening_cache(
@@ -144,6 +148,16 @@ def _store_opening_cache(
 
 def _payload_from_cache(cache: OpeningCache) -> DialoguePayload:
     return DialoguePayload.model_validate(load_json(cache.payload_json, {}))
+
+
+def _payload_from_prepared_event(event: ProactiveEvent) -> DialoguePayload | None:
+    payload = load_json(event.prepared_payload_json, {})
+    if not payload or not event.prepared_at:
+        return None
+    try:
+        return DialoguePayload.model_validate(payload)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _instant_greeting_payload(local_time: datetime | None) -> DialoguePayload:
@@ -231,10 +245,12 @@ def prepare_opening(
 
     if proactive is not None and allow_llm:
         try:
-            payload = _prepare_proactive_payload(session, user, character, proactive)
-            proactive.prepared_payload_json = dump_json(payload.model_dump())
-            proactive.prepared_at = utc_now()
-            proactive.prepare_error = ""
+            payload = _payload_from_prepared_event(proactive)
+            if payload is None:
+                payload = _prepare_proactive_payload(session, user, character, proactive)
+                proactive.prepared_payload_json = dump_json(payload.model_dump())
+                proactive.prepared_at = utc_now()
+                proactive.prepare_error = ""
             cache = _store_opening_cache(
                 session,
                 user_id=user_id,
@@ -265,6 +281,105 @@ def prepare_opening(
     session.commit()
     write_diagnostic("opening_prepared", kind="greeting", cache_id=cache.cache_id)
     return {"ok": True, "prepared": True, "cache_id": cache.cache_id, "kind": "greeting"}
+
+
+def prepare_due_openings(
+    session: Session,
+    *,
+    user_id: str = "",
+    character_id: str = "",
+    local_time: datetime | None = None,
+    limit: int = 8,
+    generate_news: bool = False,
+) -> dict[str, Any]:
+    now_utc = _now(local_time)
+    prepared = 0
+    skipped = 0
+    failed = 0
+    checked = 0
+    users = session.execute(select(User).order_by(User.created_at)).scalars().all()
+    characters = session.execute(select(Character).order_by(Character.character_id)).scalars().all()
+    if user_id:
+        users = [item for item in users if item.user_id == user_id]
+    if character_id:
+        characters = [item for item in characters if item.character_id == character_id]
+    write_diagnostic("proactive_prewarm_started", users=len(users), characters=len(characters), limit=limit)
+    for user in users:
+        if prepared >= limit:
+            break
+        if not user.story_completed or not user.notifications_enabled:
+            skipped += 1
+            continue
+        for character in characters:
+            if prepared >= limit:
+                break
+            checked += 1
+            pending = pending_proactive_response(
+                session,
+                user_id=user.user_id,
+                character_id=character.character_id,
+                local_time=local_time,
+                generate_news=generate_news,
+            )
+            event_payload = pending.get("event") or {}
+            event_id = str(event_payload.get("proactive_event_id") or "")
+            if not event_id:
+                skipped += 1
+                continue
+            event = session.get(ProactiveEvent, event_id)
+            if event is None:
+                skipped += 1
+                continue
+            existing = _find_ready_cache(
+                session,
+                user_id=user.user_id,
+                character_id=character.character_id,
+                now_utc=now_utc,
+                proactive_event_id=event.proactive_event_id,
+            )
+            if existing is not None:
+                skipped += 1
+                continue
+            try:
+                payload = _payload_from_prepared_event(event)
+                if payload is None:
+                    payload = _prepare_proactive_payload(session, user, character, event)
+                    event.prepared_payload_json = dump_json(payload.model_dump())
+                    event.prepared_at = utc_now()
+                    event.prepare_error = ""
+                cache = _store_opening_cache(
+                    session,
+                    user_id=user.user_id,
+                    character_id=character.character_id,
+                    kind="proactive",
+                    payload=payload,
+                    now_utc=now_utc,
+                    proactive_event_id=event.proactive_event_id,
+                )
+                session.commit()
+                prepared += 1
+                write_diagnostic(
+                    "proactive_prewarm_succeeded",
+                    proactive_event_id=event.proactive_event_id,
+                    cache_id=cache.cache_id,
+                    user_id=user.user_id,
+                    character_id=character.character_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                event.prepare_error = str(exc)
+                event.updated_at = utc_now()
+                session.commit()
+                failed += 1
+                write_diagnostic(
+                    "proactive_prewarm_failed",
+                    proactive_event_id=event.proactive_event_id,
+                    user_id=user.user_id,
+                    character_id=character.character_id,
+                    message=str(exc),
+                )
+    result = {"ok": True, "checked": checked, "prepared": prepared, "skipped": skipped, "failed": failed}
+    write_diagnostic("proactive_prewarm_finished", **result)
+    return result
 
 
 def consume_ready_opening(

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .diagnostics import write_diagnostic
 from .models import Character, Experience, Memory, Moment, MomentInteraction, ScheduleSlot
 from .proactive import create_schedule_proactive_event
-from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider
+from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider, get_task_llm_provider
 from .utils import uid
 
 
@@ -121,7 +121,7 @@ def mark_interruption(session: Session, *, user_id: str, session_id: str, local_
 
 
 def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, slot: ScheduleSlot, exp: Experience) -> dict[str, object] | None:
-    config = get_enabled_provider(session, "llm")
+    config = get_task_llm_provider(session)
     if config is None:
         write_diagnostic("moment_skipped", reason="llm_not_configured", slot_id=slot.slot_id, activity=slot.activity_title)
         return None

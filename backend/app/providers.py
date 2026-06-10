@@ -74,19 +74,19 @@ def _json_or_empty(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def provider_presets() -> dict[str, Any]:
-    return {
-        "llm": [
+def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
+    suffix = "任务模型" if task else "对话模型"
+    return [
             {
                 "provider": "volc_ark",
-                "label": "火山方舟 / Doubao 对话模型",
+                "label": f"火山方舟 / Doubao {suffix}",
                 "base_url": "https://ark.cn-beijing.volces.com/api/v3",
                 "model": "",
                 "docs": "https://www.volcengine.com/docs/82379",
                 "supports_models": True,
-                "description": "只负责 Galgame 对话 JSON 输出，不承担联网搜索。",
+                "description": "负责后台任务 JSON/文本输出。" if task else "只负责 Galgame 对话 JSON 输出，不承担联网搜索。",
                 "fields": [
-                    _field("label", "显示名称", "core", default="火山方舟 / Doubao 对话模型"),
+                    _field("label", "显示名称", "core", default=f"火山方舟 / Doubao {suffix}"),
                     _field("base_url", "API Base URL", "core", default="https://ark.cn-beijing.volces.com/api/v3", required=True),
                     _field("model", "Chat Completions 模型", "core", required=True, placeholder="例如 doubao-seed-1-6-250615"),
                     _field("api_key", "Ark API Key", "secret", required=True),
@@ -96,14 +96,14 @@ def provider_presets() -> dict[str, Any]:
             },
             {
                 "provider": "deepseek",
-                "label": "DeepSeek Chat Completions",
+                "label": f"DeepSeek Chat Completions {suffix}",
                 "base_url": "https://api.deepseek.com",
                 "model": "deepseek-chat",
                 "docs": "https://api-docs.deepseek.com/zh-cn/",
                 "supports_models": True,
-                "description": "DeepSeek 作为 LLM 使用；除非真实工具结果含来源，否则不作为联网搜索。",
+                "description": "DeepSeek 作为后台任务 LLM 使用，不承担联网搜索。" if task else "DeepSeek 作为 LLM 使用；除非真实工具结果含来源，否则不作为联网搜索。",
                 "fields": [
-                    _field("label", "显示名称", "core", default="DeepSeek Chat Completions"),
+                    _field("label", "显示名称", "core", default=f"DeepSeek Chat Completions {suffix}"),
                     _field("base_url", "API Base URL", "core", default="https://api.deepseek.com", required=True),
                     _field("model", "Chat Completions 模型", "core", default="deepseek-chat", required=True),
                     _field("api_key", "DeepSeek API Key", "secret", required=True),
@@ -113,14 +113,14 @@ def provider_presets() -> dict[str, Any]:
             },
             {
                 "provider": "openai_compatible",
-                "label": "OpenAI-compatible 对话模型",
+                "label": f"OpenAI-compatible {suffix}",
                 "base_url": "",
                 "model": "",
                 "docs": "https://platform.openai.com/docs/api-reference/chat",
                 "supports_models": True,
-                "description": "自定义 OpenAI-compatible Chat Completions 入口。",
+                "description": "自定义 OpenAI-compatible Chat Completions 入口，用于后台任务。" if task else "自定义 OpenAI-compatible Chat Completions 入口。",
                 "fields": [
-                    _field("label", "显示名称", "core", default="OpenAI-compatible 对话模型"),
+                    _field("label", "显示名称", "core", default=f"OpenAI-compatible {suffix}"),
                     _field("base_url", "API Base URL", "core", required=True, placeholder="https://example.com/v1"),
                     _field("model", "Chat Completions 模型", "core", required=True),
                     _field("api_key", "API Key", "secret", required=True),
@@ -128,7 +128,13 @@ def provider_presets() -> dict[str, Any]:
                     _field("extra_body", "额外 Chat Completions JSON", "advanced", type_="json", default={}),
                 ],
             },
-        ],
+    ]
+
+
+def provider_presets() -> dict[str, Any]:
+    return {
+        "llm": _llm_presets(),
+        "llm_task": _llm_presets(task=True),
         "tts": [
             {
                 "provider": "volc_seed_tts",
@@ -533,6 +539,10 @@ def get_enabled_provider(session: Session, kind: str) -> ProviderConfig | None:
                 config.updated_at = utc_now()
         session.commit()
     return selected
+
+
+def get_task_llm_provider(session: Session) -> ProviderConfig | None:
+    return get_enabled_provider(session, "llm_task") or get_enabled_provider(session, "llm")
 
 
 class OpenAICompatibleClient:
@@ -1173,7 +1183,7 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
     config: ProviderConfig | None = None
     try:
         config = upsert_provider(session, payload)
-        if config.kind == "llm":
+        if config.kind in {"llm", "llm_task"}:
             result = OpenAICompatibleClient(config).chat_json(
                 [
                     {"role": "system", "content": "只返回 JSON。"},

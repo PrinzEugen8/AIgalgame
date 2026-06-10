@@ -121,6 +121,25 @@ class ScheduleSlot(Base):
     can_generate_photo: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class CalendarEvent(Base):
+    __tablename__ = "calendar_events"
+
+    event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, default="", index=True)
+    character_id: Mapped[str] = mapped_column(String, default="", index=True)
+    event_date: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(String)
+    category: Mapped[str] = mapped_column(String, default="special")
+    description: Mapped[str] = mapped_column(Text, default="")
+    salience: Mapped[int] = mapped_column(Integer, default=80)
+    repeats_yearly: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_type: Mapped[str] = mapped_column(String, default="")
+    source_id: Mapped[str] = mapped_column(String, default="", index=True)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
 class Experience(Base):
     __tablename__ = "experiences"
 
