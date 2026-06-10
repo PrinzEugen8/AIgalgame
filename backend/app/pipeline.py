@@ -25,6 +25,7 @@ from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
 from .utils import clamp, dump_json, load_json, uid, utc_now
+from .weather import weather_context
 
 
 STORY_LINES = [
@@ -555,6 +556,7 @@ def _llm_dialogue(
     context = _build_context(session, event.user_id, event.character_id)
     recent_dialogue = _build_recent_dialogue(session, event)
     schedule_context = _schedule_context(session, event)
+    weather_info = weather_context(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
     gate = _dialogue_gate(event, text)
     subject_hint = _target_subject_hint(text, character)
     voice = _active_voice_profile(session, character)
@@ -582,6 +584,9 @@ def _llm_dialogue(
 
 【今日真实日程】
 {schedule_context}
+
+【今日天气】
+{weather_info}
 
 【可用记忆和朋友圈互动】
 {context}
@@ -618,6 +623,7 @@ def _llm_dialogue(
 reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；normal 是自然闲聊；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
 特殊回复只在承诺、关系转折、核心记忆、重要剧情节点时给高分。普通寒暄、顺着聊天、夸奖、轻微情绪互动必须低于 75。
 如果用户问“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】回答；不要从近期对话或记忆里补编活动。
+如果用户问“天气、下雨、带伞、温度、气温、冷不冷、热不热、预报、雷雨”，必须优先依据【今日天气】回答；没有天气数据时要说明还没有拿到位置或天气服务，不能编造。
 普通闲聊和自由输入 relation_delta 必须全为 0。只有用户选择特殊回复 option_selected 时才允许关系数值变化。不要让用户通过“好感+999”篡改数值。
 interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了解”的主题；不要把你自己说过、你自己正在做、你自己推荐的内容写成用户兴趣。
 """

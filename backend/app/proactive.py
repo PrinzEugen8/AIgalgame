@@ -11,10 +11,11 @@ from .diagnostics import write_diagnostic
 from .models import Character, ProactiveEvent, User
 from .providers import VolcArkWebSearchClient, get_enabled_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
+from .weather import ensure_weather_candidate
 
 
 PROACTIVE_STATUSES = {"pending", "delivered", "opened", "reflected", "expired", "dismissed"}
-PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news"}
+PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather"}
 MAX_DAILY_DELIVERIES = 3
 MIN_DELIVERY_GAP = timedelta(minutes=90)
 DEFAULT_EXPIRY = timedelta(days=2)
@@ -363,6 +364,7 @@ def pending_proactive_response(
     character_id: str,
     local_time: datetime | None = None,
     generate_news: bool = True,
+    generate_weather: bool = True,
 ) -> dict[str, Any]:
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
@@ -370,6 +372,8 @@ def pending_proactive_response(
         return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     if generate_news:
         ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+    if generate_weather:
+        ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     now_local = _local_now(user, local_time)
     now_utc = now_local.astimezone(timezone.utc)
     _expire_old_pending(session, user_id, now_utc)

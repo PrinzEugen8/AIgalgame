@@ -19,7 +19,7 @@ from app import providers  # noqa: E402
 from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User  # noqa: E402
+from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User, UserLocation, WeatherSnapshot  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
@@ -27,6 +27,7 @@ from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, 
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
 from app.schemas import EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
+from app.utils import dump_json  # noqa: E402
 
 
 client = TestClient(app)
@@ -68,6 +69,8 @@ def test_provider_presets() -> None:
     search_fields = {item["name"] for item in payload["search"][0]["fields"]}
     assert {"max_keyword", "limit", "max_tool_calls", "user_location"}.issubset(search_fields)
     assert payload["search"][0]["supports_models"] is True
+    weather_fields = {item["name"] for item in payload["weather"][0]["fields"]}
+    assert {"auth_mode", "key_id", "project_id", "private_key", "api_key", "include_minutely"}.issubset(weather_fields)
     assert [item["provider"] for item in payload["image"]] == ["doubao_seedream", "openai_gpt_image", "gemini_image"]
     assert "supports_web_search" not in str(payload)
 
@@ -755,6 +758,45 @@ def test_volc_ark_web_search_normalizes_sources_and_requires_publish_time() -> N
         providers.HTTP_TRANSPORT = None
 
 
+def test_qweather_provider_uses_api_key_header() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["api_key"] = request.headers.get("X-QW-Api-Key", "")
+        assert "key=qweather-key" not in str(request.url)
+        return httpx.Response(
+            200,
+            json={
+                "code": "200",
+                "updateTime": "2026-06-10T10:00+08:00",
+                "now": {"obsTime": "2026-06-10T09:55+08:00", "temp": "27", "text": "多云"},
+            },
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        payload = client.post(
+            "/api/config/providers/test",
+            json={
+                "provider_id": "test_qweather_provider",
+                "kind": "weather",
+                "provider": "qweather",
+                "label": "QWeather Test",
+                "base_url": "https://qweather.example",
+                "secrets": {"api_key": "qweather-key"},
+                "metadata": {"auth_mode": "api_key", "test_location": "101010100"},
+                "enabled": True,
+            },
+        ).json()
+        assert payload["ok"] is True
+        assert payload["kind"] == "weather"
+        assert seen["url"].startswith("https://qweather.example/v7/weather/now")
+        assert seen["api_key"] == "qweather-key"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_volc_ark_web_search_404_returns_actionable_diagnostic() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://ark.cn-beijing.volces.com/api/v3/responses"
@@ -1082,6 +1124,89 @@ def test_schedule_question_prompt_includes_actual_slot_context() -> None:
         providers.HTTP_TRANSPORT = None
 
 
+def test_weather_question_prompt_includes_weather_context() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"weather_prompt_user_{suffix}"
+    seen_prompt = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        body = json.loads(request.content.decode())
+        seen_prompt = body["messages"][1]["content"]
+        assert "【今日天气】" in seen_prompt
+        assert "晚上可能有雨" in seen_prompt
+        content = json.dumps(
+            {
+                "lines": [{"text": "今天晚上可能会下雨，出门的话把伞带上吧。", "emotion": "thinking", "pose": "thinking"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_weather_prompt_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.add(
+                WeatherSnapshot(
+                    snapshot_id=f"weather_prompt_snapshot_{suffix}",
+                    user_id=user_id,
+                    weather_date="2026-06-10",
+                    location_key="101280601",
+                    city_name="深圳",
+                    observed_at="2026-06-10T11:55:00+08:00",
+                    fetched_at="2026-06-10T04:00:00+00:00",
+                    expires_at="2026-06-10T14:00:00+00:00",
+                    weather_text="多云",
+                    severity="rain",
+                    severity_score=82,
+                    trigger_key="evening_rain",
+                    summary="深圳现在多云，晚上可能有雨。",
+                    now_json=dump_json({"now": {"temp": "29", "text": "多云"}}),
+                    hourly_json=dump_json({"hourly": [{"fxTime": "2026-06-10T20:00+08:00", "temp": "27", "text": "小雨", "pop": "70"}]}),
+                    daily_json=dump_json({"daily": [{"textDay": "多云", "textNight": "小雨", "tempMin": "25", "tempMax": "31", "precip": "2"}]}),
+                    warning_json=dump_json({"warning": []}),
+                    minutely_json=dump_json({}),
+                )
+            )
+            session.commit()
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id=f"weather_prompt_session_{suffix}",
+                    payload={"text": "今天天气怎么样？晚上会下雨吗？"},
+                    client_context={"local_time": "2026-06-10T12:00:00+08:00"},
+                ),
+            )
+            assert "伞" in result.payload["lines"][0]["text"]
+            assert "【今日真实日程】" in seen_prompt
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_memory_interest_requires_explicit_user_interest() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"interest_filter_user_{suffix}"
@@ -1317,6 +1442,109 @@ def test_app_opened_without_proactive_event_returns_no_reply() -> None:
             ),
         )
         assert result.event_type == "no_reply"
+
+
+def test_location_upload_refreshes_qweather_and_creates_weather_proactive() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"weather_location_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        assert request.headers.get("X-QW-Api-Key") == "qweather-key"
+        if path == "/geo/v2/city/lookup":
+            return httpx.Response(
+                200,
+                json={
+                    "code": "200",
+                    "location": [
+                        {
+                            "id": "101280601",
+                            "name": "深圳",
+                            "adm1": "广东省",
+                            "adm2": "深圳市",
+                            "country": "中国",
+                            "tz": "Asia/Shanghai",
+                        }
+                    ],
+                },
+            )
+        if path == "/v7/weather/now":
+            return httpx.Response(
+                200,
+                json={
+                    "code": "200",
+                    "updateTime": "2026-06-10T15:00+08:00",
+                    "now": {"obsTime": "2026-06-10T15:00+08:00", "temp": "28", "text": "雷阵雨", "windScale": "3"},
+                },
+            )
+        if path == "/v7/weather/3d":
+            return httpx.Response(
+                200,
+                json={
+                    "code": "200",
+                    "daily": [
+                        {"fxDate": "2026-06-10", "tempMin": "25", "tempMax": "30", "textDay": "雷阵雨", "textNight": "雷阵雨", "precip": "12"}
+                    ],
+                },
+            )
+        if path == "/v7/weather/24h":
+            return httpx.Response(
+                200,
+                json={
+                    "code": "200",
+                    "hourly": [
+                        {"fxTime": "2026-06-10T20:00+08:00", "temp": "27", "text": "雷阵雨", "pop": "80", "precip": "3.2"}
+                    ],
+                },
+            )
+        if path == "/v7/warning/now":
+            return httpx.Response(200, json={"code": "200", "warning": []})
+        if path == "/v7/minutely/5m":
+            return httpx.Response(200, json={"code": "200", "summary": "未来两小时有阵雨", "minutely": []})
+        return httpx.Response(404, json={"code": "404"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_qweather_location_{suffix}",
+                    kind="weather",
+                    provider="qweather",
+                    base_url="https://qweather.example",
+                    secrets={"api_key": "qweather-key"},
+                    metadata={"auth_mode": "api_key", "include_minutely": True, "cache_minutes": 120},
+                ),
+            )
+            session.commit()
+        payload = client.post(
+            f"/api/location?user_id={user_id}&character_id=sakura",
+            json={
+                "latitude": 22.54,
+                "longitude": 114.06,
+                "accuracy_m": 32,
+                "provider": "test",
+                "local_time": "2026-06-10T15:30:00+08:00",
+            },
+        ).json()
+        assert payload["ok"] is True
+        assert payload["location"]["qweather_location_id"] == "101280601"
+        assert payload["weather"]["trigger_key"] == "thunderstorm"
+        assert payload["weather"]["severity_score"] >= 90
+        assert payload["proactive_event_id"]
+        with SessionLocal() as session:
+            proactive = session.get(ProactiveEvent, payload["proactive_event_id"])
+            assert proactive is not None
+            assert proactive.source_type == "weather"
+            assert proactive.priority >= 90
+            location = session.get(UserLocation, user_id)
+            assert location.city_name == "深圳"
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def test_proactive_pending_delivery_limits_sleep_and_gap() -> None:

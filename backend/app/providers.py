@@ -259,6 +259,45 @@ def provider_presets() -> dict[str, Any]:
                 ],
             },
         ],
+        "weather": [
+            {
+                "provider": "qweather",
+                "label": "和风天气 QWeather",
+                "base_url": "",
+                "model": "",
+                "docs": "https://dev.qweather.com/docs/",
+                "supports_models": False,
+                "description": "使用和风天气 API Host，支持 GeoAPI、实时天气、逐小时、每日预报、灾害预警和可选分钟降水。",
+                "fields": [
+                    _field("label", "显示名称", "core", default="和风天气 QWeather"),
+                    _field("base_url", "API Host", "core", required=True, placeholder="https://abcxyz.qweatherapi.com"),
+                    _field(
+                        "auth_mode",
+                        "认证方式",
+                        "metadata",
+                        type_="select",
+                        default="jwt",
+                        options=[
+                            {"value": "jwt", "label": "JWT（推荐）"},
+                            {"value": "api_key", "label": "API Key（兼容）"},
+                        ],
+                    ),
+                    _field("key_id", "JWT kid / 凭据 ID", "secret", show_when={"auth_mode": "jwt"}),
+                    _field("project_id", "JWT sub / 项目 ID", "secret", show_when={"auth_mode": "jwt"}),
+                    _field("private_key", "Ed25519 私钥 PEM", "secret", type_="textarea", show_when={"auth_mode": "jwt"}),
+                    _field("api_key", "QWeather API Key", "secret", show_when={"auth_mode": "api_key"}),
+                    _field("test_location", "测试 LocationID 或经纬度", "metadata", default="101010100", placeholder="101010100 或 116.41,39.92"),
+                    _field("daily_days", "每日预报天数", "metadata", type_="select", default="3d", options=["3d", "7d"]),
+                    _field("hourly_hours", "逐小时预报时长", "metadata", type_="select", default="24h", options=["24h", "72h", "168h"]),
+                    _field("include_minutely", "分钟降水", "metadata", type_="checkbox", default=True),
+                    _field("geo_range", "GeoAPI 搜索范围", "metadata", default="cn", placeholder="cn；留空表示全球"),
+                    _field("lang", "语言", "metadata", default="zh"),
+                    _field("unit", "单位", "metadata", type_="select", default="m", options=["m", "i"]),
+                    _field("cache_minutes", "天气缓存分钟", "metadata", type_="number", default=120),
+                    _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                ],
+            }
+        ],
         "image": [
             {
                 "provider": "doubao_seedream",
@@ -384,6 +423,15 @@ def _has_tts_credentials(config: ProviderConfig) -> bool:
     return bool(_secret(config, "x_api_key") or _secret(config, "api_key") or (_secret(config, "app_id") and _secret(config, "access_key")))
 
 
+def _missing_qweather_credentials(config: ProviderConfig) -> list[str]:
+    metadata = load_json(config.metadata_json, {})
+    auth_mode = str(metadata.get("auth_mode") or "jwt").strip()
+    if auth_mode == "api_key":
+        return [] if _secret(config, "api_key") else ["api_key"]
+    required = ["key_id", "project_id", "private_key"]
+    return [field for field in required if not _secret(config, field)]
+
+
 def _missing_secret_fields(config: ProviderConfig) -> list[str]:
     if _preset(config.kind, config.provider) is None:
         return ["unsupported_provider"]
@@ -400,6 +448,8 @@ def _missing_secret_fields(config: ProviderConfig) -> list[str]:
                 missing.append("access_key")
             return missing
         return [] if _has_tts_credentials(config) else ["x_api_key 或 app_id/access_key"]
+    if config.kind == "weather" and config.provider == "qweather":
+        return _missing_qweather_credentials(config)
     fields = _required_secret_fields(config.kind, config.provider)
     return [field for field in fields if not _secret(config, field)]
 
@@ -1051,6 +1101,118 @@ class VolcArkWebSearchClient:
         }
 
 
+class QWeatherClient:
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.metadata = load_json(config.metadata_json, {})
+        self.auth_mode = str(self.metadata.get("auth_mode") or "jwt").strip()
+        self.api_key = _secret(config, "api_key")
+        if self.auth_mode == "api_key" and not self.api_key:
+            raise ProviderError("QWeather API Key is not configured")
+        if self.auth_mode != "api_key":
+            self.key_id = _secret(config, "key_id")
+            self.project_id = _secret(config, "project_id")
+            self.private_key = _secret(config, "private_key")
+            if not (self.key_id and self.project_id and self.private_key):
+                raise ProviderError("QWeather JWT key_id/project_id/private_key are not configured")
+        if not config.base_url:
+            raise ProviderError("QWeather API Host is not configured")
+
+    def _base_url(self) -> str:
+        base = self.config.base_url.strip().rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            base = f"https://{base}"
+        return base
+
+    def _url(self, path: str) -> str:
+        return f"{self._base_url()}/{path.lstrip('/')}"
+
+    def _jwt_token(self) -> str:
+        try:
+            import jwt
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError("QWeather JWT requires PyJWT and cryptography. Run pip install -r backend/requirements.txt") from exc
+        now = int(time.time())
+        payload = {"iat": now - 30, "exp": now + 900, "sub": self.project_id}
+        return jwt.encode(payload, self.private_key, algorithm="EdDSA", headers={"kid": self.key_id})
+
+    def _headers(self) -> dict[str, str]:
+        if self.auth_mode == "api_key":
+            return {"X-QW-Api-Key": self.api_key}
+        return {"Authorization": f"Bearer {self._jwt_token()}"}
+
+    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        clean_params = {key: value for key, value in params.items() if value not in (None, "")}
+        with _client(float(self.metadata.get("timeout", 30.0))) as client:
+            response = client.get(self._url(path), headers=self._headers(), params=clean_params)
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                write_diagnostic(
+                    "qweather_http_error",
+                    provider_id=self.config.provider_id,
+                    endpoint=self._url(path),
+                    status_code=response.status_code,
+                    response_preview=response.text[:300],
+                )
+                raise ProviderError(f"QWeather request failed: HTTP {response.status_code}") from exc
+        payload = response.json()
+        code = str(payload.get("code") or "")
+        if code and code != "200":
+            write_diagnostic("qweather_api_error", provider_id=self.config.provider_id, endpoint=self._url(path), code=code)
+            raise ProviderError(f"QWeather API returned code={code}")
+        return payload
+
+    def city_lookup(self, location: str) -> dict[str, Any]:
+        params = {
+            "location": location,
+            "number": 1,
+            "range": str(self.metadata.get("geo_range") or "").strip(),
+            "lang": str(self.metadata.get("lang") or "zh").strip(),
+        }
+        payload = self._get("/geo/v2/city/lookup", params)
+        rows = payload.get("location") or []
+        if not rows:
+            raise ProviderError("QWeather GeoAPI did not return a matching location")
+        return rows[0]
+
+    def weather_now(self, location: str) -> dict[str, Any]:
+        return self._get(
+            "/v7/weather/now",
+            {
+                "location": location,
+                "lang": str(self.metadata.get("lang") or "zh").strip(),
+                "unit": str(self.metadata.get("unit") or "m").strip(),
+            },
+        )
+
+    def weather_bundle(self, location: str, coordinate: str = "") -> dict[str, Any]:
+        lang = str(self.metadata.get("lang") or "zh").strip()
+        unit = str(self.metadata.get("unit") or "m").strip()
+        daily_days = str(self.metadata.get("daily_days") or "3d").strip()
+        hourly_hours = str(self.metadata.get("hourly_hours") or "24h").strip()
+        common = {"location": location, "lang": lang, "unit": unit}
+        bundle: dict[str, Any] = {
+            "now": self.weather_now(location),
+            "daily": self._get(f"/v7/weather/{daily_days}", common),
+            "hourly": self._get(f"/v7/weather/{hourly_hours}", common),
+        }
+        try:
+            bundle["warning"] = self._get("/v7/warning/now", common)
+        except Exception as exc:  # noqa: BLE001
+            write_diagnostic("qweather_warning_skipped", provider_id=self.config.provider_id, message=str(exc))
+            bundle["warning"] = {}
+        if _as_bool(self.metadata.get("include_minutely"), True) and coordinate:
+            try:
+                bundle["minutely"] = self._get("/v7/minutely/5m", {"location": coordinate, "lang": lang})
+            except Exception as exc:  # noqa: BLE001
+                write_diagnostic("qweather_minutely_skipped", provider_id=self.config.provider_id, message=str(exc))
+                bundle["minutely"] = {}
+        else:
+            bundle["minutely"] = {}
+        return bundle
+
+
 def _image_extension_from_response(response: httpx.Response, fallback: str) -> str:
     content_type = response.headers.get("content-type", "").split(";")[0].strip()
     if content_type:
@@ -1209,6 +1371,14 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
             ok = True
             message = "Ark Web Search returned verifiable sources"
             details = result
+        elif config.kind == "weather":
+            if config.provider != "qweather":
+                raise ProviderError("Unsupported weather provider")
+            location = str(load_json(config.metadata_json, {}).get("test_location") or "101010100").strip()
+            result = QWeatherClient(config).weather_now(location)
+            ok = True
+            message = "QWeather returned current weather"
+            details = {"location": location, "now": result.get("now") or {}, "updateTime": result.get("updateTime")}
         elif config.kind == "image":
             asset = ImageProvider(config).generate(session, "adult anime galgame heroine in a sunny classroom, cherry blossoms, safe")
             ok = True

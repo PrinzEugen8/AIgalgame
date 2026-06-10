@@ -36,6 +36,17 @@ class ApiClient(private val baseUrl: String) {
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
     suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
+    suspend fun updateLocation(latitude: Double, longitude: Double, accuracyM: Float, provider: String): JSONObject {
+        val body = JSONObject()
+            .put("latitude", latitude)
+            .put("longitude", longitude)
+            .put("accuracy_m", accuracyM)
+            .put("provider", provider)
+            .put("captured_at", OffsetDateTime.now().toString())
+            .put("local_time", OffsetDateTime.now().toString())
+        return post("/api/location", body)
+    }
+
     suspend fun openingReady(proactiveEventId: String = ""): JSONObject {
         val suffix = if (proactiveEventId.isBlank()) "" else "&proactive_event_id=${encode(proactiveEventId)}"
         return get("/api/opening/ready?session_id=android&local_time=${encodedLocalTime()}$suffix")

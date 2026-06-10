@@ -11,6 +11,7 @@ from .models import Character, Experience, Memory, Moment, MomentInteraction, Sc
 from .proactive import create_schedule_proactive_event
 from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider, get_task_llm_provider
 from .utils import uid
+from .weather import ensure_weather_candidate
 
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,7 @@ def _npc_name(value: object, index: int) -> str:
 
 
 def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
+    weather_event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=day, force=True)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     slots = session.execute(
         select(ScheduleSlot).where(
@@ -296,5 +298,6 @@ def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: d
         "experiences": created_experiences,
         "moments": created_moments,
         "proactive_events": created_proactive_events,
+        "weather_events": 1 if weather_event is not None and weather_event.source_type == "weather" else 0,
         "skipped_moments": skipped_moments,
     }

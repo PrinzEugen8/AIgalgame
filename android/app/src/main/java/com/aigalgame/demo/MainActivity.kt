@@ -2,11 +2,17 @@ package com.aigalgame.demo
 
 import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -92,6 +98,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
@@ -104,7 +111,9 @@ import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.LocalTime
@@ -113,16 +122,21 @@ import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val locationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        viewModel.syncLocation(force = true)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33) {
-            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+        locationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
             "sakura_widget_poll",
             ExistingPeriodicWorkPolicy.UPDATE,
@@ -149,6 +163,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        viewModel.syncLocation()
         viewModel.resumeFromForeground()
     }
 }
@@ -162,6 +177,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var dialogueEventInFlight = false
     private var placementDraftCharacter = ""
     private var pendingProactiveEventId = ""
+    private var lastLocationUploadedAt = 0L
 
     var baseUrl by mutableStateOf("")
         private set
@@ -202,6 +218,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (saved.isNotBlank()) {
                     api = ApiClient(saved)
+                    syncLocation()
                     refreshBootstrap(openAfterBootstrap = pendingProactiveEventId.isBlank())
                     openPendingProactive()
                 } else {
@@ -234,6 +251,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             appOpenedBaseUrl = ""
             api = if (cleaned.isBlank()) null else ApiClient(cleaned)
             if (cleaned.isNotBlank()) {
+                syncLocation(force = true)
                 testHealth()
             }
         }
@@ -271,6 +289,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 storyCompleted = boot.optObject("user").optBoolean("story_completed", storyCompleted)
                 bootstrappedBaseUrl = urlKey
+                syncLocation()
                 if (openAfterBootstrap && lines.isEmpty()) {
                     openApp()
                 }
@@ -319,6 +338,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun resumeFromForeground() {
         if (baseUrl.isBlank()) return
+        syncLocation()
         val waitingForUser = currentLine() == null && (normalReplies.isNotEmpty() || keyReplies.isNotEmpty())
         if (storyCompleted && waitingForUser) {
             normalReplies.clear()
@@ -506,6 +526,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun updateNotificationsEnabled(value: Boolean) {
         notificationsEnabled = value
         viewModelScope.launch { settings.saveNotificationsEnabled(value) }
+    }
+
+    fun syncLocation(force: Boolean = false) {
+        val client = api ?: return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastLocationUploadedAt < TimeUnit.HOURS.toMillis(6)) return
+        val context = getApplication<Application>()
+        if (!hasLocationPermission(context)) return
+        viewModelScope.launch {
+            val location = currentOrLastLocation(context) ?: return@launch
+            try {
+                client.updateLocation(location.latitude, location.longitude, location.accuracy, location.provider ?: "android")
+                lastLocationUploadedAt = System.currentTimeMillis()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun hasLocationPermission(context: Context): Boolean {
+        val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+
+    private suspend fun currentOrLastLocation(context: Context): Location? {
+        val cached = withContext(Dispatchers.IO) { latestKnownLocation(context) }
+        if (cached != null) return cached
+        return withTimeoutOrNull(10_000) { requestSingleLocation(context) }
+    }
+
+    private suspend fun requestSingleLocation(context: Context): Location? = suspendCancellableCoroutine { continuation ->
+        if (!hasLocationPermission(context)) {
+            continuation.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (manager == null) {
+            continuation.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        val provider = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER).firstOrNull {
+            runCatching { manager.isProviderEnabled(it) }.getOrDefault(false)
+        }
+        if (provider == null) {
+            continuation.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                manager.removeUpdates(this)
+                if (continuation.isActive) continuation.resume(location)
+            }
+        }
+        try {
+            manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            continuation.invokeOnCancellation { manager.removeUpdates(listener) }
+        } catch (_: SecurityException) {
+            if (continuation.isActive) continuation.resume(null)
+        } catch (_: IllegalArgumentException) {
+            if (continuation.isActive) continuation.resume(null)
+        }
+    }
+
+    private fun latestKnownLocation(context: Context): Location? {
+        if (!hasLocationPermission(context)) return null
+        val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+        return try {
+            manager.getProviders(true)
+                .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+                .maxByOrNull { it.time }
+        } catch (_: SecurityException) {
+            null
+        }
     }
 
     fun clearLocalState() {

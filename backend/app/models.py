@@ -210,6 +210,53 @@ class ProactiveEvent(Base):
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
+class UserLocation(Base):
+    __tablename__ = "user_locations"
+
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, default="android")
+    latitude: Mapped[float] = mapped_column(Float, default=0.0)
+    longitude: Mapped[float] = mapped_column(Float, default=0.0)
+    accuracy_m: Mapped[float] = mapped_column(Float, default=0.0)
+    qweather_location_id: Mapped[str] = mapped_column(String, default="", index=True)
+    city_name: Mapped[str] = mapped_column(String, default="")
+    adm1: Mapped[str] = mapped_column(String, default="")
+    adm2: Mapped[str] = mapped_column(String, default="")
+    country: Mapped[str] = mapped_column(String, default="")
+    timezone: Mapped[str] = mapped_column(String, default="")
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+    captured_at: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class WeatherSnapshot(Base):
+    __tablename__ = "weather_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    weather_date: Mapped[str] = mapped_column(String, index=True)
+    location_key: Mapped[str] = mapped_column(String, default="", index=True)
+    city_name: Mapped[str] = mapped_column(String, default="")
+    latitude: Mapped[float] = mapped_column(Float, default=0.0)
+    longitude: Mapped[float] = mapped_column(Float, default=0.0)
+    observed_at: Mapped[str] = mapped_column(String, default="")
+    fetched_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+    expires_at: Mapped[str] = mapped_column(String, default="", index=True)
+    weather_text: Mapped[str] = mapped_column(String, default="")
+    severity: Mapped[str] = mapped_column(String, default="normal")
+    severity_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    trigger_key: Mapped[str] = mapped_column(String, default="", index=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    now_json: Mapped[str] = mapped_column(Text, default="{}")
+    hourly_json: Mapped[str] = mapped_column(Text, default="{}")
+    daily_json: Mapped[str] = mapped_column(Text, default="{}")
+    warning_json: Mapped[str] = mapped_column(Text, default="{}")
+    minutely_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
 class OpeningCache(Base):
     __tablename__ = "opening_caches"
 

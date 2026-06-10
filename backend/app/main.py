@@ -35,6 +35,7 @@ from .models import (
     ScheduleSlot,
     TtsVoiceProfile,
     User,
+    UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
 from .pipeline import handle_event
@@ -64,6 +65,7 @@ from .schedule import ensure_schedule, run_daily_cycle
 from .scheduler import start_scheduler, stop_scheduler
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
 from .utils import clamp, dump_json, load_json, uid
+from .weather import ensure_weather_candidate, ensure_weather_snapshot, update_user_location, weather_snapshot_to_dict
 
 
 setup_logging()
@@ -197,7 +199,7 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     providers = [provider_to_out(item).model_dump() for item in session.execute(select(ProviderConfig)).scalars().all()]
     configured = {
         kind: any(item["kind"] == kind and item["ready"] for item in providers)
-        for kind in ("llm", "llm_task", "tts", "search", "image")
+        for kind in ("llm", "llm_task", "tts", "search", "weather", "image")
     }
     return {"ok": True, "providers": providers, "configured": configured}
 
@@ -806,6 +808,96 @@ def _parse_client_time(value: str = "") -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _location_to_out(location: UserLocation | None) -> dict[str, Any] | None:
+    if location is None:
+        return None
+    return {
+        "user_id": location.user_id,
+        "provider": location.provider,
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "accuracy_m": location.accuracy_m,
+        "qweather_location_id": location.qweather_location_id,
+        "city_name": location.city_name,
+        "adm1": location.adm1,
+        "adm2": location.adm2,
+        "country": location.country,
+        "timezone": location.timezone,
+        "captured_at": location.captured_at,
+        "updated_at": location.updated_at,
+    }
+
+
+@app.post("/api/location")
+def location_update(
+    payload: dict[str, Any] | None = None,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    body = payload or {}
+    try:
+        latitude = float(body.get("latitude"))
+        longitude = float(body.get("longitude"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="latitude and longitude are required") from exc
+    location = update_user_location(
+        session,
+        user_id=str(body.get("user_id") or user_id),
+        latitude=latitude,
+        longitude=longitude,
+        accuracy_m=float(body.get("accuracy_m") or 0),
+        provider=str(body.get("provider") or "android"),
+        captured_at=str(body.get("captured_at") or ""),
+    )
+    local_time = _parse_client_time(str(body.get("local_time") or ""))
+    snapshot = ensure_weather_snapshot(session, user_id=location.user_id, local_time=local_time, force=bool(body.get("refresh", False)))
+    event = ensure_weather_candidate(session, user_id=location.user_id, character_id=character_id, local_time=local_time) if snapshot is not None else None
+    return {
+        "ok": True,
+        "location": _location_to_out(location),
+        "weather": weather_snapshot_to_dict(snapshot),
+        "proactive_event_id": event.proactive_event_id if event is not None else "",
+    }
+
+
+@app.get("/api/weather/current")
+def weather_current(
+    user_id: str = DEFAULT_USER_ID,
+    refresh: bool = False,
+    local_time: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID)
+    snapshot = ensure_weather_snapshot(session, user_id=user_id, local_time=_parse_client_time(local_time), force=refresh)
+    location = session.get(UserLocation, user_id)
+    return {"ok": True, "location": _location_to_out(location), "weather": weather_snapshot_to_dict(snapshot)}
+
+
+@app.post("/api/weather/refresh")
+def weather_refresh(
+    payload: dict[str, Any] | None = None,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    body = payload or {}
+    effective_user_id = str(body.get("user_id") or user_id)
+    effective_character_id = str(body.get("character_id") or character_id)
+    local_time = _parse_client_time(str(body.get("local_time") or ""))
+    snapshot = ensure_weather_snapshot(session, user_id=effective_user_id, local_time=local_time, force=True)
+    event = ensure_weather_candidate(session, user_id=effective_user_id, character_id=effective_character_id, local_time=local_time) if snapshot is not None else None
+    location = session.get(UserLocation, effective_user_id)
+    return {
+        "ok": True,
+        "location": _location_to_out(location),
+        "weather": weather_snapshot_to_dict(snapshot),
+        "proactive_event_id": event.proactive_event_id if event is not None else "",
+    }
 
 
 @app.get("/api/proactive/pending")

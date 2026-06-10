@@ -3,6 +3,7 @@ const kinds = [
   { id: "llm_task", title: "LLM 任务模型" },
   { id: "tts", title: "TTS 语音合成" },
   { id: "search", title: "联网搜索" },
+  { id: "weather", title: "天气服务" },
   { id: "image", title: "图片生成" },
 ];
 
