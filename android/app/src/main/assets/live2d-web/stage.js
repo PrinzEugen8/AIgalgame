@@ -268,6 +268,7 @@
         if (!window.PIXI) {
             throw new Error("PIXI is not available");
         }
+        status.coreLoaded = !!window.Live2DCubismCore;
         canvas.style.width = "100vw";
         canvas.style.height = "100vh";
         canvas.style.opacity = "1";
@@ -290,6 +291,8 @@
         if (app.renderer) {
             app.renderer.backgroundAlpha = 0;
         }
+        status.frameworkLoaded = !!(window.PIXI.live2d && window.PIXI.live2d.Live2DModel);
+        renderDiagnostics();
 
         var originalRender = app.render.bind(app);
         app.render = function guardedRender() {
@@ -329,10 +332,15 @@
             return;
         }
         debug("loadModel " + resolvedSrc);
+        status.modelLoaded = false;
+        status.drawableCount = 0;
+        status.lastError = "";
+        renderDiagnostics();
         var Live2DModel = window.PIXI && window.PIXI.live2d && window.PIXI.live2d.Live2DModel;
         if (!Live2DModel) {
             throw new Error("PIXI.live2d.Live2DModel is not available");
         }
+        status.frameworkLoaded = true;
         if (typeof Live2DModel.registerTicker === "function" && window.PIXI.Ticker) {
             Live2DModel.registerTicker(window.PIXI.Ticker);
             window.PIXI.Ticker.shared.start();
@@ -360,6 +368,9 @@
         model.zIndex = 10;
         modelBaseWidth = Math.max(1, model.width || 1);
         modelBaseHeight = Math.max(1, model.height || 1);
+        status.modelLoaded = true;
+        status.drawableCount = getDrawableCount();
+        renderDiagnostics();
         model.on("hit", function (hitAreas) {
             debug("hit:" + JSON.stringify(hitAreas || []));
         });
@@ -579,6 +590,7 @@
             state = Object.assign({}, state, nextState || {});
             state.placement = Object.assign({}, defaultState().placement, state.placement || {});
             state.focusAt = Object.assign({}, defaultState().focusAt, state.focusAt || {});
+            applyStageClass(state.stageMode || "home");
             if (state.stageVersion && state.stageVersion !== STAGE_VERSION) {
                 debug("stage version mismatch android=" + state.stageVersion + " web=" + STAGE_VERSION);
             }
@@ -619,7 +631,7 @@
                     colorHits += 1;
                 }
             }
-            return {
+            latestPixelProbe = {
                 supported: true,
                 width: width,
                 height: height,
@@ -628,8 +640,12 @@
                 colorHits: colorHits,
                 glError: gl.getError()
             };
+            renderDiagnostics();
+            return latestPixelProbe;
         } catch (error) {
-            return { supported: false, reason: error.message || String(error) };
+            latestPixelProbe = { supported: false, alphaHits: 0, colorHits: 0, reason: error.message || String(error) };
+            renderDiagnostics();
+            return latestPixelProbe;
         }
     }
 
