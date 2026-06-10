@@ -57,12 +57,79 @@
             touch-action: none;
             opacity: 1;
         }
+
+        #diagnostics {
+            position: fixed;
+            left: 12px;
+            right: 12px;
+            bottom: 12px;
+            z-index: 5;
+            display: none;
+            grid-template-columns: 1fr 1fr;
+            gap: 7px 10px;
+            padding: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.20);
+            border-radius: 8px;
+            background: rgba(10, 14, 22, 0.72);
+            color: #f8fbff;
+            font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            pointer-events: none;
+        }
+
+        body.stage-selftest #diagnostics {
+            display: grid;
+        }
+
+        .status-row {
+            display: flex;
+            min-width: 0;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .status-label {
+            min-width: 0;
+            overflow: hidden;
+            color: rgba(248, 251, 255, 0.74);
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .status-value {
+            color: #ffffff;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .status-ok {
+            color: #7df0a9;
+        }
+
+        .status-bad {
+            color: #ff8f9f;
+        }
+
+        #error {
+            grid-column: 1 / -1;
+            color: #ffb7c1;
+            overflow-wrap: anywhere;
+        }
     </style>
 </head>
-<body>
+<body class="stage-home">
 <div id="stage-background"></div>
 <div id="stage-vignette"></div>
 <canvas id="live2d-canvas"></canvas>
+<div id="diagnostics" aria-live="polite">
+    <div class="status-row"><span class="status-label">Core loaded</span><span id="core" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Framework loaded</span><span id="framework" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Model loaded</span><span id="model" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Drawable count</span><span id="drawables" class="status-value">0</span></div>
+    <div class="status-row"><span class="status-label">Pixel alpha</span><span id="pixel-alpha" class="status-value">0</span></div>
+    <div class="status-row"><span class="status-label">Stage version</span><span id="version" class="status-value">boot</span></div>
+    <div id="error"></div>
+</div>
 <script src="./vendor/live2dcubismcore.min.js"></script>
 <script src="./vendor/pixi.min.js"></script>
 <script>

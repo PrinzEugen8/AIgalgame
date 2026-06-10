@@ -32,12 +32,15 @@ android {
 }
 
 val requiredLive2DAssets = listOf(
-    "src/main/assets/live2d/sdk/live2dcubismcore.min.js",
-    "src/main/assets/live2d-web/official/index.html",
-    "src/main/assets/live2d-web/official/official-stage.js",
+    "src/main/assets/live2d-web/index.html",
+    "src/main/assets/live2d-web/stage.js",
+    "src/main/assets/live2d-web/vendor/live2dcubismcore.min.js",
+    "src/main/assets/live2d-web/vendor/pixi.min.js",
+    "src/main/assets/live2d-web/vendor/cubism4.min.js",
     "src/main/assets/live2d/models/Haru/Haru.model3.json",
     "src/main/assets/live2d/models/Haru/Haru.moc3",
-    "src/main/assets/live2d/models/Haru/Haru.2048/texture_00.png"
+    "src/main/assets/live2d/models/Haru/Haru.2048/texture_00.png",
+    "src/main/assets/live2d/models/Haru/Haru.2048/texture_01.png"
 )
 
 tasks.register("verifyLive2DAssets") {

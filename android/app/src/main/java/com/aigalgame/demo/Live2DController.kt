@@ -43,19 +43,19 @@ class Live2DController(context: Context, initialCharacter: String = "atri") {
         config = Live2DCharacterConfigs.forCharacter(character)
         val present = appContext.assetExists(config.modelAssetPath)
         val fallbackPresent = appContext.assetExists(config.fallbackModelAssetPath)
-        val officialStagePresent = appContext.assetExists(Live2DCharacterConfigs.OfficialStageAssetPath)
-        val officialCorePresent = appContext.assetExists(Live2DCharacterConfigs.OfficialCoreAssetPath)
+        val missingRuntimeAssets = Live2DCharacterConfigs.RequiredRuntimeAssetPaths
+            .filterNot { appContext.assetExists(it) }
+        val runtimeAvailable = missingRuntimeAssets.isEmpty()
         val resolvedModelPath = when {
             present -> config.modelAssetPath
             fallbackPresent -> config.fallbackModelAssetPath
             else -> config.modelAssetPath
         }
-        val rendererAvailable = (present || fallbackPresent) && officialStagePresent && officialCorePresent
+        val rendererAvailable = (present || fallbackPresent) && runtimeAvailable
         val status = when {
-            present && rendererAvailable -> "Live2D official model ready"
-            fallbackPresent && rendererAvailable -> "Live2D official fallback sample model ready"
-            !officialStagePresent -> "Live2D official stage missing, using PNG fallback"
-            !officialCorePresent -> "Live2D Cubism Core missing, using PNG fallback"
+            present && rendererAvailable -> "Live2D Pixi model ready"
+            fallbackPresent && rendererAvailable -> "Live2D Pixi fallback sample model ready"
+            !runtimeAvailable -> "Live2D Web runtime missing (${missingRuntimeAssets.joinToString()}), using PNG fallback"
             else -> "Live2D model asset missing, using PNG fallback"
         }
         state = state.copy(

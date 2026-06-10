@@ -4,7 +4,7 @@
     var MODEL_BASE_URL = new URL("../", window.location.href).href;
     var DEFAULT_MODEL = MODEL_BASE_URL + "live2d/samples/Haru/Haru.model3.json";
     var DEFAULT_BACKGROUND = MODEL_BASE_URL + "live2d-web/backgrounds/classroom.png";
-    var STAGE_VERSION = "webview-composited-bg-v2";
+    var STAGE_VERSION = "pixi-cubism4-runtime-v3";
     var MAX_RESOLUTION = 2;
     var RENDER_BURST_FRAMES = 36;
     var motionAliases = {
@@ -35,6 +35,15 @@
 
     var canvas = document.getElementById("live2d-canvas");
     var backgroundLayer = document.getElementById("stage-background");
+    var diagnostics = {
+        core: document.getElementById("core"),
+        framework: document.getElementById("framework"),
+        model: document.getElementById("model"),
+        drawables: document.getElementById("drawables"),
+        pixelAlpha: document.getElementById("pixel-alpha"),
+        version: document.getElementById("version"),
+        error: document.getElementById("error")
+    };
     var app = null;
     var model = null;
     var backgroundSprite = null;
@@ -53,6 +62,15 @@
     var targetFocusY = 0;
     var blinkUntilMs = 0;
     var nextBlinkMs = performance.now() + 1600;
+    var latestPixelProbe = { supported: false, alphaHits: 0, colorHits: 0 };
+    var status = {
+        coreLoaded: !!window.Live2DCubismCore,
+        frameworkLoaded: false,
+        modelLoaded: false,
+        drawableCount: 0,
+        lastError: "",
+        stageMode: "home"
+    };
 
     function defaultState() {
         return {
@@ -86,6 +104,44 @@
         }
     }
 
+    function setText(node, value, ok) {
+        if (!node) return;
+        node.textContent = String(value);
+        node.classList.toggle("status-ok", ok === true);
+        node.classList.toggle("status-bad", ok === false);
+    }
+
+    function renderDiagnostics() {
+        setText(diagnostics.core, status.coreLoaded ? "yes" : "no", status.coreLoaded);
+        setText(diagnostics.framework, status.frameworkLoaded ? "yes" : "no", status.frameworkLoaded);
+        setText(diagnostics.model, status.modelLoaded ? "yes" : "no", status.modelLoaded);
+        setText(diagnostics.drawables, status.drawableCount || 0);
+        setText(diagnostics.pixelAlpha, latestPixelProbe.alphaHits || 0, (latestPixelProbe.alphaHits || 0) > 0);
+        setText(diagnostics.version, STAGE_VERSION);
+        if (diagnostics.error) diagnostics.error.textContent = status.lastError || "";
+    }
+
+    function applyStageClass(stageMode) {
+        status.stageMode = stageMode || "home";
+        document.body.classList.toggle("stage-selftest", status.stageMode === "selftest");
+        document.body.classList.toggle("stage-home", status.stageMode !== "selftest" && status.stageMode !== "dress");
+        document.body.classList.toggle("stage-dress", status.stageMode === "dress");
+    }
+
+    function getDrawableCount() {
+        try {
+            var coreModel = model && model.internalModel && model.internalModel.coreModel;
+            if (coreModel && coreModel.drawables && typeof coreModel.drawables.count === "number") {
+                return coreModel.drawables.count;
+            }
+            if (coreModel && typeof coreModel.getDrawableCount === "function") {
+                return coreModel.getDrawableCount();
+            }
+        } catch (_) {
+        }
+        return 0;
+    }
+
     function debug(message) {
         try {
             console.log("[AiriLive2D] " + message);
@@ -96,6 +152,8 @@
 
     function reportError(error) {
         var message = error && error.message ? error.message : String(error);
+        status.lastError = message;
+        renderDiagnostics();
         try {
             console.error("[AiriLive2D] " + message);
         } catch (_) {

@@ -29,6 +29,14 @@ class Live2DConfigTest {
     }
 
     @Test
+    fun runtimeUsesPackagedPixiStageAssets() {
+        assertEquals("live2d-web/index.html", Live2DCharacterConfigs.OfficialStageAssetPath)
+        assertEquals("live2d-web/vendor/live2dcubismcore.min.js", Live2DCharacterConfigs.OfficialCoreAssetPath)
+        assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/pixi.min.js"))
+        assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/cubism4.min.js"))
+    }
+
+    @Test
     fun hitAreasCoverExpectedTouchRegions() {
         val config = Live2DCharacterConfigs.forCharacter("atri")
 
