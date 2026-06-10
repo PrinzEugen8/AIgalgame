@@ -13,18 +13,20 @@ APK:
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The app is designed for a real Android device on the same LAN as the backend. Cleartext HTTP is enabled for local development, so `http://192.168.x.x:8899` works. Online service keys are configured only in the backend admin page.
+The app is designed for a real Android device connecting through an HTTPS tunnel or trusted HTTPS endpoint. Cleartext HTTP is disabled in the Android app. Online service keys are configured only in the backend admin page.
 
 ## Tunnel Troubleshooting
 
-The backend defaults to port `8899`. If an intranet tunnel reports `dial tcp 127.0.0.1:8898: connectex: No connection could be made`, the tunnel is pointing at a port where the backend is not listening. Set the tunnel's local target to `127.0.0.1:8899`, or start the backend on `8898`:
+The backend defaults to local port `8899`. If an intranet tunnel reports `dial tcp 127.0.0.1:8898: connectex: No connection could be made`, the tunnel is pointing at a port where the backend is not listening. Set the tunnel's local target to `127.0.0.1:8899`, or start the backend on `8898`:
 
 ```powershell
 $env:AIGALGAME_PORT = "8898"
 .\backend\run.ps1
 ```
 
-If the app reports `Trust anchor for certification path not found`, Android does not trust the HTTPS certificate served by the tunnel. Prefer the tunnel's `http://` URL for local development, or use an HTTPS tunnel/domain with a public trusted certificate. A self-signed certificate requires installing its CA on the phone and configuring the debug app to trust it.
+The phone-facing address must be HTTPS, for example `https://your-tunnel-domain.example`. The tunnel can still forward privately to `127.0.0.1:8899` on the PC.
+
+If the app reports `Trust anchor for certification path not found`, Android does not trust the HTTPS certificate served by the tunnel. Use an HTTPS tunnel/domain with a public trusted certificate. If your tunnel uses a self-signed or private-CA certificate, install that CA certificate on the phone; debug builds include a network security config that trusts user-installed CAs while still blocking cleartext HTTP. Release builds trust only system CAs.
 
 Implemented surfaces:
 

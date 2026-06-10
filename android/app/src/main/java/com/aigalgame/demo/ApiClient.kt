@@ -116,7 +116,7 @@ class ApiClient(private val baseUrl: String) {
                 if (text.isBlank()) JSONObject() else JSONObject(text)
             }
         } catch (e: IllegalArgumentException) {
-            throw IOException("后端地址格式无效，请填写 http://IP:8899 或内网穿透提供的完整 http/https 地址。当前地址：$url", e)
+            throw IOException("后端地址格式无效，请填写内网穿透提供的完整 https 地址，例如 https://your-domain.example。当前地址：$url", e)
         } catch (e: IOException) {
             throw IOException(describeNetworkFailure(url, e), e)
         }
@@ -126,10 +126,13 @@ class ApiClient(private val baseUrl: String) {
 fun normalizeBackendUrl(value: String): String {
     val cleaned = value.trim().trimEnd('/')
     if (cleaned.isBlank()) return ""
-    if (cleaned.startsWith("http://", ignoreCase = true) || cleaned.startsWith("https://", ignoreCase = true)) {
+    if (cleaned.startsWith("https://", ignoreCase = true)) {
         return cleaned
     }
-    return "http://$cleaned"
+    if (cleaned.startsWith("http://", ignoreCase = true)) {
+        return "https://" + cleaned.substringAfter("://")
+    }
+    return "https://$cleaned"
 }
 
 fun describeNetworkFailure(url: String, error: IOException): String {
@@ -147,12 +150,12 @@ fun describeNetworkFailure(url: String, error: IOException): String {
             error is SSLPeerUnverifiedException ||
             causeText.contains("CertPathValidatorException", ignoreCase = true) ||
             causeText.contains("Trust anchor", ignoreCase = true) ->
-            "HTTPS 证书不被 Android 信任。内网穿透请优先使用它提供的 http 地址，或换成带公网可信证书的 https 域名；自签证书需要把 CA 安装到手机并让调试版信任。当前地址：$url"
+            "HTTPS 证书不被 Android 信任。请使用带公网可信证书的内网穿透域名；如果是自签或私有 CA，请先把 CA 证书安装到手机，debug 版 App 会信任用户 CA。当前地址：$url"
 
         error is ConnectException ||
             message.contains("failed to connect", ignoreCase = true) ||
             message.contains("Connection refused", ignoreCase = true) ->
-            "连接被拒绝：目标端口没有服务在监听。当前电脑后端监听 8899，内网穿透本地目标应填 127.0.0.1:8899；如果你坚持用 8898，请用 AIGALGAME_PORT=8898 启动后端。当前地址：$url"
+            "连接被拒绝：内网穿透的本地目标端口没有服务在监听。电脑后端当前是 8899，穿透本地目标应填 127.0.0.1:8899；外部访问仍然使用穿透提供的 https 地址。当前地址：$url"
 
         error is UnknownHostException ->
             "找不到这个后端域名或地址，请检查内网穿透域名是否已启动、手机网络是否可访问。当前地址：$url"
