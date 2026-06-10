@@ -2,9 +2,9 @@
     "use strict";
 
     var MODEL_BASE_URL = new URL("../", window.location.href).href;
-    var DEFAULT_MODEL = MODEL_BASE_URL + "live2d/samples/Haru/Haru.model3.json";
-    var DEFAULT_BACKGROUND = MODEL_BASE_URL + "live2d-web/backgrounds/classroom.png";
-    var STAGE_VERSION = "pixi-cubism4-runtime-v3";
+    var DEFAULT_MODEL = MODEL_BASE_URL + "live2d/models/Haru/Haru.model3.json";
+    var DEFAULT_BACKGROUND = "";
+    var STAGE_VERSION = "pixi-cubism-runtime-v4";
     var MAX_RESOLUTION = 2;
     var RENDER_BURST_FRAMES = 36;
     var motionAliases = {
@@ -34,7 +34,6 @@
     };
 
     var canvas = document.getElementById("live2d-canvas");
-    var backgroundLayer = document.getElementById("stage-background");
     var diagnostics = {
         core: document.getElementById("core"),
         framework: document.getElementById("framework"),
@@ -46,10 +45,9 @@
     };
     var app = null;
     var model = null;
-    var backgroundSprite = null;
     var modelSrc = "";
     var backgroundSrc = "";
-    var backgroundLoaded = false;
+    var backgroundLoaded = true;
     var modelBaseWidth = 1;
     var modelBaseHeight = 1;
     var state = defaultState();
@@ -142,6 +140,27 @@
         return 0;
     }
 
+    function readModelSize(nextModel) {
+        var internal = nextModel && nextModel.internalModel;
+        var size = internal && typeof internal.getSize === "function" ? internal.getSize() : null;
+        var width = Math.max(
+            Number(internal && internal.originalWidth) || 0,
+            Number(nextModel && nextModel.width) || 0,
+            Number(size && size[0]) || 0,
+            1
+        );
+        var height = Math.max(
+            Number(internal && internal.originalHeight) || 0,
+            Number(nextModel && nextModel.height) || 0,
+            Number(size && size[1]) || 0,
+            1
+        );
+        return {
+            width: Math.max(1, width),
+            height: Math.max(1, height)
+        };
+    }
+
     function debug(message) {
         try {
             console.log("[AiriLive2D] " + message);
@@ -184,73 +203,13 @@
 
     function setBackground(nextSrc) {
         var resolvedSrc = normalizeBackgroundSrc(nextSrc);
-        if (resolvedSrc === backgroundSrc && backgroundLoaded) {
-            return;
-        }
         backgroundSrc = resolvedSrc;
-        backgroundLoaded = false;
-        if (backgroundLayer) {
-            var cssUrl = resolvedSrc.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-            backgroundLayer.style.backgroundImage = 'url("' + cssUrl + '")';
-        }
-
-        var image = new Image();
-        image.onload = function () {
-            backgroundLoaded = true;
-            debug("background loaded " + resolvedSrc);
-            setPixiBackground(resolvedSrc);
-        };
-        image.onerror = function () {
-            backgroundLoaded = false;
-            debug("background failed " + resolvedSrc);
-        };
-        image.src = resolvedSrc;
-    }
-
-    function setPixiBackground(src) {
-        if (!app || !window.PIXI) return;
-        if (backgroundSprite) {
-            app.stage.removeChild(backgroundSprite);
-            try {
-                backgroundSprite.destroy({ children: true, texture: false, baseTexture: false });
-            } catch (_) {
-            }
-            backgroundSprite = null;
-        }
-
-        var texture = window.PIXI.Texture.from(src);
-        backgroundSprite = new window.PIXI.Sprite(texture);
-        backgroundSprite.zIndex = -100;
-        backgroundSprite.alpha = 1;
-        backgroundSprite.visible = true;
-        app.stage.addChild(backgroundSprite);
-
-        function markReady() {
-            backgroundLoaded = true;
-            fitBackground();
-            requestRenderBurst(12);
-        }
-
-        if (texture.baseTexture.valid) {
-            markReady();
-        } else {
-            texture.baseTexture.once("loaded", markReady);
-            texture.baseTexture.once("error", function () {
-                backgroundLoaded = false;
-                debug("pixi background failed " + src);
-            });
-        }
+        backgroundLoaded = true;
+        renderDiagnostics();
     }
 
     function fitBackground() {
-        if (!app || !backgroundSprite) return;
-        var size = screenSize();
-        var textureWidth = backgroundSprite.texture && backgroundSprite.texture.width || 1;
-        var textureHeight = backgroundSprite.texture && backgroundSprite.texture.height || 1;
-        var scale = Math.max(size.width / textureWidth, size.height / textureHeight);
-        backgroundSprite.scale.set(scale);
-        backgroundSprite.x = (size.width - textureWidth * scale) * 0.5;
-        backgroundSprite.y = (size.height - textureHeight * scale) * 0.5;
+        return;
     }
 
     function resolveMotion(name) {
@@ -366,8 +325,9 @@
         model.visible = true;
         model.alpha = 1;
         model.zIndex = 10;
-        modelBaseWidth = Math.max(1, model.width || 1);
-        modelBaseHeight = Math.max(1, model.height || 1);
+        var modelSize = readModelSize(model);
+        modelBaseWidth = modelSize.width;
+        modelBaseHeight = modelSize.height;
         status.modelLoaded = true;
         status.drawableCount = getDrawableCount();
         renderDiagnostics();
@@ -400,21 +360,22 @@
         if (!app || !model) return;
         var size = screenSize();
         var placement = state.placement || {};
-        var userScale = Number(placement.scale || 1);
+        var userScale = clamp(Number(placement.scale || 1), 0.7, 1.35);
         var offsetX = Number(placement.offsetX || 0);
         var offsetY = Number(placement.offsetY || 0);
-        var bottomInset = Number(placement.bottomInset || 0);
+        var bottomInset = clamp(Number(placement.bottomInset || 0), 0, size.height * 0.28);
+        var heightRatio = state.stageMode === "dress" ? 0.78 : 0.72;
+        var widthRatio = state.stageMode === "dress" ? 0.86 : 0.82;
         var fitScale = Math.min(
-            size.height / modelBaseHeight * 2,
-            size.width / modelBaseWidth * 2
+            size.height * heightRatio / modelBaseHeight,
+            size.width * widthRatio / modelBaseWidth
         );
-        var startingOffsetY = state.stageMode === "dress"
-            ? 0.88
-            : (size.height >= size.width ? 0.75 : 1.0);
+        var finalScale = Math.max(0.001, fitScale * userScale);
+        var renderedHeight = modelBaseHeight * finalScale;
 
-        model.scale.set(fitScale * userScale);
+        model.scale.set(finalScale);
         model.x = size.width * 0.5 + offsetX;
-        model.y = size.height * startingOffsetY + offsetY - bottomInset;
+        model.y = size.height - bottomInset - renderedHeight * 0.5 + offsetY;
     }
 
     function requestRenderBurst(frames) {
@@ -672,10 +633,7 @@
                 modelSrc: modelSrc,
                 backgroundSrc: backgroundSrc,
                 backgroundLoaded: backgroundLoaded,
-                hasPixiBackground: !!backgroundSprite,
-                pixiBackgroundVisible: backgroundSprite ? backgroundSprite.visible : false,
-                pixiBackgroundWidth: backgroundSprite ? backgroundSprite.width : 0,
-                pixiBackgroundHeight: backgroundSprite ? backgroundSprite.height : 0,
+                webBackgroundDisabled: true,
                 stageWidth: app ? app.screen.width : 0,
                 stageHeight: app ? app.screen.height : 0,
                 rendererWidth: app && app.renderer ? app.renderer.width : 0,

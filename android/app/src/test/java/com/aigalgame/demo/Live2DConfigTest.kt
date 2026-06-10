@@ -1,6 +1,8 @@
 package com.aigalgame.demo
 
+import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,6 +36,15 @@ class Live2DConfigTest {
         assertEquals("live2d-web/vendor/live2dcubismcore.min.js", Live2DCharacterConfigs.OfficialCoreAssetPath)
         assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/pixi.min.js"))
         assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/cubism4.min.js"))
+    }
+
+    @Test
+    fun webStageUsesSinglePackagedModelEntry() {
+        val stageJs = File("src/main/assets/live2d-web/stage.js").readText()
+
+        assertTrue(stageJs.contains("live2d/models/Haru/Haru.model3.json"))
+        assertFalse(stageJs.contains("live2d/samples/Haru"))
+        assertFalse(stageJs.contains("setPixiBackground"))
     }
 
     @Test

@@ -125,7 +125,7 @@ class ApiClient(private val baseUrl: String) {
     }
 }
 
-private fun backendHttpClient(): OkHttpClient {
+internal fun backendHttpClient(): OkHttpClient {
     return OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)

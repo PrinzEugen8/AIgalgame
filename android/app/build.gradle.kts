@@ -39,8 +39,19 @@ val requiredLive2DAssets = listOf(
     "src/main/assets/live2d-web/vendor/cubism4.min.js",
     "src/main/assets/live2d/models/Haru/Haru.model3.json",
     "src/main/assets/live2d/models/Haru/Haru.moc3",
+    "src/main/assets/live2d/models/Haru/Haru.physics3.json",
+    "src/main/assets/live2d/models/Haru/Haru.pose3.json",
     "src/main/assets/live2d/models/Haru/Haru.2048/texture_00.png",
-    "src/main/assets/live2d/models/Haru/Haru.2048/texture_01.png"
+    "src/main/assets/live2d/models/Haru/Haru.2048/texture_01.png",
+    "src/main/assets/live2d/models/Haru/expressions/F01.exp3.json",
+    "src/main/assets/live2d/models/Haru/motions/haru_g_idle.motion3.json",
+    "src/main/assets/live2d/models/Haru/motions/haru_g_m26.motion3.json"
+)
+
+val forbiddenLive2DAssets = listOf(
+    "src/main/assets/live2d-web/official/index.html",
+    "src/main/assets/live2d-web/official/official-stage.js",
+    "src/main/assets/live2d/sdk/live2dcubismcore.min.js"
 )
 
 tasks.register("verifyLive2DAssets") {
@@ -50,6 +61,14 @@ tasks.register("verifyLive2DAssets") {
         val missing = requiredLive2DAssets.filterNot { layout.projectDirectory.file(it).asFile.exists() }
         if (missing.isNotEmpty()) {
             throw GradleException("Missing Live2D assets: ${missing.joinToString()}")
+        }
+        val forbidden = forbiddenLive2DAssets.filter { layout.projectDirectory.file(it).asFile.exists() }
+        if (forbidden.isNotEmpty()) {
+            throw GradleException("Remove obsolete Live2D renderer assets: ${forbidden.joinToString()}")
+        }
+        val stageJs = layout.projectDirectory.file("src/main/assets/live2d-web/stage.js").asFile.readText()
+        if ("live2d/samples/" in stageJs) {
+            throw GradleException("Live2D stage.js must default to live2d/models, not live2d/samples")
         }
     }
 }
@@ -68,6 +87,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.media3:media3-datasource-okhttp:1.5.1")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.work:work-runtime-ktx:2.10.0")

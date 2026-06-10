@@ -111,11 +111,12 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import androidx.core.app.NotificationManagerCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.work.ExistingWorkPolicy
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
@@ -154,11 +155,7 @@ class MainActivity : ComponentActivity() {
             ExistingPeriodicWorkPolicy.UPDATE,
             PeriodicWorkRequestBuilder<NotificationWorker>(15, TimeUnit.MINUTES).build()
         )
-        WorkManager.getInstance(this).enqueueUniqueWork(
-            "sakura_widget_startup_refresh",
-            ExistingWorkPolicy.REPLACE,
-            OneTimeWorkRequestBuilder<NotificationWorker>().build()
-        )
+        SakuraWidgetProvider.refreshNow(this)
         viewModel.consumeLaunchIntent(intent)
         setContent {
             GalgameTheme {
@@ -852,7 +849,11 @@ fun AiGalgameApp(vm: MainViewModel) {
 @Composable
 fun AudioLinePlayer(vm: MainViewModel) {
     val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val player = remember {
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(OkHttpDataSource.Factory(backendHttpClient())))
+            .build()
+    }
     val line = vm.currentLine()
     LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled) {
         val url = line?.ttsUrl.orEmpty()
@@ -885,8 +886,18 @@ fun AudioLinePlayer(vm: MainViewModel) {
             vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
         }
     }
-    DisposableEffect(Unit) {
-        onDispose { player.release() }
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                vm.errorMessage = "语音播放失败：${error.message ?: error.errorCodeName}"
+                vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
 }
 
@@ -901,7 +912,7 @@ fun simulatedSpeechMouthOpen(text: String, elapsedMs: Long): Float {
 
 @Composable
 fun ConnectionScreen(vm: MainViewModel) {
-    var value by remember { mutableStateOf("http://192.168.1.2:8899") }
+    var value by remember { mutableStateOf("https://your-tunnel-domain.example") }
     Column(
         Modifier
             .fillMaxSize()

@@ -25,7 +25,7 @@ Secrets must be configured locally through the backend admin page; they are neve
 3. Open the backend admin page on the PC and configure real services:
 
    ```text
-   http://<PC-LAN-IP>:8899/admin
+   http://127.0.0.1:8899/admin
    ```
 
 4. Build the APK:
@@ -42,6 +42,8 @@ Secrets must be configured locally through the backend admin page; they are neve
    .\scripts\install_debug_apk.ps1
    ```
 
-6. In the app, connect to `http://<PC-LAN-IP>:8899`.
+6. In the app, connect to the HTTPS tunnel address that forwards to `127.0.0.1:8899`, for example `https://your-tunnel-domain.example`.
+
+The Android app blocks cleartext HTTP. Debug APKs trust all HTTPS certificates for personal tunnel/local HTTPS testing; release builds still require a publicly trusted certificate.
 
 Provider tests must pass in the backend admin page before real LLM/TTS/search/image flows can be accepted. The app no longer contains service keys or provider configuration fields.

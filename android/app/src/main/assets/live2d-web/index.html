@@ -19,8 +19,6 @@
             touch-action: none;
         }
 
-        #stage-background,
-        #stage-vignette,
         #live2d-canvas {
             position: absolute;
             inset: 0;
@@ -28,29 +26,8 @@
             height: 100vh;
         }
 
-        #stage-background {
-            z-index: 0;
-            background-color: transparent;
-            background-image: var(--stage-bg, none);
-            background-position: center;
-            background-size: cover;
-            background-repeat: no-repeat;
-            opacity: 1;
-        }
-
-        #stage-vignette {
-            z-index: 1;
-            pointer-events: none;
-            background: linear-gradient(
-                180deg,
-                rgba(0, 0, 0, 0.20) 0%,
-                rgba(0, 0, 0, 0.00) 38%,
-                rgba(0, 0, 0, 0.36) 100%
-            );
-        }
-
         #live2d-canvas {
-            z-index: 2;
+            z-index: 1;
             display: block;
             background: transparent;
             object-fit: cover;
@@ -118,8 +95,6 @@
     </style>
 </head>
 <body class="stage-home">
-<div id="stage-background"></div>
-<div id="stage-vignette"></div>
 <canvas id="live2d-canvas"></canvas>
 <div id="diagnostics" aria-live="polite">
     <div class="status-row"><span class="status-label">Core loaded</span><span id="core" class="status-value status-bad">no</span></div>
