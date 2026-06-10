@@ -22,13 +22,43 @@ def _day_start(day: datetime) -> datetime:
     return day.replace(hour=4, minute=0, second=0, microsecond=0)
 
 
+def _slot_time(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _same_timezone(now: datetime, value: datetime) -> datetime:
+    if value.tzinfo is None and now.tzinfo is not None:
+        return now.replace(tzinfo=None)
+    if value.tzinfo is not None and now.tzinfo is None:
+        return now.replace(tzinfo=value.tzinfo)
+    return now
+
+
+def _refresh_elapsed_slots(session: Session, slots: list[ScheduleSlot], now: datetime) -> None:
+    changed = False
+    for slot in slots:
+        if slot.actual_status != "pending":
+            continue
+        end_at = _slot_time(slot.end_at)
+        if end_at is not None and end_at <= _same_timezone(now, end_at):
+            slot.actual_status = "completed"
+            changed = True
+    if changed:
+        session.commit()
+
+
 def ensure_schedule(session: Session, *, user_id: str, character_id: str, day: datetime) -> list[ScheduleSlot]:
     start = _day_start(day)
     schedule_date = start.date().isoformat()
+    now = datetime.now(start.tzinfo)
     existing = session.execute(
         select(ScheduleSlot).where(ScheduleSlot.user_id == user_id, ScheduleSlot.schedule_date == schedule_date)
     ).scalars().all()
     if existing:
+        _refresh_elapsed_slots(session, existing, now)
         return existing
     memories = session.execute(
         select(Memory).where(Memory.user_id == user_id, Memory.hidden == False).order_by(Memory.created_at.desc()).limit(30)  # noqa: E712
@@ -56,17 +86,18 @@ def ensure_schedule(session: Session, *, user_id: str, character_id: str, day: d
             title, typ, loc, salience = "想和你聊天", "miss_user", "房间", 65
         else:
             title, typ, loc, salience = "睡前整理心情", "daily", "房间", 25
+        slot_end = slot_start + timedelta(minutes=15)
         slot = ScheduleSlot(
             slot_id=uid("slot"),
             schedule_date=schedule_date,
             user_id=user_id,
             character_id=character_id,
             start_at=slot_start.isoformat(),
-            end_at=(slot_start + timedelta(minutes=15)).isoformat(),
+            end_at=slot_end.isoformat(),
             activity_title=title,
             activity_type=typ,
             location=loc,
-            actual_status="completed" if slot_start < datetime.now(slot_start.tzinfo) else "pending",
+            actual_status="completed" if slot_end <= _same_timezone(now, slot_end) else "pending",
             salience=salience,
             can_generate_moment=salience >= 60,
             can_generate_photo=salience >= 80,

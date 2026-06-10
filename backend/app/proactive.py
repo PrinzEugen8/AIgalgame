@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .diagnostics import write_diagnostic
-from .models import ProactiveEvent, User
+from .models import Character, ProactiveEvent, User
 from .providers import VolcArkWebSearchClient, get_enabled_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
 
@@ -192,12 +192,16 @@ def create_moment_feedback_event(
     character_id: str,
     interaction_id: str,
     interaction_type: str,
+    moment_id: str = "",
     content: str = "",
 ) -> ProactiveEvent | None:
     if interaction_type == "like":
         text = "我看到你给我的朋友圈点了赞。虽然只是一下下，但我还是有点开心。"
+        dedupe_key = f"moment_interaction:{user_id}:{moment_id or interaction_id}:like"
     else:
-        text = f"我看到你在朋友圈里说「{content[:80]}」。这句话我想当面回应你。"
+        normalized = " ".join(content.split())[:80]
+        text = f"我看到你在朋友圈里说「{normalized}」。这句话我想当面回应你。"
+        dedupe_key = f"moment_interaction:{user_id}:{moment_id or interaction_id}:comment:{normalized}"
     return create_proactive_event(
         session,
         user_id=user_id,
@@ -207,8 +211,8 @@ def create_moment_feedback_event(
         title="小樱注意到了你的互动",
         text=text,
         priority=72 if interaction_type == "comment" else 64,
-        dedupe_key=f"moment_interaction:{interaction_id}",
-        payload={"interaction_type": interaction_type, "content": content},
+        dedupe_key=dedupe_key,
+        payload={"interaction_type": interaction_type, "content": content, "moment_id": moment_id},
     )
 
 
@@ -318,21 +322,37 @@ def proactive_event_payload(event: ProactiveEvent | None) -> dict[str, Any] | No
     }
 
 
-def proactive_widget_payload(event: ProactiveEvent | None) -> dict[str, Any]:
+def _character_chibi_url(character: Character | None) -> str:
+    assets = load_json(character.chibi_widget_assets_json if character is not None else "{}", {})
+    if not isinstance(assets, dict):
+        return ""
+    for key in ("happy", "default", "study", "miss", "sleep"):
+        value = str(assets.get(key) or "").strip()
+        if value.startswith("/media/") or value.startswith("http://") or value.startswith("https://"):
+            return value
+        if value and not value.startswith("asset://"):
+            return f"/media/{value}"
+    return ""
+
+
+def proactive_widget_payload(event: ProactiveEvent | None, character: Character | None = None) -> dict[str, Any]:
+    chibi_url = _character_chibi_url(character)
     if event is None:
         return {
-            "character_name": "小樱",
+            "character_name": character.name if character is not None else "小樱",
             "status": "想聊天",
             "bubble": "今天也想听你说说话。",
             "unread_count": 0,
             "proactive_event_id": "",
+            "chibi_url": chibi_url,
         }
     return {
-        "character_name": "小樱",
+        "character_name": character.name if character is not None else "小樱",
         "status": "有话想说",
         "bubble": event.text[:80],
         "unread_count": 1,
         "proactive_event_id": event.proactive_event_id,
+        "chibi_url": chibi_url,
     }
 
 
@@ -345,8 +365,9 @@ def pending_proactive_response(
     generate_news: bool = True,
 ) -> dict[str, Any]:
     user = session.get(User, user_id)
+    character = session.get(Character, character_id)
     if user is None:
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None)}
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     if generate_news:
         ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     now_local = _local_now(user, local_time)
@@ -355,19 +376,19 @@ def pending_proactive_response(
     event = _next_due_pending(session, user_id=user_id, character_id=character_id, now_utc=now_utc)
     if event is None:
         session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None)}
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     if _is_sleep_time(user, now_local):
         session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None)}
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     if _daily_delivery_count(session, user, now_local) >= MAX_DAILY_DELIVERIES:
         session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None)}
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     latest = _latest_delivery(session, user)
     if latest is not None and now_local - latest < MIN_DELIVERY_GAP:
         session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None)}
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
     session.commit()
-    return {"ok": True, "event": proactive_event_payload(event), "widget": proactive_widget_payload(event)}
+    return {"ok": True, "event": proactive_event_payload(event), "widget": proactive_widget_payload(event, character)}
 
 
 def mark_proactive_delivered(session: Session, event_id: str) -> ProactiveEvent | None:
@@ -393,6 +414,20 @@ def mark_proactive_opened(session: Session, event_id: str) -> ProactiveEvent | N
     event.updated_at = utc_now()
     session.commit()
     write_diagnostic("proactive_opened", proactive_event_id=event.proactive_event_id, source_type=event.source_type)
+    return event
+
+
+def consume_proactive_event(session: Session, event_id: str) -> ProactiveEvent | None:
+    event = session.get(ProactiveEvent, event_id)
+    if event is None:
+        return None
+    now = utc_now()
+    event.status = "reflected"
+    event.opened_at = event.opened_at or now
+    event.reflected_at = event.reflected_at or now
+    event.updated_at = now
+    session.commit()
+    write_diagnostic("proactive_consumed", proactive_event_id=event.proactive_event_id, source_type=event.source_type)
     return event
 
 

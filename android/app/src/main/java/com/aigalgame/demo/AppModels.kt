@@ -59,6 +59,30 @@ data class OutfitPlacement(
     val bottomInset: Float = 48f
 )
 
+private const val OutfitPlacementMinScale = 0.25f
+private const val OutfitPlacementMaxScale = 4.0f
+private const val OutfitPlacementBaseHorizontalRange = 480f
+private const val OutfitPlacementUpRange = 900f
+private const val OutfitPlacementDownRange = 420f
+private const val OutfitPlacementMaxBottomInset = 220f
+
+fun OutfitPlacement.coerceForStage(): OutfitPlacement {
+    val nextScale = scale.coerceIn(OutfitPlacementMinScale, OutfitPlacementMaxScale)
+    val rangeMultiplier = maxOf(nextScale, 1f)
+    return copy(
+        scale = nextScale,
+        offsetX = offsetX.coerceIn(
+            -OutfitPlacementBaseHorizontalRange * rangeMultiplier,
+            OutfitPlacementBaseHorizontalRange * rangeMultiplier
+        ),
+        offsetY = offsetY.coerceIn(
+            -OutfitPlacementUpRange * rangeMultiplier,
+            OutfitPlacementDownRange * rangeMultiplier
+        ),
+        bottomInset = bottomInset.coerceIn(0f, OutfitPlacementMaxBottomInset)
+    )
+}
+
 data class CalendarItem(
     val date: String,
     val startAt: String,

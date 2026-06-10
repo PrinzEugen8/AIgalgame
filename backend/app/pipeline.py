@@ -19,11 +19,11 @@ from .models import (
     TtsVoiceProfile,
     User,
 )
-from .proactive import mark_proactive_opened, mark_proactive_reflected
+from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected
 from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import mark_interruption
-from .utils import clamp, dump_json, load_json, split_cn_lines, uid, utc_now
+from .utils import clamp, dump_json, load_json, uid, utc_now
 
 
 STORY_LINES = [
@@ -129,48 +129,6 @@ def _active_voice_profile(session: Session, character: Character) -> TtsVoicePro
     return None
 
 
-def _japanese_tts_text(session: Session, character: Character, text: str) -> str | None:
-    config = get_enabled_provider(session, "llm")
-    if config is None:
-        write_diagnostic("tts_translate_skipped", character_id=character.character_id, reason="llm_not_configured")
-        return None
-    try:
-        result = OpenAICompatibleClient(config).chat_json(
-            [
-                {"role": "system", "content": "你只输出 JSON。"},
-                {
-                    "role": "user",
-                    "content": (
-                        "把下面这句 Galgame 角色中文台词翻译成自然日文，只用于语音合成。"
-                        "保留温柔、口语、短句感觉，不要解释。输出格式：{\"tts_text\":\"...\"}\n"
-                        f"角色：{character.name}\n中文台词：{text}"
-                    ),
-                },
-            ],
-            max_tokens=180,
-            temperature=0.2,
-        )
-        translated = str(result.get("tts_text") or result.get("ja") or "").strip()
-        if _has_tts_readable_text(translated) and _contains_japanese_kana(translated):
-            return translated
-        write_diagnostic(
-            "tts_translate_rejected",
-            character_id=character.character_id,
-            reason="translated_text_is_not_japanese",
-            source_text=text,
-            translated_text=translated,
-        )
-        return None
-    except Exception as exc:  # noqa: BLE001
-        write_diagnostic(
-            "tts_translate_error",
-            character_id=character.character_id,
-            error_type=type(exc).__name__,
-            message=str(exc),
-        )
-        return None
-
-
 def _valid_japanese_tts_text(source_text: str, candidate: str) -> bool:
     cleaned = " ".join(candidate.split()).strip()
     source = " ".join(source_text.split()).strip()
@@ -228,6 +186,9 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
             if _valid_japanese_tts_text(text, translated):
                 write_diagnostic(
                     "tts_translate_ok",
+                    stage="line_repair",
+                    provider_id=config.provider_id,
+                    model=config.model,
                     character_id=character.character_id,
                     attempt=attempt,
                     source_text=text,
@@ -236,6 +197,9 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
                 return translated
             write_diagnostic(
                 "tts_translate_rejected",
+                stage="line_repair",
+                provider_id=config.provider_id,
+                model=config.model,
                 character_id=character.character_id,
                 reason="retry_text_is_not_japanese",
                 attempt=attempt,
@@ -245,12 +209,23 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
         except Exception as exc:  # noqa: BLE001
             write_diagnostic(
                 "tts_translate_error",
+                stage="line_repair",
+                provider_id=config.provider_id,
+                model=config.model,
                 character_id=character.character_id,
                 attempt=attempt,
                 error_type=type(exc).__name__,
                 message=str(exc),
             )
-    write_diagnostic("tts_translate_failed", character_id=character.character_id, source_text=text, attempts=2)
+    write_diagnostic(
+        "tts_translate_failed",
+        stage="line_repair",
+        provider_id=config.provider_id,
+        model=config.model,
+        character_id=character.character_id,
+        source_text=text,
+        attempts=2,
+    )
     return None
 
 
@@ -320,6 +295,18 @@ def _tts_for_line(
         tts_text = text
     try:
         asset = VolcTtsClient(config).synthesize(session, tts_text, voice_type=speaker, resource_id=resource_id, line_emotion=emotion)
+        write_diagnostic(
+            "tts_line_ready",
+            provider_id=config.provider_id,
+            character_id=character.character_id,
+            voice_id=voice.voice_id if voice is not None else "",
+            speaker=speaker,
+            resource_id=resource_id,
+            tts_language=voice.language if voice is not None else "provider_default",
+            source_text=text,
+            tts_text=tts_text,
+            has_audio=True,
+        )
         return asset.url, ""
     except Exception as exc:  # noqa: BLE001
         write_diagnostic(
@@ -364,7 +351,7 @@ def _story_response(session: Session, event: EventIn, user: User, character: Cha
             lines=[DialogueLine(line_id=uid("line"), text=text, emotion="shy", pose="shy", tts_audio_url=tts_url, tts_error=tts_error)],
             relation_delta=delta,
         )
-        return _event("dialogue", payload.model_dump(), event.session_id)
+        return _event("dialogue", {**payload.model_dump(), "story_completed": True}, event.session_id)
     line = STORY_LINES[min(index, len(STORY_LINES) - 1)]
     tts_url, tts_error = _tts_for_line(session, user, character, line, "happy")
     key_replies: list[ReplyOption] = []
@@ -388,6 +375,21 @@ def _story_response(session: Session, event: EventIn, user: User, character: Cha
     return _event("story_line", {**payload.model_dump(), "story_index": index + 1}, event.session_id)
 
 
+def _japanese_tts_problems(result: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for index, item in enumerate(result.get("lines") or []):
+        if not isinstance(item, dict):
+            problems.append(f"lines[{index}] 不是对象")
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        if not _has_tts_readable_text(text):
+            continue
+        candidate = str(item.get("tts_text_ja") or item.get("tts_text") or item.get("ja") or "").strip()
+        if not _valid_japanese_tts_text(text, candidate):
+            problems.append(f"lines[{index}] 缺少合格 tts_text_ja")
+    return problems
+
+
 def _llm_dialogue(
     session: Session,
     event: EventIn,
@@ -396,6 +398,7 @@ def _llm_dialogue(
     text: str,
     *,
     allow_relation_delta: bool = True,
+    persist_side_effects: bool = True,
 ) -> DialoguePayload:
     config = get_enabled_provider(session, "llm")
     if config is None:
@@ -459,10 +462,40 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
             '"tts_text_ja" with natural spoken Japanese for voice synthesis. '
             'Keep "text" Chinese for display. Do not put Chinese in tts_text_ja.'
         )
-    result = OpenAICompatibleClient(config).chat_json(
-        [{"role": "system", "content": "你是 Galgame 台词与状态 JSON 生成器。"}, {"role": "user", "content": prompt}],
-        max_tokens=900,
-    )
+    client = OpenAICompatibleClient(config)
+    result: dict[str, Any] = {}
+    retry_reason = ""
+    for attempt in range(1, 3):
+        attempt_prompt = prompt
+        if retry_reason:
+            attempt_prompt += (
+                "\n\n上一次输出没有通过日文配音校验："
+                f"{retry_reason}。请重新生成完整 JSON，并确保每一条 lines 都有合格的 tts_text_ja。"
+            )
+        result = client.chat_json(
+            [{"role": "system", "content": "你是 Galgame 台词与状态 JSON 生成器。"}, {"role": "user", "content": attempt_prompt}],
+            max_tokens=1100,
+        )
+        problems = _japanese_tts_problems(result) if requires_japanese_tts else []
+        if not problems:
+            break
+        retry_reason = "；".join(problems[:4])
+        write_diagnostic(
+            "tts_dialogue_retry",
+            provider_id=config.provider_id,
+            model=config.model,
+            character_id=character.character_id,
+            attempt=attempt,
+            reason=retry_reason,
+        )
+    if requires_japanese_tts and (problems := _japanese_tts_problems(result)):
+        write_diagnostic(
+            "tts_dialogue_repair_needed",
+            provider_id=config.provider_id,
+            model=config.model,
+            character_id=character.character_id,
+            reason="；".join(problems[:4]),
+        )
     reply_mode = str(result.get("reply_mode") or "normal").strip().lower()
     if reply_mode not in {"silent", "light", "normal", "key_moment"}:
         reply_mode = "normal"
@@ -482,32 +515,38 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
     max_lines = 1 if reply_mode == "light" else 4
     for item in (result.get("lines") or [])[:max_lines]:
         line_emotion = str(item.get("emotion") or "calm")
-        raw_line_text = str(item.get("text") or "")
-        line_texts = split_cn_lines(raw_line_text, limit=52)
+        line_text = " ".join(str(item.get("text") or "").split()).strip()
         ja_candidate = str(item.get("tts_text_ja") or item.get("tts_text") or item.get("ja") or "").strip()
-        for line_text in line_texts:
-            if not _has_tts_readable_text(line_text):
-                continue
-            tts_url, tts_error = _tts_for_line(
-                session,
-                user,
-                character,
-                line_text,
-                line_emotion,
-                tts_text_ja=ja_candidate if len(line_texts) == 1 else None,
+        if not _has_tts_readable_text(line_text):
+            continue
+        tts_url, tts_error = _tts_for_line(
+            session,
+            user,
+            character,
+            line_text,
+            line_emotion,
+            tts_text_ja=ja_candidate,
+        )
+        if user.tts_enabled and voice is not None and not tts_url:
+            write_diagnostic(
+                "tts_line_missing_audio",
+                character_id=character.character_id,
+                voice_id=voice.voice_id,
+                tts_language=voice.language,
+                source_text=line_text,
+                tts_error=tts_error,
             )
-            line_objs.append(
-                DialogueLine(
-                    line_id=uid("line"),
-                    text=line_text,
-                    emotion=line_emotion,
-                    pose=str(item.get("pose") or "idle"),
-                    tts_audio_url=tts_url,
-                    tts_error=tts_error,
-                )
+            raise ProviderError(tts_error or "语音生成失败")
+        line_objs.append(
+            DialogueLine(
+                line_id=uid("line"),
+                text=line_text,
+                emotion=line_emotion,
+                pose=str(item.get("pose") or "idle"),
+                tts_audio_url=tts_url,
+                tts_error=tts_error,
             )
-            if reply_mode == "light" and len(line_objs) >= 1:
-                break
+        )
         if reply_mode == "light" and len(line_objs) >= 1:
             break
     if not line_objs:
@@ -550,51 +589,52 @@ reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、�
                     trigger_memory=bool(item.get("trigger_memory")),
                 )
             )
-    for item in result.get("memory_candidates") or []:
-        content = str(item.get("content") or "").strip()
-        if content:
-            importance = float(item.get("importance") or 0.5)
-            if reply_mode != "key_moment":
-                importance = min(importance, 0.69)
-            session.add(
-                Memory(
-                    memory_id=uid("mem"),
-                    user_id=event.user_id,
-                    character_id=event.character_id,
-                    layer=str(item.get("layer") or "chat"),
-                    content=content,
-                    source_event_id=event.event_id or "",
-                    importance=importance,
-                    confidence=float(item.get("confidence") or 0.6),
-                )
-            )
-    topics = [str(item).strip() for item in (result.get("interest_topics") or []) if str(item).strip()]
-    if "关注" in text and not topics:
-        topics.append(text.split("关注", 1)[-1].strip(" 。！!"))
-    if topics:
-        current = load_json(user.interest_topics_json, [])
-        for topic in topics:
-            if topic and topic not in current:
-                current.append(topic)
+    if persist_side_effects:
+        for item in result.get("memory_candidates") or []:
+            content = str(item.get("content") or "").strip()
+            if content:
+                importance = float(item.get("importance") or 0.5)
+                if reply_mode != "key_moment":
+                    importance = min(importance, 0.69)
                 session.add(
                     Memory(
                         memory_id=uid("mem"),
                         user_id=event.user_id,
                         character_id=event.character_id,
-                        layer="chat",
-                        content=f"用户最近关注：{topic}",
+                        layer=str(item.get("layer") or "chat"),
+                        content=content,
                         source_event_id=event.event_id or "",
-                        importance=0.7,
-                        confidence=0.8,
+                        importance=importance,
+                        confidence=float(item.get("confidence") or 0.6),
                     )
                 )
-        user.interest_topics_json = dump_json(current[-20:])
-    if allow_relation_delta:
-        _apply_delta(relation, delta)
-    for interaction in session.execute(
-        select(MomentInteraction).where(MomentInteraction.actor_id == event.user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
-    ).scalars():
-        interaction.reflected_in_chat = True
+        topics = [str(item).strip() for item in (result.get("interest_topics") or []) if str(item).strip()]
+        if "关注" in text and not topics:
+            topics.append(text.split("关注", 1)[-1].strip(" 。！!"))
+        if topics:
+            current = load_json(user.interest_topics_json, [])
+            for topic in topics:
+                if topic and topic not in current:
+                    current.append(topic)
+                    session.add(
+                        Memory(
+                            memory_id=uid("mem"),
+                            user_id=event.user_id,
+                            character_id=event.character_id,
+                            layer="chat",
+                            content=f"用户最近关注：{topic}",
+                            source_event_id=event.event_id or "",
+                            importance=0.7,
+                            confidence=0.8,
+                        )
+                    )
+            user.interest_topics_json = dump_json(current[-20:])
+        if allow_relation_delta:
+            _apply_delta(relation, delta)
+        for interaction in session.execute(
+            select(MomentInteraction).where(MomentInteraction.actor_id == event.user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
+        ).scalars():
+            interaction.reflected_in_chat = True
     return DialoguePayload(
         lines=line_objs,
         normal_replies=normal,
@@ -685,7 +725,14 @@ def handle_event(session: Session, event: EventIn) -> AppEventOut:
         proactive = mark_proactive_opened(session, proactive_id) if proactive_id else None
         if proactive is None:
             return _no_reply(event.session_id, pace_reason="入口打开没有找到可回流的主动事件。")
-        payload = _llm_dialogue(session, event, user, character, _proactive_target_text(proactive, event.event_type))
+        if proactive.prepared_payload_json and proactive.prepared_payload_json != "{}":
+            payload = DialoguePayload.model_validate(load_json(proactive.prepared_payload_json, {}))
+        else:
+            try:
+                payload = _llm_dialogue(session, event, user, character, _proactive_target_text(proactive, event.event_type))
+            except ProviderError:
+                consume_proactive_event(session, proactive.proactive_event_id)
+                raise
         if not payload.lines:
             session.commit()
             return _no_reply(event.session_id, reply_mode=payload.reply_mode, pace_reason=payload.pace_reason)

@@ -31,8 +31,9 @@ from .models import (
     TtsVoiceProfile,
     User,
 )
+from .opening import consume_ready_opening, prepare_opening
 from .pipeline import handle_event
-from .proactive import create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
+from .proactive import consume_proactive_event, create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
 from .providers import (
     OpenAICompatibleClient,
     ProviderError,
@@ -459,6 +460,55 @@ def proactive_delivered(event_id: str, session: Session = Depends(get_session)) 
     return {"ok": True, "event": {"proactive_event_id": event.proactive_event_id, "status": event.status}}
 
 
+@app.post("/api/proactive/{event_id}/consume")
+def proactive_consume(event_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    event = consume_proactive_event(session, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="proactive event not found")
+    return {"ok": True, "event": {"proactive_event_id": event.proactive_event_id, "status": event.status}}
+
+
+@app.post("/api/opening/prepare")
+def opening_prepare(
+    payload: dict[str, Any] | None = None,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    body = payload or {}
+    return prepare_opening(
+        session,
+        user_id=str(body.get("user_id") or user_id),
+        character_id=str(body.get("character_id") or character_id),
+        local_time=_parse_client_time(str(body.get("local_time") or "")),
+        proactive_event_id=str(body.get("proactive_event_id") or ""),
+        allow_llm=bool(body.get("allow_llm", True)),
+    )
+
+
+@app.get("/api/opening/ready")
+def opening_ready(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session_id: str = "android",
+    local_time: str = "",
+    proactive_event_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    result = consume_ready_opening(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        session_id=session_id,
+        local_time=_parse_client_time(local_time),
+        proactive_event_id=proactive_event_id,
+    )
+    write_diagnostic("event_ok", event_type="opening_ready", session_id=session_id, result_type=result.event_type)
+    return result.model_dump()
+
+
 @app.websocket("/ws/app")
 async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id: str = "device") -> None:
     await websocket.accept()
@@ -570,6 +620,7 @@ def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session
         character_id=DEFAULT_CHARACTER_ID,
         interaction_id=interaction.interaction_id,
         interaction_type="like",
+        moment_id=moment_id,
     )
     session.commit()
     return {"ok": True, "interaction_id": interaction.interaction_id}
@@ -591,6 +642,7 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
         character_id=DEFAULT_CHARACTER_ID,
         interaction_id=interaction.interaction_id,
         interaction_type="comment",
+        moment_id=moment_id,
         content=content,
     )
     session.commit()

@@ -587,7 +587,9 @@ class OpenAICompatibleClient:
                     message=str(exc),
                 )
                 raise
-        content = response.json()["choices"][0]["message"]["content"]
+        response_payload = response.json()
+        choice = response_payload["choices"][0]
+        content = choice["message"]["content"]
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError as exc:
@@ -607,6 +609,8 @@ class OpenAICompatibleClient:
             model=self.config.model,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             keys=list(parsed.keys()) if isinstance(parsed, dict) else [],
+            finish_reason=choice.get("finish_reason", ""),
+            raw_preview=str(content)[:120],
         )
         return parsed
 
@@ -641,13 +645,17 @@ class OpenAICompatibleClient:
                     message=str(exc),
                 )
                 raise
-        content = str(response.json()["choices"][0]["message"]["content"] or "").strip()
+        response_payload = response.json()
+        choice = response_payload["choices"][0]
+        content = str(choice["message"]["content"] or "").strip()
         write_diagnostic(
             "llm_text_ok",
             provider_id=self.config.provider_id,
             model=self.config.model,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             chars=len(content),
+            finish_reason=choice.get("finish_reason", ""),
+            raw_preview=content[:120],
         )
         return content
 

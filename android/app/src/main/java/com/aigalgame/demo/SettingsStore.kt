@@ -67,11 +67,12 @@ class SettingsStore(private val context: Context) {
     }
 
     suspend fun savePlacement(character: String, placement: OutfitPlacement) {
+        val next = placement.coerceForStage()
         context.settingsDataStore.edit { prefs ->
-            prefs[placementKey(character, "scale")] = placement.scale
-            prefs[placementKey(character, "offset_x")] = placement.offsetX
-            prefs[placementKey(character, "offset_y")] = placement.offsetY
-            prefs[placementKey(character, "bottom_inset")] = placement.bottomInset
+            prefs[placementKey(character, "scale")] = next.scale
+            prefs[placementKey(character, "offset_x")] = next.offsetX
+            prefs[placementKey(character, "offset_y")] = next.offsetY
+            prefs[placementKey(character, "bottom_inset")] = next.bottomInset
         }
     }
 
@@ -85,7 +86,7 @@ class SettingsStore(private val context: Context) {
             offsetX = prefs[placementKey(character, "offset_x")] ?: fallback.offsetX,
             offsetY = prefs[placementKey(character, "offset_y")] ?: fallback.offsetY,
             bottomInset = prefs[placementKey(character, "bottom_inset")] ?: fallback.bottomInset
-        )
+        ).coerceForStage()
     }
 
     private fun placementKey(character: String, field: String) = floatPreferencesKey("placement_${character}_$field")

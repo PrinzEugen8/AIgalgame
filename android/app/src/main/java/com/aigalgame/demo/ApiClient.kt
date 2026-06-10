@@ -36,6 +36,10 @@ class ApiClient(private val baseUrl: String) {
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
     suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
+    suspend fun openingReady(proactiveEventId: String = ""): JSONObject {
+        val suffix = if (proactiveEventId.isBlank()) "" else "&proactive_event_id=${encode(proactiveEventId)}"
+        return get("/api/opening/ready?session_id=android&local_time=${encodedLocalTime()}$suffix")
+    }
 
     suspend fun postEvent(type: String, text: String = "", replyId: String = "", storyIndex: Int = 0, proactiveEventId: String = ""): JSONObject {
         val payload = JSONObject()
@@ -52,6 +56,14 @@ class ApiClient(private val baseUrl: String) {
     }
 
     suspend fun markProactiveDelivered(eventId: String): JSONObject = post("/api/proactive/$eventId/delivered", JSONObject())
+    suspend fun consumeProactive(eventId: String): JSONObject = post("/api/proactive/$eventId/consume", JSONObject())
+    suspend fun prepareOpening(proactiveEventId: String = ""): JSONObject {
+        val body = JSONObject()
+            .put("local_time", OffsetDateTime.now().toString())
+            .put("allow_llm", proactiveEventId.isNotBlank())
+        if (proactiveEventId.isNotBlank()) body.put("proactive_event_id", proactiveEventId)
+        return post("/api/opening/prepare", body)
+    }
 
     suspend fun likeMoment(momentId: String): JSONObject = post("/api/moments/$momentId/like", JSONObject())
 
@@ -64,7 +76,11 @@ class ApiClient(private val baseUrl: String) {
     private suspend fun post(path: String, json: JSONObject): JSONObject = request("POST", path, json)
 
     private fun encodedLocalTime(): String {
-        return URLEncoder.encode(OffsetDateTime.now().toString(), StandardCharsets.UTF_8.name())
+        return encode(OffsetDateTime.now().toString())
+    }
+
+    private fun encode(value: String): String {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8.name())
     }
 
     private suspend fun request(method: String, path: String, json: JSONObject?): JSONObject = withContext(Dispatchers.IO) {

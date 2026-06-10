@@ -19,11 +19,12 @@ from app import providers  # noqa: E402
 from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Character, Experience, Memory, Message, Moment, MomentInteraction, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User  # noqa: E402
+from app.models import Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User  # noqa: E402
+from app.opening import consume_ready_opening, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
-from app.proactive import create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
+from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, provider_presets, upsert_provider  # noqa: E402
-from app.schedule import mark_interruption, run_daily_cycle  # noqa: E402
+from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
 from app.schemas import EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
 
@@ -479,10 +480,18 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
             llm_bodies.append(body)
             if "response_format" in body:
                 assert "tts_text_ja" in body["messages"][1]["content"]
+                has_retry_hint = "上一次输出没有通过日文配音校验" in body["messages"][1]["content"]
                 content = json.dumps(
                     {
                         "reply_mode": "normal",
-                        "lines": [{"text": cn_text, "emotion": "calm", "pose": "idle"}],
+                        "lines": [
+                            {
+                                "text": cn_text,
+                                "emotion": "calm",
+                                "pose": "idle",
+                                **({"tts_text_ja": ja_text} if has_retry_hint else {}),
+                            }
+                        ],
                         "normal_replies": [],
                         "key_reply_score": 0,
                         "key_replies": [],
@@ -548,7 +557,8 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
             assert result.payload["lines"][0]["text"] == cn_text
             assert len(llm_bodies) == 2
             assert "response_format" in llm_bodies[0]
-            assert "response_format" not in llm_bodies[1]
+            assert "response_format" in llm_bodies[1]
+            assert "上一次输出没有通过日文配音校验" in llm_bodies[1]["messages"][1]["content"]
             assert tts_bodies[0]["req_params"]["text"] == ja_text
     finally:
         providers.HTTP_TRANSPORT = None
@@ -1106,8 +1116,142 @@ def test_proactive_pending_and_delivered_routes() -> None:
     ).json()
     assert payload["event"]["proactive_event_id"] == event_id
     assert payload["widget"]["unread_count"] == 1
+    assert payload["widget"]["chibi_url"] == "/media/asset_chibi_sakura_widget"
     delivered = client.post(f"/api/proactive/{event_id}/delivered").json()
     assert delivered["event"]["status"] == "delivered"
+
+
+def test_proactive_consume_clears_widget_pending_event() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_consume_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="sakura")
+        event = create_proactive_event(
+            session,
+            user_id=user_id,
+            character_id="sakura",
+            source_type="memory",
+            source_id=f"consume_memory_{suffix}",
+            title="清红点测试",
+            text="这条主动消息被点击后应该马上清掉红点。",
+            priority=90,
+            dedupe_key=f"consume_memory_{suffix}",
+            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+        )
+        session.commit()
+        before = pending_proactive_response(
+            session,
+            user_id=user_id,
+            character_id="sakura",
+            local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+            generate_news=False,
+        )
+        assert before["event"]["proactive_event_id"] == event.proactive_event_id
+        consume_proactive_event(session, event.proactive_event_id)
+        after = pending_proactive_response(
+            session,
+            user_id=user_id,
+            character_id="sakura",
+            local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
+            generate_news=False,
+        )
+        assert after["event"] is None
+        assert after["widget"]["unread_count"] == 0
+
+
+def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"opening_greeting_user_{suffix}"
+    voice_id = f"voice_opening_greeting_{suffix}"
+    resource_id = f"resource-opening-{suffix}"
+    speaker = f"speaker-opening-{suffix}"
+    audio = base64.b64encode(b"ID3" + b"o" * 220).decode()
+    tts_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        tts_bodies.append(body)
+        assert request.headers["X-Api-Resource-Id"] == resource_id
+        assert body["req_params"]["speaker"] == speaker
+        assert any("ぁ" <= ch <= "ヿ" for ch in body["req_params"]["text"])
+        return httpx.Response(200, content=f'data: {{"data":"{audio}"}}\n'.encode())
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_opening_greeting_tts_{suffix}",
+                    kind="tts",
+                    provider="volc_seed_tts",
+                    base_url="https://openspeech.bytedance.com/api/v3/tts/unidirectional",
+                    secrets={"x_api_key": "tts-key"},
+                ),
+            )
+            session.merge(
+                TtsVoiceProfile(
+                    voice_id=voice_id,
+                    provider_id=config.provider_id,
+                    label="opening greeting",
+                    speaker=speaker,
+                    resource_id=resource_id,
+                    language="ja",
+                    enabled=True,
+                )
+            )
+            user = session.get(User, user_id)
+            character = session.get(Character, "sakura")
+            user.story_completed = True
+            user.tts_enabled = True
+            character.tts_voice_profile_id = voice_id
+            session.commit()
+
+            prepared = prepare_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T20:00:00+08:00"),
+                allow_llm=False,
+            )
+            assert prepared["kind"] == "greeting"
+            cache = session.get(OpeningCache, prepared["cache_id"])
+            assert cache is not None and cache.status == "ready"
+            ready = consume_ready_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                session_id=f"opening_session_{suffix}",
+                local_time=datetime.fromisoformat("2026-06-09T20:01:00+08:00"),
+            )
+            assert ready.event_type == "dialogue"
+            assert ready.payload["cached"] is True
+            assert ready.payload["opening_kind"] == "greeting"
+            assert ready.payload["lines"][0]["tts_audio_url"].startswith("/media/")
+            session.refresh(cache)
+            assert cache.status == "consumed"
+            assert tts_bodies
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_repeated_moment_like_dedupes_proactive_event_by_moment() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"moment_like_dedupe_user_{suffix}"
+    moment_id = "seed_moment_sakura_walk"
+    first = client.post(f"/api/moments/{moment_id}/like?user_id={user_id}").json()
+    second = client.post(f"/api/moments/{moment_id}/like?user_id={user_id}").json()
+    assert first["ok"] is True and second["ok"] is True
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(ProactiveEvent).where(
+                ProactiveEvent.user_id == user_id,
+                ProactiveEvent.source_type == "moment_interaction",
+                ProactiveEvent.dedupe_key == f"moment_interaction:{user_id}:{moment_id}:like",
+            )
+        ).scalars().all()
+        assert len(rows) == 1
 
 
 def test_notification_opened_reflects_proactive_event_in_chat() -> None:
@@ -1355,6 +1499,45 @@ def test_schedule_interruption_and_daily_cycle() -> None:
         mark_interruption(session, user_id="demo_user", session_id="s_test", local_time=datetime.fromisoformat("2026-06-09T14:22:00+08:00"))
         updated = session.get(ScheduleSlot, "slot_test_interrupt")
         assert updated.actual_status == "interrupted"
+
+
+def test_ensure_schedule_refreshes_elapsed_pending_slots() -> None:
+    user_id = "schedule_refresh_user"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="sakura")
+        session.merge(
+            ScheduleSlot(
+                slot_id="slot_test_refresh_elapsed",
+                schedule_date="2026-06-09",
+                user_id=user_id,
+                character_id="sakura",
+                start_at="2026-06-09T08:00:00+08:00",
+                end_at="2026-06-09T08:15:00+08:00",
+                activity_title="早饭",
+                activity_type="daily",
+                actual_status="pending",
+            )
+        )
+        session.merge(
+            ScheduleSlot(
+                slot_id="slot_test_refresh_interrupted",
+                schedule_date="2026-06-09",
+                user_id=user_id,
+                character_id="sakura",
+                start_at="2026-06-09T08:15:00+08:00",
+                end_at="2026-06-09T08:30:00+08:00",
+                activity_title="早饭",
+                activity_type="daily",
+                actual_status="interrupted",
+            )
+        )
+        session.commit()
+
+        ensure_schedule(session, user_id=user_id, character_id="sakura", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
+        elapsed = session.get(ScheduleSlot, "slot_test_refresh_elapsed")
+        interrupted = session.get(ScheduleSlot, "slot_test_refresh_interrupted")
+        assert elapsed.actual_status == "completed"
+        assert interrupted.actual_status == "interrupted"
 
 
 def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:

@@ -14,8 +14,8 @@
 
         <ImageView
             android:id="@+id/widget_icon"
-            android:layout_width="112dp"
-            android:layout_height="96dp"
+            android:layout_width="136dp"
+            android:layout_height="122dp"
             android:contentDescription="@string/app_name"
             android:scaleType="fitCenter"
             android:src="@drawable/chibi_sakura_widget" />

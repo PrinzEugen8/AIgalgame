@@ -181,9 +181,29 @@ class ProactiveEvent(Base):
     scheduled_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
     expires_at: Mapped[str] = mapped_column(String, default="")
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    prepared_payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    prepared_at: Mapped[str] = mapped_column(String, default="")
+    prepare_error: Mapped[str] = mapped_column(Text, default="")
     delivered_at: Mapped[str] = mapped_column(String, default="")
     opened_at: Mapped[str] = mapped_column(String, default="")
     reflected_at: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class OpeningCache(Base):
+    __tablename__ = "opening_caches"
+
+    cache_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    kind: Mapped[str] = mapped_column(String, default="greeting", index=True)
+    proactive_event_id: Mapped[str] = mapped_column(String, default="", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String, default="ready", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    expires_at: Mapped[str] = mapped_column(String, default="", index=True)
+    consumed_at: Mapped[str] = mapped_column(String, default="")
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 

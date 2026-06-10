@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Character, Moment, MomentInteraction, RelationState, User
+from .models import Character, MediaAsset, Moment, MomentInteraction, RelationState, User
 
 
 DEFAULT_USER_ID = "demo_user"
@@ -42,6 +44,25 @@ INITIAL_MOMENTS = [
         "comments": [{"actor_name": "同桌同学", "content": "这句很像会被认真收藏起来的话。"}],
     },
 ]
+
+
+def _ensure_chibi_asset(session: Session, character: Character) -> None:
+    asset_id = "asset_chibi_sakura_widget"
+    image_path = Path(__file__).resolve().parents[2] / "android" / "app" / "src" / "main" / "res" / "drawable-nodpi" / "chibi_sakura_widget.png"
+    if image_path.exists() and session.get(MediaAsset, asset_id) is None:
+        session.add(
+            MediaAsset(
+                asset_id=asset_id,
+                asset_type="image",
+                url=f"/media/{asset_id}",
+                local_path=str(image_path),
+                local_cache_key="local:chibi_sakura_widget",
+                prompt="本地桌面小组件 Q 版小樱形象",
+                ai_generated=True,
+            )
+        )
+    if asset_id not in character.chibi_widget_assets_json:
+        character.chibi_widget_assets_json = f'{{"happy":"{asset_id}","default":"{asset_id}"}}'
 
 
 def _ensure_initial_moments(session: Session, character_id: str) -> None:
@@ -96,18 +117,18 @@ def ensure_seed(session: Session, user_id: str = DEFAULT_USER_ID, character_id: 
         session.add(User(user_id=user_id))
     character = session.get(Character, character_id)
     if character is None:
-        session.add(
-            Character(
-                character_id=character_id,
-                name="小樱",
-                persona_prompt=PERSONA,
-                speech_style=SPEECH,
-                relationship_boundary=BOUNDARY,
-                avatar_assets_json='{"default":"asset://avatar_sakura"}',
-                standing_assets_json='{"idle":"asset://standing_sakura_idle","happy":"asset://standing_sakura_happy","shy":"asset://standing_sakura_shy","thinking":"asset://standing_sakura_thinking"}',
-                chibi_widget_assets_json='{"happy":"asset://chibi_happy","study":"asset://chibi_study","sleep":"asset://chibi_sleep","miss":"asset://chibi_miss"}',
-            )
+        character = Character(
+            character_id=character_id,
+            name="小樱",
+            persona_prompt=PERSONA,
+            speech_style=SPEECH,
+            relationship_boundary=BOUNDARY,
+            avatar_assets_json='{"default":"asset://avatar_sakura"}',
+            standing_assets_json='{"idle":"asset://standing_sakura_idle","happy":"asset://standing_sakura_happy","shy":"asset://standing_sakura_shy","thinking":"asset://standing_sakura_thinking"}',
+            chibi_widget_assets_json='{"happy":"asset_chibi_sakura_widget","default":"asset_chibi_sakura_widget"}',
         )
+        session.add(character)
+    _ensure_chibi_asset(session, character)
     exists = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
     ).scalar_one_or_none()

@@ -14,7 +14,6 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
@@ -97,7 +96,9 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.work.ExistingWorkPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
@@ -127,6 +128,11 @@ class MainActivity : ComponentActivity() {
             ExistingPeriodicWorkPolicy.UPDATE,
             PeriodicWorkRequestBuilder<NotificationWorker>(15, TimeUnit.MINUTES).build()
         )
+        WorkManager.getInstance(this).enqueueUniqueWork(
+            "sakura_widget_startup_refresh",
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<NotificationWorker>().build()
+        )
         viewModel.consumeLaunchIntent(intent)
         setContent {
             GalgameTheme {
@@ -140,6 +146,11 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         viewModel.consumeLaunchIntent(intent)
     }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.resumeFromForeground()
+    }
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -151,7 +162,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var dialogueEventInFlight = false
     private var placementDraftCharacter = ""
     private var pendingProactiveEventId = ""
-    private var pendingProactiveOpenType = "notification_opened"
 
     var baseUrl by mutableStateOf("")
         private set
@@ -163,6 +173,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var storyIndex by mutableIntStateOf(0)
     var isBusy by mutableStateOf(false)
     var errorMessage by mutableStateOf("")
+    var storyCompleted by mutableStateOf(false)
     var selectedCharacter by mutableStateOf("atri")
     var selectedBackground by mutableStateOf("classroom")
     var previewEmotion by mutableStateOf("calm")
@@ -211,7 +222,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun currentLine(): DialogueLine? = lines.getOrNull(currentLineIndex)
-    fun currentPlacement(): OutfitPlacement = outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)
+    fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
 
     fun saveBaseUrl(value: String) {
@@ -258,6 +269,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     mood = rel.optInt("mood", relation.mood),
                     stage = rel.optString("stage", relation.stage)
                 )
+                storyCompleted = boot.optObject("user").optBoolean("story_completed", storyCompleted)
                 bootstrappedBaseUrl = urlKey
                 if (openAfterBootstrap && lines.isEmpty()) {
                     openApp()
@@ -272,7 +284,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val eventId = intent?.getStringExtra("proactive_event_id").orEmpty()
         if (eventId.isBlank()) return
         pendingProactiveEventId = eventId
-        pendingProactiveOpenType = intent?.getStringExtra("proactive_open_type").orEmpty().ifBlank { "notification_opened" }
         openPendingProactive()
     }
 
@@ -280,11 +291,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         val eventId = pendingProactiveEventId
         if (eventId.isBlank()) return
-        val eventType = pendingProactiveOpenType.ifBlank { "notification_opened" }
         pendingProactiveEventId = ""
-        pendingProactiveOpenType = "notification_opened"
         launchDialogueEvent {
-            applyEvent(client.postEvent(eventType, proactiveEventId = eventId, storyIndex = storyIndex))
+            SakuraWidgetProvider.clearUnread(getApplication())
+            try {
+                client.consumeProactive(eventId)
+            } catch (_: Exception) {
+            }
+            applyEvent(client.openingReady(eventId))
             appOpenedBaseUrl = baseUrl
         }
     }
@@ -294,8 +308,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val urlKey = baseUrl
         if (!force && appOpenedBaseUrl == urlKey) return
         launchDialogueEvent {
-            applyEvent(client.postEvent("app_opened", storyIndex = storyIndex))
+            if (storyCompleted) {
+                applyEvent(client.openingReady())
+            } else {
+                applyEvent(client.postEvent("app_opened", storyIndex = storyIndex))
+            }
             appOpenedBaseUrl = urlKey
+        }
+    }
+
+    fun resumeFromForeground() {
+        if (baseUrl.isBlank()) return
+        val waitingForUser = currentLine() == null && (normalReplies.isNotEmpty() || keyReplies.isNotEmpty())
+        if (storyCompleted && waitingForUser) {
+            normalReplies.clear()
+            keyReplies.clear()
+            openApp(force = true)
+        } else {
+            openApp()
         }
     }
 
@@ -445,12 +475,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updatePlacementDraft(value: OutfitPlacement) {
         val character = placementDraftCharacter.ifBlank { selectedCharacter }
-        placementDraft = value
-        outfitPlacements = outfitPlacements.toMutableMap().also { it[character] = value }
+        val next = value.coerceForStage()
+        placementDraft = next
+        outfitPlacements = outfitPlacements.toMutableMap().also { it[character] = next }
     }
 
     fun commitPlacementEdit() {
-        val value = placementDraft ?: return
+        val value = placementDraft?.coerceForStage() ?: return
         val character = placementDraftCharacter.ifBlank { selectedCharacter }
         placementDraft = null
         placementDraftCharacter = ""
@@ -498,6 +529,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val payload = event.optObject("payload")
+        if (payload.has("story_completed")) {
+            storyCompleted = payload.optBoolean("story_completed", storyCompleted)
+        }
         storyIndex = payload.optInt("story_index", storyIndex)
         val relationJson = payload.optObject("relation_delta")
         if (relationJson.length() > 0) {
@@ -522,6 +556,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             lines.add(line)
             dialogueHistory.add(line)
+        }
+        if (ttsEnabled && lines.size > 1 && lines.any { it.ttsUrl.isBlank() }) {
+            errorMessage = "本次回复有台词缺少语音，已记录诊断。"
         }
         currentLineIndex = 0
         normalReplies.clear()
@@ -644,9 +681,11 @@ fun AudioLinePlayer(vm: MainViewModel) {
     val context = LocalContext.current
     val player = remember { ExoPlayer.Builder(context).build() }
     val line = vm.currentLine()
-    LaunchedEffect(line?.ttsUrl, vm.ttsEnabled) {
+    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled) {
         val url = line?.ttsUrl.orEmpty()
         if (vm.ttsEnabled && url.isNotBlank()) {
+            player.stop()
+            player.clearMediaItems()
             player.setMediaItem(MediaItem.fromUri(vm.resolveUrl(url)))
             player.prepare()
             player.play()
@@ -1158,16 +1197,17 @@ fun CharacterStage(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
-    var gesturePlacement by remember(placement) { mutableStateOf(placement) }
+    val stagePlacement = placement.coerceForStage()
+    var gesturePlacement by remember(stagePlacement) { mutableStateOf(stagePlacement) }
     val transformState = rememberTransformableState { zoomChange, panChange, _ ->
         if (!editable || onPlacementChange == null) return@rememberTransformableState
         val dx = with(density) { panChange.x.toDp().value }
         val dy = with(density) { panChange.y.toDp().value }
         val next = gesturePlacement.copy(
-            scale = (gesturePlacement.scale * zoomChange).coerceIn(0.65f, 1.8f),
-            offsetX = (gesturePlacement.offsetX + dx).coerceIn(-180f, 180f),
-            offsetY = (gesturePlacement.offsetY + dy).coerceIn(-260f, 160f)
-        )
+            scale = gesturePlacement.scale * zoomChange,
+            offsetX = gesturePlacement.offsetX + dx,
+            offsetY = gesturePlacement.offsetY + dy
+        ).coerceForStage()
         gesturePlacement = next
         onPlacementChange(next)
     }
@@ -1182,20 +1222,11 @@ fun CharacterStage(
     }
     Box(modifier.then(stageGestureModifier)) {
         SakuraSceneBackground(background)
-        if (editable) {
-            Box(
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(CharacterStageBaseHeight * placement.scale)
-                    .border(1.dp, Color(0x99FFFFFF), RoundedCornerShape(12.dp))
-            )
-        }
         CharacterStandee(
             character = character,
             emotion = emotion,
             pose = pose,
-            placement = placement,
+            placement = stagePlacement,
             baseHeight = CharacterStageBaseHeight,
             modifier = Modifier
                 .align(Alignment.BottomCenter)

@@ -31,19 +31,35 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             val widget = state.optObject("widget")
             val event = state.optObject("event")
             val eventId = event.optString("proactive_event_id", widget.optString("proactive_event_id"))
+            val chibiUrl = widget.optString("chibi_url")
+            val chibi = if (chibiUrl.isNotBlank()) {
+                try {
+                    val bytes = HttpDownloader.bytes(api.absoluteUrl(chibiUrl))
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                } catch (_: Exception) {
+                    null
+                }
+            } else {
+                null
+            }
             SakuraWidgetProvider.updateAll(
                 applicationContext,
                 widget.optString("character_name", "小樱"),
                 widget.optString("status", "想聊天"),
                 widget.optString("bubble", "今天也想听你说说话。"),
                 widget.optInt("unread_count", 0),
-                eventId
+                eventId,
+                chibi
             )
             if (eventId.isNotBlank()) {
                 if (prefs[booleanPreferencesKey("notifications_enabled")] ?: true) {
                     notify(event)
                 }
                 api.markProactiveDelivered(eventId)
+            }
+            try {
+                api.prepareOpening(eventId)
+            } catch (_: Exception) {
             }
             Result.success()
         } catch (_: Exception) {
