@@ -662,9 +662,13 @@
             return {
                 stageVersion: STAGE_VERSION,
                 requestedStageVersion: state.stageVersion || "",
+                coreLoaded: status.coreLoaded,
+                frameworkLoaded: status.frameworkLoaded,
+                modelLoaded: status.modelLoaded,
+                drawableCount: status.drawableCount,
+                lastError: status.lastError,
                 app: !!app,
                 hasModel: !!model,
-                modelLoaded: !!model,
                 modelSrc: modelSrc,
                 backgroundSrc: backgroundSrc,
                 backgroundLoaded: backgroundLoaded,
@@ -698,6 +702,9 @@
             };
         }
     };
+
+    renderDiagnostics();
+    applyStageClass(state.stageMode);
 
     try {
         debug("boot");
