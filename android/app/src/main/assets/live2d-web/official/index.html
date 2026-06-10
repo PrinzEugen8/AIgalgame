@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Live2D Official Stage</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #161923;
+      color: #f8fbff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body.stage-home,
+    body.stage-dress {
+      background:
+        linear-gradient(180deg, rgba(8, 11, 18, 0.18), rgba(8, 11, 18, 0.28)),
+        url("/assets/live2d-web/backgrounds/classroom.png") center / cover no-repeat,
+        #1b1e28;
+    }
+
+    body.stage-selftest {
+      background:
+        radial-gradient(circle at 50% 18%, rgba(93, 142, 184, 0.25), transparent 34%),
+        linear-gradient(180deg, #202535 0%, #11131b 100%);
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+
+    #diagnostics {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      display: none;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px 10px;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.20);
+      border-radius: 8px;
+      background: rgba(10, 14, 22, 0.72);
+      backdrop-filter: blur(8px);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    body.stage-selftest #diagnostics {
+      display: grid;
+    }
+
+    .status-row {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .status-label {
+      min-width: 0;
+      overflow: hidden;
+      color: rgba(248, 251, 255, 0.74);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-value {
+      color: #ffffff;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status-ok {
+      color: #7df0a9;
+    }
+
+    .status-bad {
+      color: #ff8f9f;
+    }
+
+    #error {
+      grid-column: 1 / -1;
+      color: #ffb7c1;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body class="stage-selftest">
+  <canvas id="stage"></canvas>
+  <div id="diagnostics" aria-live="polite">
+    <div class="status-row"><span class="status-label">Core loaded</span><span id="core" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Framework loaded</span><span id="framework" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Model loaded</span><span id="model" class="status-value status-bad">no</span></div>
+    <div class="status-row"><span class="status-label">Drawable count</span><span id="drawables" class="status-value">0</span></div>
+    <div class="status-row"><span class="status-label">Last frame time</span><span id="frame" class="status-value">0.0 ms</span></div>
+    <div class="status-row"><span class="status-label">Stage version</span><span id="version" class="status-value">boot</span></div>
+    <div id="error"></div>
+  </div>
+  <script src="/assets/live2d/sdk/live2dcubismcore.min.js"></script>
+  <script src="./official-stage.js"></script>
+</body>
+</html>

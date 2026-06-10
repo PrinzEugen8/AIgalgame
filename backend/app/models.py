@@ -22,6 +22,8 @@ class User(Base):
     sleep_end: Mapped[str] = mapped_column(String, default="08:00")
     interest_topics_json: Mapped[str] = mapped_column(Text, default="[]")
     proactive_daily_limit: Mapped[str] = mapped_column(String, default="low")
+    proactive_next_check_at: Mapped[str] = mapped_column(String, default="")
+    proactive_judgement_json: Mapped[str] = mapped_column(Text, default="{}")
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     widget_bubbles_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     news_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -253,6 +255,22 @@ class WeatherSnapshot(Base):
     daily_json: Mapped[str] = mapped_column(Text, default="{}")
     warning_json: Mapped[str] = mapped_column(Text, default="{}")
     minutely_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class TrendRadarSnapshot(Base):
+    __tablename__ = "trend_radar_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String, default="", index=True)
+    local_date: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="ok", index=True)
+    generated_at: Mapped[str] = mapped_column(String, default="")
+    fetched_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+    endpoint: Mapped[str] = mapped_column(String, default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 

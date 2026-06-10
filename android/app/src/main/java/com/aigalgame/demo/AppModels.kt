@@ -5,6 +5,8 @@ data class DialogueLine(
     val text: String,
     val emotion: String = "calm",
     val pose: String = "idle",
+    val motion: String = "",
+    val expression: String = "",
     val ttsUrl: String = "",
     val ttsError: String = ""
 )
@@ -59,6 +61,92 @@ data class OutfitPlacement(
     val bottomInset: Float = 48f
 )
 
+enum class Live2DReactionIntensity(val wireName: String) {
+    Soft("soft"),
+    Flirty("flirty"),
+    Boundary("boundary")
+}
+
+data class RelationDelta(
+    val affection: Int = 0,
+    val trust: Int = 0,
+    val dependency: Int = 0,
+    val mood: Int = 0
+)
+
+data class Live2DReactionConfig(
+    val hitArea: String,
+    val intensity: Live2DReactionIntensity = Live2DReactionIntensity.Soft,
+    val motion: String = "",
+    val expression: String = "",
+    val localTextCandidates: List<String> = emptyList(),
+    val relationDelta: RelationDelta = RelationDelta(),
+    val cooldownMs: Long = 1400L
+)
+
+data class Live2DTapMotionConfig(
+    val hitArea: String,
+    val motion: String,
+    val weight: Float = 1f
+)
+
+data class Live2DModelConfig(
+    val name: String,
+    val assetPath: String,
+    val scale: Float = 1f,
+    val initialXShift: Float = 0f,
+    val initialYShift: Float = 0f,
+    val idleMotionGroupName: String = "Idle",
+    val emotionMap: Map<String, String> = emptyMap(),
+    val tapMotions: List<Live2DTapMotionConfig> = emptyList()
+)
+
+data class Live2DEmotionBinding(
+    val expression: String = "",
+    val motion: String = ""
+)
+
+data class Live2DHitArea(
+    val id: String,
+    val label: String,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float
+) {
+    fun contains(x: Float, y: Float): Boolean {
+        return x in left..right && y in top..bottom
+    }
+}
+
+data class Live2DCharacterConfig(
+    val character: String,
+    val modelAssetPath: String,
+    val fallbackModelAssetPath: String = "",
+    val modelConfig: Live2DModelConfig = Live2DModelConfig(
+        name = character,
+        assetPath = modelAssetPath
+    ),
+    val emotionBindings: Map<String, Live2DEmotionBinding>,
+    val poseMotionMap: Map<String, String>,
+    val hitAreas: List<Live2DHitArea>,
+    val reactions: List<Live2DReactionConfig>
+)
+
+data class Live2DReaction(
+    val hitArea: String,
+    val intensity: Live2DReactionIntensity,
+    val motion: String,
+    val expression: String,
+    val text: String,
+    val relationDelta: RelationDelta
+)
+
+data class Live2DSpeechState(
+    val active: Boolean = false,
+    val mouthOpen: Float = 0f
+)
+
 private const val OutfitPlacementMinScale = 0.25f
 private const val OutfitPlacementMaxScale = 4.0f
 private const val OutfitPlacementBaseHorizontalRange = 480f
@@ -99,6 +187,7 @@ enum class AppScreen {
     Home,
     DressUp,
     Settings,
+    Live2DSelfTest,
     Moments,
     Calendar,
     Journal

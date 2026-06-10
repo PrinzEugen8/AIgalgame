@@ -31,6 +31,30 @@ android {
     }
 }
 
+val requiredLive2DAssets = listOf(
+    "src/main/assets/live2d/sdk/live2dcubismcore.min.js",
+    "src/main/assets/live2d-web/official/index.html",
+    "src/main/assets/live2d-web/official/official-stage.js",
+    "src/main/assets/live2d/models/Haru/Haru.model3.json",
+    "src/main/assets/live2d/models/Haru/Haru.moc3",
+    "src/main/assets/live2d/models/Haru/Haru.2048/texture_00.png"
+)
+
+tasks.register("verifyLive2DAssets") {
+    group = "verification"
+    description = "Checks that the offline Live2D Web runtime and fallback model are packaged."
+    doLast {
+        val missing = requiredLive2DAssets.filterNot { layout.projectDirectory.file(it).asFile.exists() }
+        if (missing.isNotEmpty()) {
+            throw GradleException("Missing Live2D assets: ${missing.joinToString()}")
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("verifyLive2DAssets")
+}
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.activity:activity-compose:1.9.3")
@@ -42,8 +66,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

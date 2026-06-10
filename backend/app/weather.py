@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -7,13 +8,16 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .diagnostics import write_diagnostic
+from .diagnostics import diagnostic_span, write_diagnostic
 from .models import ProactiveEvent, User, UserLocation, WeatherSnapshot
 from .providers import QWeatherClient, get_enabled_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
 
 
-WEATHER_CACHE_FALLBACK = timedelta(hours=2)
+WEATHER_REFRESH_HOUR = 4
+MANUAL_REFRESH_DEDUPE_SECONDS = 60
+_WEATHER_LOCKS_GUARD = threading.Lock()
+_WEATHER_REFRESH_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -41,6 +45,19 @@ def _local_now(user: User | None, local_time: datetime | None = None) -> datetim
     return local_time.astimezone(zone)
 
 
+def _active_weather_date(now_local: datetime) -> str:
+    if now_local.hour < WEATHER_REFRESH_HOUR:
+        now_local = now_local - timedelta(days=1)
+    return now_local.date().isoformat()
+
+
+def _next_weather_refresh_at(now_local: datetime) -> datetime:
+    target = now_local.replace(hour=WEATHER_REFRESH_HOUR, minute=0, second=0, microsecond=0)
+    if now_local >= target:
+        target += timedelta(days=1)
+    return target
+
+
 def _utc_iso(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -57,16 +74,34 @@ def _latest_snapshot(session: Session, user_id: str) -> WeatherSnapshot | None:
     ).scalar_one_or_none()
 
 
-def _fresh_snapshot(session: Session, user_id: str, now_utc: datetime) -> WeatherSnapshot | None:
-    snapshot = _latest_snapshot(session, user_id)
+def _snapshot_for_date(session: Session, user_id: str, weather_date: str) -> WeatherSnapshot | None:
+    return session.execute(
+        select(WeatherSnapshot)
+        .where(WeatherSnapshot.user_id == user_id, WeatherSnapshot.weather_date == weather_date)
+        .order_by(WeatherSnapshot.fetched_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _refresh_lock_for(user_id: str, weather_date: str) -> threading.Lock:
+    key = f"{user_id}:{weather_date}"
+    with _WEATHER_LOCKS_GUARD:
+        lock = _WEATHER_REFRESH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WEATHER_REFRESH_LOCKS[key] = lock
+        return lock
+
+
+def _recently_fetched(snapshot: WeatherSnapshot | None, now_utc: datetime, seconds: int = MANUAL_REFRESH_DEDUPE_SECONDS) -> bool:
     if snapshot is None:
-        return None
-    expires_at = _parse_iso(snapshot.expires_at)
-    if expires_at is None:
-        return None
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    return snapshot if expires_at > now_utc else None
+        return False
+    fetched_at = _parse_iso(snapshot.fetched_at)
+    if fetched_at is None:
+        return False
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    return fetched_at.astimezone(timezone.utc) >= now_utc - timedelta(seconds=seconds)
 
 
 def update_user_location(
@@ -218,20 +253,49 @@ def _apply_geo(location: UserLocation, geo: dict[str, Any]) -> None:
     location.updated_at = utc_now()
 
 
-def ensure_weather_snapshot(
+def read_weather_snapshot(
     session: Session,
     *,
     user_id: str,
     local_time: datetime | None = None,
-    force: bool = False,
+    allow_stale: bool = True,
 ) -> WeatherSnapshot | None:
     user = session.get(User, user_id)
     now_local = _local_now(user, local_time)
-    now_utc = now_local.astimezone(timezone.utc)
-    if not force:
-        cached = _fresh_snapshot(session, user_id, now_utc)
-        if cached is not None:
-            return cached
+    weather_date = _active_weather_date(now_local)
+    snapshot = _snapshot_for_date(session, user_id, weather_date)
+    stale = False
+    if snapshot is None and allow_stale:
+        snapshot = _latest_snapshot(session, user_id)
+        stale = snapshot is not None
+    write_diagnostic(
+        "weather_snapshot_read",
+        feature="天气服务",
+        stage="read_weather_snapshot",
+        summary=f"{user_id} {'hit' if snapshot is not None else 'miss'}",
+        user_id=user_id,
+        active_weather_date=weather_date,
+        snapshot_id=snapshot.snapshot_id if snapshot is not None else "",
+        snapshot_weather_date=snapshot.weather_date if snapshot is not None else "",
+        stale=stale,
+    )
+    return snapshot
+
+
+def active_weather_date_for_user(session: Session, *, user_id: str, local_time: datetime | None = None) -> str:
+    user = session.get(User, user_id)
+    return _active_weather_date(_local_now(user, local_time))
+
+
+def _refresh_weather_snapshot_inner(
+    session: Session,
+    *,
+    user_id: str,
+    local_time: datetime | None = None,
+    weather_date: str,
+) -> WeatherSnapshot | None:
+    user = session.get(User, user_id)
+    now_local = _local_now(user, local_time)
     location = session.get(UserLocation, user_id)
     if location is None:
         write_diagnostic("weather_skipped", reason="missing_location", user_id=user_id)
@@ -242,7 +306,7 @@ def ensure_weather_snapshot(
         return _latest_snapshot(session, user_id)
     client = QWeatherClient(config)
     coordinate = _coordinate(location.longitude, location.latitude)
-    if not location.qweather_location_id or force:
+    if not location.qweather_location_id:
         try:
             _apply_geo(location, client.city_lookup(coordinate))
         except Exception as exc:  # noqa: BLE001
@@ -254,19 +318,18 @@ def ensure_weather_snapshot(
         write_diagnostic("weather_refresh_failed", user_id=user_id, location=weather_location, message=str(exc))
         return _latest_snapshot(session, user_id)
     evaluation = _evaluate_weather(bundle)
-    cache_minutes = _as_int(load_json(config.metadata_json, {}).get("cache_minutes")) or 120
     now_payload = (bundle.get("now") or {}).get("now") or {}
     snapshot = WeatherSnapshot(
         snapshot_id=uid("weather"),
         user_id=user_id,
-        weather_date=now_local.date().isoformat(),
+        weather_date=weather_date,
         location_key=weather_location,
         city_name=location.city_name,
         latitude=location.latitude,
         longitude=location.longitude,
         observed_at=str(now_payload.get("obsTime") or (bundle.get("now") or {}).get("updateTime") or ""),
         fetched_at=utc_now(),
-        expires_at=_utc_iso(now_utc + timedelta(minutes=cache_minutes)),
+        expires_at=_utc_iso(_next_weather_refresh_at(now_local)),
         weather_text=str(now_payload.get("text") or ""),
         severity=str(evaluation["severity"]),
         severity_score=int(evaluation["score"]),
@@ -284,6 +347,69 @@ def ensure_weather_snapshot(
     session.commit()
     write_diagnostic("weather_refreshed", user_id=user_id, snapshot_id=snapshot.snapshot_id, trigger=snapshot.trigger_key, score=snapshot.severity_score)
     return snapshot
+
+
+def refresh_weather_snapshot(
+    session: Session,
+    *,
+    user_id: str,
+    local_time: datetime | None = None,
+    force: bool = False,
+) -> WeatherSnapshot | None:
+    user = session.get(User, user_id)
+    now_local = _local_now(user, local_time)
+    now_utc = now_local.astimezone(timezone.utc)
+    weather_date = _active_weather_date(now_local)
+    lock = _refresh_lock_for(user_id, weather_date)
+    with diagnostic_span(
+        "weather_refresh_trace",
+        feature="天气服务",
+        stage="refresh_weather_snapshot",
+        purpose="Refresh weather data from QWeather",
+        summary=f"{user_id} force={force}",
+        user_id=user_id,
+        input={"local_time": local_time.isoformat() if local_time is not None else "", "force": force, "weather_date": weather_date},
+    ) as span:
+        with lock:
+            session.expire_all()
+            existing = _snapshot_for_date(session, user_id, weather_date)
+            if existing is not None and (not force or _recently_fetched(existing, now_utc)):
+                write_diagnostic(
+                    "weather_refresh_reused",
+                    feature="天气服务",
+                    stage="refresh_weather_snapshot",
+                    user_id=user_id,
+                    snapshot_id=existing.snapshot_id,
+                    weather_date=weather_date,
+                    force=force,
+                )
+                span.add(
+                    output=weather_snapshot_to_dict(existing),
+                    snapshot_id=existing.snapshot_id,
+                    cache_used=True,
+                    cache_hit=True,
+                )
+                return existing
+            snapshot = _refresh_weather_snapshot_inner(session, user_id=user_id, local_time=local_time, weather_date=weather_date)
+        span.add(
+            output=weather_snapshot_to_dict(snapshot) if snapshot is not None else None,
+            snapshot_id=snapshot.snapshot_id if snapshot is not None else "",
+            cache_used=False,
+            cache_hit=False,
+        )
+        return snapshot
+
+
+def ensure_weather_snapshot(
+    session: Session,
+    *,
+    user_id: str,
+    local_time: datetime | None = None,
+    force: bool = False,
+) -> WeatherSnapshot | None:
+    if force:
+        return refresh_weather_snapshot(session, user_id=user_id, local_time=local_time, force=True)
+    return read_weather_snapshot(session, user_id=user_id, local_time=local_time, allow_stale=True)
 
 
 def _scheduled_at(snapshot: WeatherSnapshot, now_local: datetime) -> datetime:
@@ -393,11 +519,15 @@ def is_weather_question(text: str) -> bool:
 
 
 def weather_context(session: Session, *, user_id: str, text: str = "", local_time: datetime | None = None) -> str:
-    snapshot = ensure_weather_snapshot(session, user_id=user_id, local_time=local_time, force=False)
+    snapshot = read_weather_snapshot(session, user_id=user_id, local_time=local_time, allow_stale=True)
     if snapshot is None:
         if is_weather_question(text):
-            return "暂无天气数据：还没有获取到用户位置，或天气服务尚未配置完成。"
+            return "还没有今天的天气数据：天气会在每天04:00随日程生成时更新。"
         return "暂无天气数据。"
+    active_weather_date = active_weather_date_for_user(session, user_id=user_id, local_time=local_time)
+    freshness_note = ""
+    if snapshot.weather_date != active_weather_date:
+        freshness_note = f"暂无{active_weather_date} 04:00后的天气数据；以下是上次天气快照。"
     daily = load_json(snapshot.daily_json, {})
     hourly = load_json(snapshot.hourly_json, {})
     warnings = load_json(snapshot.warning_json, {})
@@ -412,7 +542,8 @@ def weather_context(session: Session, *, user_id: str, text: str = "", local_tim
     today = daily_rows[0] if daily_rows else {}
     warning_text = "；".join(str(item.get("title") or item.get("typeName") or "") for item in (warning_rows or [])[:3] if isinstance(item, dict))
     return "\n".join(
-        [
+        [item for item in [
+            freshness_note,
             f"城市：{snapshot.city_name or '未知'}",
             f"摘要：{snapshot.summary}",
             f"严重度：{snapshot.severity} / {snapshot.severity_score} / {snapshot.trigger_key}",
@@ -420,5 +551,5 @@ def weather_context(session: Session, *, user_id: str, text: str = "", local_tim
             f"未来8小时：{'；'.join(next_hours) if next_hours else '暂无'}",
             f"预警：{warning_text or '暂无'}",
             f"更新时间：{snapshot.observed_at or snapshot.fetched_at}",
-        ]
+        ] if item]
     )

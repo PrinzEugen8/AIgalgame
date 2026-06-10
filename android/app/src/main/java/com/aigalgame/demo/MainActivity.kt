@@ -1,6 +1,9 @@
 package com.aigalgame.demo
 
 import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -10,9 +13,11 @@ import android.graphics.BitmapFactory
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -100,8 +105,13 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import androidx.core.app.NotificationManagerCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.work.ExistingWorkPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -123,6 +133,8 @@ import java.time.format.DateTimeParseException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+
+private const val SAKURA_NOTIFICATION_CHANNEL_ID = "sakura"
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
@@ -161,6 +173,14 @@ class MainActivity : ComponentActivity() {
         viewModel.consumeLaunchIntent(intent)
     }
 
+    fun requestNotificationPermissionFromSettings() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         viewModel.syncLocation()
@@ -178,6 +198,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var placementDraftCharacter = ""
     private var pendingProactiveEventId = ""
     private var lastLocationUploadedAt = 0L
+    private var lastLocationUploadLoaded = false
+    private var locationUploadInFlight = false
 
     var baseUrl by mutableStateOf("")
         private set
@@ -195,6 +217,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var previewEmotion by mutableStateOf("calm")
     var ttsEnabled by mutableStateOf(true)
     var notificationsEnabled by mutableStateOf(true)
+    var live2dSpeechState by mutableStateOf(Live2DSpeechState())
+        private set
+    var live2dReactionLine by mutableStateOf<DialogueLine?>(null)
+        private set
     var outfitPlacements by mutableStateOf(defaultOutfitPlacements())
     var placementDraft by mutableStateOf<OutfitPlacement?>(null)
         private set
@@ -242,8 +268,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
 
+    fun updateLive2DSpeech(active: Boolean, mouthOpen: Float) {
+        live2dSpeechState = Live2DSpeechState(active = active, mouthOpen = mouthOpen.coerceIn(0f, 1f))
+    }
+
+    fun applyLive2DReaction(reaction: Live2DReaction) {
+        val delta = reaction.relationDelta
+        if (delta != RelationDelta()) {
+            relation = relation.copy(
+                affection = relation.affection + delta.affection,
+                trust = relation.trust + delta.trust,
+                dependency = relation.dependency + delta.dependency,
+                mood = relation.mood + delta.mood
+            )
+        }
+        if (reaction.text.isNotBlank()) {
+            live2dReactionLine = DialogueLine(
+                id = "live2d_touch_${System.currentTimeMillis()}",
+                text = reaction.text,
+                emotion = expressionToEmotion(reaction.expression),
+                pose = reaction.motion.ifBlank { "idle" },
+                motion = reaction.motion,
+                expression = reaction.expression
+            )
+        }
+    }
+
+    fun clearLive2DReaction() {
+        live2dReactionLine = null
+    }
+
     fun saveBaseUrl(value: String) {
-        val cleaned = value.trim().trimEnd('/')
+        val cleaned = normalizeBackendUrl(value)
         viewModelScope.launch {
             settings.saveBaseUrl(cleaned)
             baseUrl = cleaned
@@ -265,9 +321,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun testHealth() {
         val client = api ?: return
         launchBusy {
-            val health = client.health()
-            connectionMessage = if (health.optBoolean("ok")) "电脑后端已连接" else "电脑后端返回异常"
-            refreshBootstrap()
+            try {
+                val health = client.health()
+                connectionMessage = if (health.optBoolean("ok")) "电脑后端已连接" else "电脑后端返回异常"
+                refreshBootstrap()
+            } catch (e: Exception) {
+                connectionMessage = e.message ?: e.javaClass.simpleName
+                throw e
+            }
         }
     }
 
@@ -531,15 +592,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun syncLocation(force: Boolean = false) {
         val client = api ?: return
         val now = System.currentTimeMillis()
-        if (!force && now - lastLocationUploadedAt < TimeUnit.HOURS.toMillis(6)) return
+        if (locationUploadInFlight) return
+        if (!force && lastLocationUploadLoaded && now - lastLocationUploadedAt < TimeUnit.HOURS.toMillis(6)) return
         val context = getApplication<Application>()
         if (!hasLocationPermission(context)) return
+        locationUploadInFlight = true
         viewModelScope.launch {
-            val location = currentOrLastLocation(context) ?: return@launch
             try {
+                if (!lastLocationUploadLoaded) {
+                    lastLocationUploadedAt = settings.readLastLocationUploadedAt()
+                    lastLocationUploadLoaded = true
+                }
+                val checkedAt = System.currentTimeMillis()
+                if (!force && checkedAt - lastLocationUploadedAt < TimeUnit.HOURS.toMillis(6)) return@launch
+                val location = currentOrLastLocation(context) ?: return@launch
                 client.updateLocation(location.latitude, location.longitude, location.accuracy, location.provider ?: "android")
-                lastLocationUploadedAt = System.currentTimeMillis()
+                val uploadedAt = System.currentTimeMillis()
+                lastLocationUploadedAt = uploadedAt
+                settings.saveLastLocationUploadedAt(uploadedAt)
             } catch (_: Exception) {
+            } finally {
+                locationUploadInFlight = false
             }
         }
     }
@@ -648,6 +721,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 text = item.optString("text"),
                 emotion = item.optString("emotion", "calm"),
                 pose = item.optString("pose", "idle"),
+                motion = item.optString("motion"),
+                expression = item.optString("expression"),
                 ttsUrl = item.optString("tts_audio_url"),
                 ttsError = item.optString("tts_error")
             )
@@ -750,6 +825,7 @@ fun AiGalgameApp(vm: MainViewModel) {
                         AppScreen.Home -> HomeScreen(vm)
                         AppScreen.DressUp -> DressUpScreen(vm)
                         AppScreen.Settings -> SettingsScreen(vm)
+                        AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
                         AppScreen.Moments -> MomentsScreen(vm)
                         AppScreen.Calendar -> CalendarScreen(vm)
                         AppScreen.Journal -> JournalScreen(vm)
@@ -781,18 +857,46 @@ fun AudioLinePlayer(vm: MainViewModel) {
     LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled) {
         val url = line?.ttsUrl.orEmpty()
         if (vm.ttsEnabled && url.isNotBlank()) {
-            player.stop()
-            player.clearMediaItems()
-            player.setMediaItem(MediaItem.fromUri(vm.resolveUrl(url)))
-            player.prepare()
-            player.play()
+            try {
+                player.stop()
+                player.clearMediaItems()
+                player.setMediaItem(MediaItem.fromUri(vm.resolveUrl(url)))
+                player.prepare()
+                player.play()
+                var elapsedMs = 0L
+                while (elapsedMs < 30_000L) {
+                    val playbackState = player.playbackState
+                    if (playbackState == Player.STATE_ENDED || (playbackState == Player.STATE_IDLE && elapsedMs > 300L)) {
+                        break
+                    }
+                    val active = playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_READY || player.isPlaying
+                    vm.updateLive2DSpeech(
+                        active = active,
+                        mouthOpen = if (active) simulatedSpeechMouthOpen(line?.text.orEmpty(), elapsedMs) else 0f
+                    )
+                    delay(45L)
+                    elapsedMs += 45L
+                }
+            } finally {
+                vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
+            }
         } else {
             player.stop()
+            vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
         }
     }
     DisposableEffect(Unit) {
         onDispose { player.release() }
     }
+}
+
+fun simulatedSpeechMouthOpen(text: String, elapsedMs: Long): Float {
+    if (text.isBlank()) return 0f
+    val frame = ((elapsedMs / 45L) + text.length).toInt()
+    val pattern = floatArrayOf(0.18f, 0.72f, 0.38f, 0.86f, 0.24f, 0.62f, 0.10f)
+    val base = pattern[Math.floorMod(frame, pattern.size)]
+    val emphasis = 0.86f + (Math.floorMod(text.hashCode(), 9) * 0.015f)
+    return (base * emphasis).coerceIn(0f, 1f)
 }
 
 @Composable
@@ -852,20 +956,25 @@ fun HomeScreen(vm: MainViewModel) {
     var historyExpanded by remember { mutableStateOf(false) }
     var standeeEditMode by remember { mutableStateOf(false) }
     val line = vm.currentLine()
-    val lastLine = line ?: vm.lines.lastOrNull()
+    val visibleLine = vm.live2dReactionLine ?: line
+    val lastLine = visibleLine ?: vm.lines.lastOrNull()
     val density = LocalDensity.current
     val keyboardLift = with(density) {
         (WindowInsets.ime.getBottom(this) - WindowInsets.navigationBars.getBottom(this)).coerceAtLeast(0).toDp()
     }
     Box(Modifier.fillMaxSize()) {
-        CharacterStage(
+        Live2DStage(
             background = vm.selectedBackground,
             character = vm.selectedCharacter,
             emotion = lastLine?.emotion ?: "calm",
             pose = lastLine?.pose ?: "idle",
             placement = vm.visiblePlacement(),
+            speechState = vm.live2dSpeechState,
+            line = lastLine,
             editable = standeeEditMode,
             onPlacementChange = { vm.updatePlacementDraft(it) },
+            onReaction = { vm.applyLive2DReaction(it) },
+            relation = vm.relation,
             modifier = Modifier.fillMaxSize()
         )
 
@@ -894,7 +1003,7 @@ fun HomeScreen(vm: MainViewModel) {
 
         HomeInteractionPanel(
             vm = vm,
-            line = line,
+            line = visibleLine,
             input = input,
             onInputChange = { input = it },
             onSend = {
@@ -935,8 +1044,14 @@ fun HomeInteractionPanel(
             DialogueBox(
                 line = line,
                 history = vm.dialogueHistory,
-                canAdvance = vm.lines.isNotEmpty(),
-                onAdvance = { vm.advanceLine() },
+                canAdvance = vm.lines.isNotEmpty() || vm.live2dReactionLine != null,
+                onAdvance = {
+                    if (vm.live2dReactionLine != null) {
+                        vm.clearLive2DReaction()
+                    } else {
+                        vm.advanceLine()
+                    }
+                },
                 onShowHistory = onShowHistory
             )
         } else {
@@ -1383,6 +1498,18 @@ fun characterImageRes(character: String, emotion: String, pose: String): Int {
     }
 }
 
+fun expressionToEmotion(expression: String): String {
+    return when (expression.lowercase(Locale.ROOT)) {
+        "happy", "curious" -> "happy"
+        "think", "thinking" -> "thinking"
+        "shy", "awkward" -> "shy"
+        "sad" -> "sad"
+        "angry" -> "angry"
+        "sleep" -> "sleep"
+        else -> "calm"
+    }
+}
+
 @Composable
 fun DressUpScreen(vm: MainViewModel) {
     val placement = vm.currentPlacement()
@@ -1398,12 +1525,14 @@ fun DressUpScreen(vm: MainViewModel) {
             Text("切换立绘、表情和场景预览。", color = Color(0xFF79545B))
         }
         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBFA))) {
-            CharacterStage(
+            Live2DStage(
                 background = vm.selectedBackground,
                 character = vm.selectedCharacter,
                 emotion = vm.previewEmotion,
                 pose = vm.previewEmotion,
                 placement = placement,
+                relation = vm.relation,
+                stageMode = "dress",
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(220.dp)
@@ -1989,9 +2118,82 @@ fun RelationPanel(relation: RelationState) {
     }
 }
 
+data class NotificationSystemStatus(
+    val runtimePermissionRequired: Boolean,
+    val runtimePermissionGranted: Boolean,
+    val appNotificationsEnabled: Boolean,
+    val channelEnabled: Boolean,
+    val lockscreenPublic: Boolean
+)
+
+fun ensureSakuraNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    val manager = context.getSystemService(NotificationManager::class.java) ?: return
+    if (manager.getNotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID) != null) return
+    val channel = NotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID, "小樱主动消息", NotificationManager.IMPORTANCE_DEFAULT)
+    channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+    manager.createNotificationChannel(channel)
+}
+
+fun readNotificationSystemStatus(context: Context): NotificationSystemStatus {
+    ensureSakuraNotificationChannel(context)
+    val runtimeRequired = Build.VERSION.SDK_INT >= 33
+    val runtimeGranted = !runtimeRequired ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    val appEnabled = NotificationManagerCompat.from(context).areNotificationsEnabled()
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+        return NotificationSystemStatus(runtimeRequired, runtimeGranted, appEnabled, channelEnabled = true, lockscreenPublic = true)
+    }
+    val manager = context.getSystemService(NotificationManager::class.java)
+    val channel = manager?.getNotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID)
+    return NotificationSystemStatus(
+        runtimePermissionRequired = runtimeRequired,
+        runtimePermissionGranted = runtimeGranted,
+        appNotificationsEnabled = appEnabled,
+        channelEnabled = channel?.importance != NotificationManager.IMPORTANCE_NONE,
+        lockscreenPublic = channel?.lockscreenVisibility == Notification.VISIBILITY_PUBLIC
+    )
+}
+
+fun openAppNotificationSettings(context: Context) {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+    } else {
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(Uri.parse("package:${context.packageName}"))
+    }
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(intent)
+}
+
+fun openSakuraNotificationChannelSettings(context: Context) {
+    ensureSakuraNotificationChannel(context)
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, SAKURA_NOTIFICATION_CHANNEL_ID)
+    } else {
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(Uri.parse("package:${context.packageName}"))
+    }
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(intent)
+}
+
 @Composable
 fun SettingsScreen(vm: MainViewModel) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var backend by remember(vm.baseUrl) { mutableStateOf(vm.baseUrl) }
+    var notificationRefresh by remember { mutableIntStateOf(0) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) notificationRefresh += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val notificationStatus = remember(notificationRefresh, vm.notificationsEnabled) {
+        readNotificationSystemStatus(context)
+    }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item {
             Text("设置", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
@@ -2013,7 +2215,32 @@ fun SettingsScreen(vm: MainViewModel) {
                     Text("陪伴体验", fontWeight = FontWeight.Bold)
                     SettingSwitch("语音播放", "开启后会自动播放小樱回复的语音。", vm.ttsEnabled) { vm.updateTtsEnabled(it) }
                     SettingSwitch("主动提醒", "开启后桌面组件和本地通知会显示新消息。", vm.notificationsEnabled) { vm.updateNotificationsEnabled(it) }
+                    NotificationPermissionPanel(
+                        status = notificationStatus,
+                        onRequestPermission = {
+                            val activity = context as? MainActivity
+                            if (activity != null) {
+                                activity.requestNotificationPermissionFromSettings()
+                            } else {
+                                openAppNotificationSettings(context)
+                            }
+                            notificationRefresh += 1
+                        },
+                        onOpenAppSettings = {
+                            openAppNotificationSettings(context)
+                            notificationRefresh += 1
+                        },
+                        onOpenChannelSettings = {
+                            openSakuraNotificationChannelSettings(context)
+                            notificationRefresh += 1
+                        }
+                    )
                 }
+            }
+        }
+        item {
+            OutlinedButton(onClick = { vm.screen = AppScreen.Live2DSelfTest }, modifier = Modifier.fillMaxWidth()) {
+                Text("Live2D self test")
             }
         }
         item {
@@ -2021,6 +2248,93 @@ fun SettingsScreen(vm: MainViewModel) {
                 Text("清理本地临时状态")
             }
         }
+    }
+}
+
+@Composable
+fun Live2DSelfTestScreen(vm: MainViewModel) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFF11131B))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { vm.screen = AppScreen.Settings }) {
+                Text("Back", color = Color.White)
+            }
+            Text(
+                "Live2D self test",
+                modifier = Modifier.weight(1f),
+                textAlign = TextAlign.Center,
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.width(64.dp))
+        }
+        Text(
+            "The panel below is rendered inside the same WebView runtime used by Home. Core/model/frame status is shown on-screen, no ADB required.",
+            color = Color(0xCCDDE7F5),
+            fontSize = 12.sp,
+            lineHeight = 16.sp
+        )
+        Box(
+            Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color(0xFF1D2230))
+        ) {
+            Live2DSelfTestStage(Modifier.fillMaxSize())
+        }
+    }
+}
+
+@Composable
+fun NotificationPermissionPanel(
+    status: NotificationSystemStatus,
+    onRequestPermission: () -> Unit,
+    onOpenAppSettings: () -> Unit,
+    onOpenChannelSettings: () -> Unit
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFFFF4F6), RoundedCornerShape(8.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        NotificationStatusRow(
+            "通知权限",
+            if (!status.runtimePermissionRequired) "无需单独授权" else if (status.runtimePermissionGranted) "已允许" else "未允许",
+            status.runtimePermissionGranted
+        )
+        NotificationStatusRow("系统通知", if (status.appNotificationsEnabled) "已开启" else "未开启", status.appNotificationsEnabled)
+        NotificationStatusRow("主动消息渠道", if (status.channelEnabled) "已开启" else "未开启", status.channelEnabled)
+        NotificationStatusRow("锁屏显示", if (status.lockscreenPublic) "渠道已允许" else "前往渠道设置", status.lockscreenPublic)
+        if (status.runtimePermissionRequired && !status.runtimePermissionGranted) {
+            Button(onClick = onRequestPermission, modifier = Modifier.fillMaxWidth()) {
+                Text("请求通知权限")
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onOpenAppSettings, modifier = Modifier.weight(1f)) {
+                Text("通知设置")
+            }
+            OutlinedButton(onClick = onOpenChannelSettings, modifier = Modifier.weight(1f)) {
+                Text("锁屏/渠道")
+            }
+        }
+    }
+}
+
+@Composable
+fun NotificationStatusRow(label: String, value: String, ok: Boolean) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, modifier = Modifier.weight(1f), color = Color(0xFF79545B), fontSize = 13.sp)
+        Text(value, color = if (ok) Color(0xFF2E7D32) else Color(0xFFC62828), fontSize = 13.sp, fontWeight = FontWeight.Bold)
     }
 }
 

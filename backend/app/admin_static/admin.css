@@ -449,6 +449,358 @@ label[hidden],
   padding: 8px 10px;
 }
 
+.runtime-toolbar {
+  display: grid;
+  grid-template-columns: 150px 130px 110px minmax(240px, 1fr) auto auto auto auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.runtime-toolbar .wide {
+  min-width: 0;
+}
+
+.runtime-list {
+  display: grid;
+  gap: 10px;
+}
+
+.runtime-trace-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid rgba(68, 84, 106, 0.14);
+  border-radius: 8px;
+  background: #f7f9fc;
+  color: #344252;
+  font-size: 13px;
+}
+
+.runtime-trace-card {
+  border: 1px solid rgba(68, 84, 106, 0.16);
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.runtime-trace-card.ok {
+  border-left-color: #50a36f;
+}
+
+.runtime-trace-card.running {
+  border-left-color: #4f7fd9;
+}
+
+.runtime-trace-card.warn,
+.runtime-trace-card.stale {
+  border-left-color: #d9a23f;
+}
+
+.runtime-trace-card.error {
+  border-left-color: #d95f76;
+}
+
+.runtime-trace-card.selected {
+  border-color: #4f7fd9;
+  box-shadow: 0 0 0 3px rgba(79, 127, 217, 0.14);
+}
+
+.runtime-trace-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  cursor: pointer;
+}
+
+.runtime-trace-main,
+.runtime-node-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.runtime-trace-main strong,
+.runtime-node-main strong,
+.runtime-trace-main small,
+.runtime-node-main small {
+  overflow-wrap: anywhere;
+}
+
+.runtime-trace-main small,
+.runtime-node-main small {
+  color: #607083;
+  font-size: 12px;
+}
+
+.runtime-trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.runtime-trace-flow {
+  display: grid;
+  gap: 0;
+  padding: 0 12px 12px;
+}
+
+.runtime-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.runtime-step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 34px;
+  bottom: -4px;
+  width: 2px;
+  background: #dbe3ee;
+}
+
+.runtime-step-index {
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background: #e8edf4;
+  color: #344252;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.runtime-step-content {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-bottom: 12px;
+}
+
+.runtime-node-button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.runtime-node-button:hover .runtime-node-main strong,
+.runtime-node-button:focus .runtime-node-main strong {
+  color: #2e5ca7;
+}
+
+.runtime-node-tags,
+.runtime-step-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.runtime-feature-chip,
+.runtime-reference-chip,
+.runtime-relation-chip,
+.runtime-mini-summary {
+  width: fit-content;
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: #e8edf4;
+  color: #344252;
+  font-size: 11px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.runtime-feature-chip {
+  border: 0;
+  cursor: pointer;
+}
+
+.runtime-feature-chip:hover,
+.runtime-feature-chip:focus {
+  background: #dfeafe;
+  color: #2e5ca7;
+}
+
+.runtime-reference-chip {
+  background: #dcf3e2;
+  color: #286241;
+}
+
+.runtime-mini-summary {
+  border-radius: 8px;
+  background: #f5f7fa;
+  color: #526477;
+  font-weight: 700;
+}
+
+.runtime-item.selected {
+  border-color: #4f7fd9;
+  box-shadow: 0 0 0 3px rgba(79, 127, 217, 0.14);
+}
+
+.runtime-item {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(68, 84, 106, 0.14);
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+}
+
+.runtime-item.ok {
+  border-left-color: #50a36f;
+}
+
+.runtime-item.running {
+  border-left-color: #4f7fd9;
+}
+
+.runtime-item.warn,
+.runtime-item.stale {
+  border-left-color: #d9a23f;
+}
+
+.runtime-item.error {
+  border-left-color: #d95f76;
+}
+
+.runtime-step.runtime-item {
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.runtime-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.runtime-head strong,
+.runtime-head small,
+.runtime-item p {
+  overflow-wrap: anywhere;
+}
+
+.runtime-head small {
+  display: block;
+  margin-top: 4px;
+  color: #607083;
+}
+
+.runtime-item p {
+  margin: 0;
+  color: #344252;
+  line-height: 1.55;
+}
+
+.runtime-state {
+  border-radius: 8px;
+  padding: 5px 8px;
+  background: #e8edf4;
+  color: #344252;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.runtime-state.ok {
+  background: #dcf3e2;
+  color: #286241;
+}
+
+.runtime-state.running {
+  background: #dfeafe;
+  color: #2e5ca7;
+}
+
+.runtime-state.warn,
+.runtime-state.stale {
+  background: #fff0d6;
+  color: #8a5a12;
+}
+
+.runtime-state.error {
+  background: #ffe1e6;
+  color: #a65359;
+}
+
+.runtime-item details summary {
+  cursor: pointer;
+  color: #526477;
+  font-weight: 800;
+}
+
+.runtime-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.runtime-detail-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.runtime-detail-section {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.runtime-detail-section h3 {
+  font-size: 13px;
+  color: #607083;
+}
+
+.runtime-detail-section pre {
+  max-height: 360px;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f5f7fa;
+  color: #26313d;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runtime-load-more {
+  display: flex;
+  justify-content: center;
+}
+
+.runtime-new-notice:not([hidden]) {
+  display: inline-flex;
+}
+
 .voice-test {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
@@ -580,7 +932,14 @@ pre {
   .voice-form,
   .voice-test,
   .provider-row,
-  .table-toolbar {
+  .table-toolbar,
+  .runtime-toolbar,
+  .runtime-trace-summary,
+  .runtime-detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .runtime-trace-actions {
+    justify-content: flex-start;
   }
 }

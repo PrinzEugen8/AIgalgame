@@ -34,6 +34,7 @@
       <button type="button" class="active" data-page-target="users">用户数据</button>
       <button type="button" data-page-target="character">角色与音色</button>
       <button type="button" data-page-target="providers">在线服务</button>
+      <button type="button" data-page-target="runtime-logs">运行日志</button>
       <button type="button" data-page-target="debug">调试与日志</button>
     </nav>
 
@@ -133,6 +134,32 @@
 
     <section class="admin-page" data-page="providers" hidden>
       <div class="grid" id="providerGrid" aria-label="在线服务配置"></div>
+    </section>
+
+    <section class="admin-page manager runtime-logs" data-page="runtime-logs" hidden>
+      <header>
+        <div>
+          <p class="eyebrow">Runtime Trace</p>
+          <h2>运行日志</h2>
+        </div>
+        <span class="badge" id="runtimeLogStatus">等待加载</span>
+      </header>
+      <div class="runtime-toolbar">
+        <label><span>功能</span><select id="runtimeFeature"><option value="">全部</option></select></label>
+        <label><span>状态</span><select id="runtimeStatus"><option value="">全部</option><option value="running">运行中</option><option value="ok">成功</option><option value="warn">提醒</option><option value="error">错误</option><option value="stale">可能中断</option></select></label>
+        <label><span>数量</span><select id="runtimeLimit"><option>50</option><option selected>200</option><option>500</option></select></label>
+        <label class="wide"><span>搜索</span><input id="runtimeSearch" placeholder="trace_id / 模块 / provider / prompt / 错误"></label>
+        <label class="inline-check"><input type="checkbox" id="runtimeIncludeLegacy" checked><span>包含旧日志</span></label>
+        <label class="inline-check"><input type="checkbox" id="runtimeIncludeCacheHits"><span>包含缓存命中</span></label>
+        <label class="inline-check"><input type="checkbox" id="runtimeAutoRefresh"><span>自动刷新</span></label>
+        <button type="button" class="secondary" id="runtimeRefresh">刷新</button>
+        <button type="button" class="secondary runtime-new-notice" id="runtimeNewNotice" hidden>有新日志，点击更新</button>
+      </div>
+      <div class="runtime-trace-filter" id="runtimeTraceFilter" hidden></div>
+      <div class="runtime-list" id="runtimeLogList"></div>
+      <div class="runtime-load-more">
+        <button type="button" class="secondary" id="runtimeLoadOlder">加载更早</button>
+      </div>
     </section>
 
     <section class="admin-page debug" data-page="debug" hidden>

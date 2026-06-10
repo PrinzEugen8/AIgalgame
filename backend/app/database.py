@@ -39,6 +39,12 @@ def _upgrade_sqlite_schema() -> None:
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
     with engine.begin() as conn:
+        if "users" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("users")}
+            if "proactive_next_check_at" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN proactive_next_check_at VARCHAR DEFAULT ''"))
+            if "proactive_judgement_json" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN proactive_judgement_json TEXT DEFAULT '{}'"))
         if "moment_interactions" in table_names:
             columns = {item["name"] for item in inspector.get_columns("moment_interactions")}
             if "actor_name" not in columns:
@@ -76,3 +82,20 @@ def _upgrade_sqlite_schema() -> None:
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE proactive_events ADD COLUMN {name} {definition}"))
+        if "trend_radar_snapshots" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("trend_radar_snapshots")}
+            additions = {
+                "provider_id": "VARCHAR DEFAULT ''",
+                "local_date": "VARCHAR DEFAULT ''",
+                "status": "VARCHAR DEFAULT 'ok'",
+                "generated_at": "VARCHAR DEFAULT ''",
+                "fetched_at": "VARCHAR DEFAULT ''",
+                "endpoint": "VARCHAR DEFAULT ''",
+                "error_message": "TEXT DEFAULT ''",
+                "payload_json": "TEXT DEFAULT '{}'",
+                "created_at": "VARCHAR DEFAULT ''",
+                "updated_at": "VARCHAR DEFAULT ''",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE trend_radar_snapshots ADD COLUMN {name} {definition}"))

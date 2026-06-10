@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .diagnostics import write_diagnostic
+from .diagnostics import current_span_id, current_trace_id, diagnostic_point, diagnostic_span, new_span_id, write_diagnostic
 from .models import (
     Character,
     Memory,
@@ -25,7 +26,7 @@ from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
 from .utils import clamp, dump_json, load_json, uid, utc_now
-from .weather import weather_context
+from .weather import active_weather_date_for_user, is_weather_question, read_weather_snapshot, weather_snapshot_to_dict
 
 
 STORY_LINES = [
@@ -105,6 +106,136 @@ def _build_recent_dialogue(session: Session, event: EventIn) -> str:
         if content:
             lines.append(f"{speaker}：{content[:120]}")
     return "\n".join(lines) or "暂无近期对话。"
+
+
+def _summary_text(value: str, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _start_reply_stage(stage: str, summary: str, *, input_payload: dict[str, Any] | None = None, references: dict[str, Any] | None = None) -> dict[str, Any]:
+    span = {
+        "trace_id": current_trace_id(),
+        "span_id": new_span_id(f"reply_{stage}"),
+        "parent_span_id": current_span_id(),
+        "started": time.monotonic(),
+        "stage": stage,
+        "summary": summary,
+    }
+    write_diagnostic(
+        "reply_stage",
+        phase="start",
+        status="running",
+        trace_id=span["trace_id"],
+        span_id=span["span_id"],
+        parent_span_id=span["parent_span_id"],
+        feature="回复模块",
+        stage=stage,
+        purpose=f"Reply {stage}",
+        summary=summary,
+        input=input_payload or {},
+        references=references or {},
+    )
+    return span
+
+
+def _end_reply_stage(span: dict[str, Any], *, status: str = "ok", output: dict[str, Any] | None = None, references: dict[str, Any] | None = None) -> None:
+    write_diagnostic(
+        "reply_stage",
+        phase="end",
+        status=status,
+        trace_id=str(span.get("trace_id") or current_trace_id()),
+        span_id=str(span.get("span_id") or ""),
+        parent_span_id=str(span.get("parent_span_id") or ""),
+        feature="回复模块",
+        stage=str(span.get("stage") or ""),
+        purpose=f"Reply {span.get('stage') or 'stage'}",
+        summary=str(span.get("summary") or ""),
+        elapsed_ms=int((time.monotonic() - float(span.get("started") or time.monotonic())) * 1000),
+        output=output or {},
+        references=references or {},
+    )
+
+
+def _context_with_references(session: Session, user_id: str, character_id: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    memories = session.execute(
+        select(Memory)
+        .where(Memory.user_id == user_id, Memory.character_id == character_id, Memory.hidden == False)  # noqa: E712
+        .order_by(Memory.created_at.desc())
+        .limit(8)
+    ).scalars().all()
+    interactions = session.execute(
+        select(MomentInteraction)
+        .where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
+        .order_by(MomentInteraction.created_at.desc())
+        .limit(4)
+    ).scalars().all()
+    lines = [f"- {memory.layer}: {memory.content}" for memory in memories]
+    for item in interactions:
+        desc = "liked a moment" if item.interaction_type == "like" else f"commented on a moment: {item.content}"
+        lines.append(f"- recent moment interaction: user {desc}")
+    references = {
+        "memory": {
+            "used": bool(memories),
+            "count": len(memories),
+            "items": [
+                {
+                    "memory_id": memory.memory_id,
+                    "layer": memory.layer,
+                    "summary": _summary_text(memory.content),
+                    "importance": memory.importance,
+                    "confidence": memory.confidence,
+                }
+                for memory in memories
+            ],
+        },
+        "moment_interactions": {
+            "used": bool(interactions),
+            "count": len(interactions),
+            "items": [
+                {
+                    "interaction_id": item.interaction_id,
+                    "moment_id": item.moment_id,
+                    "type": item.interaction_type,
+                    "summary": _summary_text(item.content or item.interaction_type),
+                }
+                for item in interactions
+            ],
+        },
+    }
+    return "\n".join(lines) or "暂无长期记忆。", references, {"memories": memories, "interactions": interactions}
+
+
+def _recent_dialogue_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
+    rows = session.execute(
+        select(Message)
+        .where(Message.user_id == event.user_id, Message.character_id == event.character_id, Message.session_id == event.session_id)
+        .order_by(Message.created_at.desc())
+        .limit(10)
+    ).scalars().all()
+    if not rows:
+        return "暂无近期对话。", {"used": False, "count": 0, "items": []}
+    lines = []
+    for item in reversed(rows):
+        speaker = "USER" if item.sender_type == "user" else "CHARACTER"
+        content = " ".join(item.content.split())
+        if content:
+            lines.append(f"{speaker}: {content[:120]}")
+    references = {
+        "used": bool(lines),
+        "count": len(rows),
+        "items": [
+            {
+                "message_id": item.message_id,
+                "sender_type": item.sender_type,
+                "source": item.source,
+                "summary": _summary_text(item.content),
+            }
+            for item in reversed(rows)
+            if item.content
+        ],
+    }
+    return "\n".join(lines) or "暂无近期对话。", references
 
 
 def _target_subject_hint(text: str, character: Character) -> str:
@@ -193,6 +324,73 @@ def _schedule_context(session: Session, event: EventIn) -> str:
             "今日摘要：" + "；".join(groups[:10]),
         ]
     )
+
+
+def _schedule_context_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
+    context = _schedule_context(session, event)
+    local_time = _extract_local_time(event) or datetime.now()
+    slots = ensure_schedule(session, user_id=event.user_id, character_id=event.character_id, day=local_time)
+    items = [
+        {
+            "slot_id": slot.slot_id,
+            "title": slot.activity_title,
+            "location": slot.location,
+            "start_at": slot.start_at,
+            "end_at": slot.end_at,
+            "status": slot.actual_status,
+        }
+        for slot in slots[:10]
+    ]
+    return context, {"used": bool(context.strip()), "count": len(slots), "items": items, "summary": _summary_text(context, 220)}
+
+
+def _weather_context_with_references(
+    session: Session,
+    *,
+    user_id: str,
+    text: str = "",
+    local_time: datetime | None = None,
+) -> tuple[str, dict[str, Any]]:
+    snapshot = read_weather_snapshot(session, user_id=user_id, local_time=local_time, allow_stale=True)
+    if snapshot is None:
+        context = "还没有今天的天气数据：天气会在每天04:00随日程生成时更新。" if is_weather_question(text) else "暂无天气数据。"
+        return context, {"used": bool(context.strip()), "available": False, "summary": context}
+    active_weather_date = active_weather_date_for_user(session, user_id=user_id, local_time=local_time)
+    freshness_note = ""
+    if snapshot.weather_date != active_weather_date:
+        freshness_note = f"暂无{active_weather_date} 04:00后的天气数据；以下是上次天气快照。"
+    payload = weather_snapshot_to_dict(snapshot) or {}
+    now_payload = (payload.get("now") or {}).get("now") or {}
+    daily_rows = ((payload.get("daily") or {}).get("daily") or []) if isinstance(payload.get("daily"), dict) else []
+    hourly_rows = ((payload.get("hourly") or {}).get("hourly") or []) if isinstance(payload.get("hourly"), dict) else []
+    warning_rows = ((payload.get("warning") or {}).get("warning") or []) if isinstance(payload.get("warning"), dict) else []
+    next_hours = []
+    for row in hourly_rows[:8]:
+        if isinstance(row, dict):
+            next_hours.append(f"{str(row.get('fxTime') or '')[-11:-6]} {row.get('text') or ''} {row.get('temp') or '?'}C pop {row.get('pop') or '?'}%")
+    today = daily_rows[0] if daily_rows and isinstance(daily_rows[0], dict) else {}
+    warning_text = " / ".join(str(item.get("title") or item.get("typeName") or "") for item in warning_rows[:3] if isinstance(item, dict))
+    context = "\n".join(
+        [item for item in [
+            freshness_note,
+            f"城市：{snapshot.city_name or '未知'}",
+            f"摘要：{snapshot.summary}",
+            f"严重度：{snapshot.severity} / {snapshot.severity_score} / {snapshot.trigger_key}",
+            f"今日：白天{today.get('textDay') or '?'}，夜间{today.get('textNight') or '?'}，{today.get('tempMin') or '?'}-{today.get('tempMax') or '?'}C，降水{today.get('precip') or '?'}",
+            f"未来8小时：{'；'.join(next_hours) if next_hours else '暂无'}",
+            f"预警：{warning_text or '暂无'}",
+            f"更新时间：{snapshot.observed_at or snapshot.fetched_at}",
+        ] if item]
+    )
+    return context, {
+        "used": True,
+        "available": True,
+        "snapshot_id": snapshot.snapshot_id,
+        "city_name": snapshot.city_name,
+        "trigger_key": snapshot.trigger_key,
+        "severity": snapshot.severity,
+        "summary": snapshot.summary,
+    }
 
 
 def _dialogue_gate(event: EventIn, text: str) -> str:
@@ -330,6 +528,12 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
                 ],
                 max_tokens=180,
                 temperature=0.2,
+                diagnostic={
+                    "feature": "日文 TTS 修复",
+                    "stage": "line_repair",
+                    "purpose": "Translate Chinese display line into Japanese TTS text",
+                    "input": {"character_id": character.character_id, "source_text": text, "attempt": attempt},
+                },
             )
             translated = _extract_tts_text_candidate(translated)
             if _valid_japanese_tts_text(text, translated):
@@ -552,15 +756,78 @@ def _llm_dialogue(
     config = get_enabled_provider(session, "llm")
     if config is None:
         raise ProviderError("LLM provider is not configured. Please configure and test a real OpenAI-compatible provider.")
-    relation = _relation(session, event.user_id, event.character_id)
-    context = _build_context(session, event.user_id, event.character_id)
-    recent_dialogue = _build_recent_dialogue(session, event)
-    schedule_context = _schedule_context(session, event)
-    weather_info = weather_context(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
-    gate = _dialogue_gate(event, text)
-    subject_hint = _target_subject_hint(text, character)
-    voice = _active_voice_profile(session, character)
-    requires_japanese_tts = bool(user.tts_enabled and voice is not None and voice.language == "ja")
+    with diagnostic_span(
+        "reply_stage",
+        feature="回复模块",
+        stage="context_build",
+        purpose="Build prompt context and reference markers",
+        summary=f"{event.event_type}: {text[:80]}",
+        input={"event_type": event.event_type, "user_id": event.user_id, "character_id": event.character_id, "session_id": event.session_id, "input_text": text},
+    ) as context_span:
+        relation = _relation(session, event.user_id, event.character_id)
+        context, context_refs, context_rows = _context_with_references(session, event.user_id, event.character_id)
+        recent_dialogue, recent_refs = _recent_dialogue_with_references(session, event)
+        schedule_context, schedule_refs = _schedule_context_with_references(session, event)
+        weather_info, weather_refs = _weather_context_with_references(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
+        gate = _dialogue_gate(event, text)
+        subject_hint = _target_subject_hint(text, character)
+        voice = _active_voice_profile(session, character)
+        requires_japanese_tts = bool(user.tts_enabled and voice is not None and voice.language == "ja")
+        references = {
+            "user_input": {
+                "used": True,
+                "event_type": event.event_type,
+                "event_id": event.event_id,
+                "session_id": event.session_id,
+                "summary": _summary_text(text),
+            },
+            "schedule": schedule_refs,
+            "weather": weather_refs,
+            "memory": context_refs["memory"],
+            "recent_dialogue": recent_refs,
+            "moment_interactions": context_refs["moment_interactions"],
+            "gate": gate,
+            "subject_hint": subject_hint,
+        }
+        context_span.add(
+            output={
+                "context_sources": {
+                    "recent_dialogue": bool(recent_dialogue.strip()),
+                    "schedule": bool(schedule_context.strip()),
+                    "weather": bool(weather_info.strip()),
+                    "memory": bool(context_rows["memories"]),
+                    "moment_interactions": bool(context_rows["interactions"]),
+                    "japanese_tts": requires_japanese_tts,
+                },
+                "references": references,
+            },
+            references=references,
+        )
+    diagnostic_point(
+        "reply_context_ready",
+        feature="回复模块",
+        stage="context",
+        summary=f"{event.event_type}: {text[:80]}",
+        event_type=event.event_type,
+        user_id=event.user_id,
+        character_id=event.character_id,
+        session_id=event.session_id,
+        input_text=text,
+        context_sources={
+            "recent_dialogue": bool(recent_dialogue.strip()),
+            "schedule": bool(schedule_context.strip()),
+            "weather": bool(weather_info.strip()),
+            "memory_or_moment": bool(context.strip()),
+            "japanese_tts": requires_japanese_tts,
+        },
+        references=references,
+        schedule_context=schedule_context,
+        weather_context=weather_info,
+        memory_context=context,
+        recent_dialogue=recent_dialogue,
+        gate=gate,
+        subject_hint=subject_hint,
+    )
     prompt = f"""
 你要为 Galgame 伴侣 APP 生成一次女主回复。必须只输出 JSON。
 请先依据【节奏判断】决定回复轻重，再生成用户可见台词。不要输出分析文字。
@@ -646,6 +913,25 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         result = client.chat_json(
             [{"role": "system", "content": "你是 Galgame 台词与状态 JSON 生成器。"}, {"role": "user", "content": attempt_prompt}],
             max_tokens=1100,
+            diagnostic={
+                "feature": "回复模块",
+                "stage": "llm_dialogue",
+                "purpose": "Generate dialogue and pacing judgement",
+                "references": references,
+                "input": {
+                    "event_type": event.event_type,
+                    "user_id": event.user_id,
+                    "character_id": event.character_id,
+                    "session_id": event.session_id,
+                    "input_text": text,
+                    "references": references,
+                    "gate": gate,
+                    "subject_hint": subject_hint,
+                    "requires_japanese_tts": requires_japanese_tts,
+                    "attempt": attempt,
+                    "retry_reason": retry_reason,
+                },
+            },
         )
         problems = _japanese_tts_problems(result) if requires_japanese_tts else []
         if not problems:
@@ -667,11 +953,57 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             character_id=character.character_id,
             reason="；".join(problems[:4]),
         )
+    payload_stage = _start_reply_stage(
+        "payload_build",
+        f"{event.event_type}: build reply payload",
+        input_payload={
+            "reply_mode_raw": result.get("reply_mode"),
+            "line_count_raw": len(result.get("lines") or []),
+            "normal_reply_count_raw": len(result.get("normal_replies") or []),
+            "key_reply_count_raw": len(result.get("key_replies") or []),
+        },
+        references=references,
+    )
     reply_mode = str(result.get("reply_mode") or "normal").strip().lower()
     if reply_mode not in {"silent", "light", "normal", "key_moment"}:
         reply_mode = "normal"
     pace_reason = str(result.get("pace_reason") or result.get("key_reply_reason") or "").strip()
+    diagnostic_point(
+        "reply_llm_judgement",
+        feature="回复模块",
+        stage="judgement",
+        summary=f"{reply_mode}: {pace_reason[:100]}",
+        reply_mode=reply_mode,
+        pace_reason=pace_reason,
+        key_reply_score=result.get("key_reply_score"),
+        key_reply_reason=result.get("key_reply_reason"),
+        relation_delta=result.get("relation_delta") or {},
+        memory_candidates=result.get("memory_candidates") or [],
+        normal_reply_count=len(result.get("normal_replies") or []),
+        key_reply_count=len(result.get("key_replies") or []),
+        references=references,
+        raw_result=result,
+    )
     if reply_mode == "silent":
+        _end_reply_stage(
+            payload_stage,
+            output={"reply_mode": reply_mode, "pace_reason": pace_reason, "line_count": 0},
+            references=references,
+        )
+        diagnostic_point(
+            "reply_output_ready",
+            feature="回复模块",
+            stage="output",
+            summary="silent reply",
+            reply_mode=reply_mode,
+            pace_reason=pace_reason,
+            line_count=0,
+            normal_reply_count=0,
+            key_reply_count=0,
+            saved_memory_count=0,
+            relation_delta=RelationDelta().model_dump(),
+            references=references,
+        )
         return DialoguePayload(lines=[], relation_delta=RelationDelta(), reply_mode=reply_mode, pace_reason=pace_reason)
     raw_delta = result.get("relation_delta") or {}
     delta = RelationDelta(
@@ -682,8 +1014,24 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
     )
     if not (allow_relation_delta and event.event_type == "option_selected") or reply_mode == "light":
         delta = RelationDelta()
+    _end_reply_stage(
+        payload_stage,
+        output={
+            "reply_mode": reply_mode,
+            "pace_reason": pace_reason,
+            "relation_delta": delta.model_dump(),
+            "requires_japanese_tts": requires_japanese_tts,
+        },
+        references=references,
+    )
     line_objs: list[DialogueLine] = []
     max_lines = 1 if reply_mode == "light" else 4
+    tts_stage = _start_reply_stage(
+        "tts_lines",
+        f"{event.event_type}: synthesize reply lines",
+        input_payload={"candidate_line_count": len(result.get("lines") or []), "max_lines": max_lines, "tts_enabled": user.tts_enabled},
+        references=references,
+    )
     for item in (result.get("lines") or [])[:max_lines]:
         line_emotion = str(item.get("emotion") or "calm")
         line_text = " ".join(str(item.get("text") or "").split()).strip()
@@ -720,6 +1068,11 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         )
         if reply_mode == "light" and len(line_objs) >= 1:
             break
+    _end_reply_stage(
+        tts_stage,
+        output={"line_count": len(line_objs), "audio_count": len([line for line in line_objs if line.tts_audio_url])},
+        references=references,
+    )
     if not line_objs:
         raise ProviderError("LLM returned no dialogue lines")
     normal = []
@@ -760,6 +1113,18 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                     trigger_memory=bool(item.get("trigger_memory")),
                 )
             )
+    saved_memory_count = 0
+    side_effects_stage = _start_reply_stage(
+        "side_effects",
+        f"{event.event_type}: persist reply side effects",
+        input_payload={
+            "persist_side_effects": persist_side_effects,
+            "allow_relation_delta": allow_relation_delta,
+            "memory_candidate_count": len(result.get("memory_candidates") or []),
+            "relation_delta": delta.model_dump(),
+        },
+        references=references,
+    )
     if persist_side_effects:
         explicit_topics = _explicit_interest_topics(text)
         for item in result.get("memory_candidates") or []:
@@ -780,6 +1145,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                         confidence=float(item.get("confidence") or 0.6),
                     )
                 )
+                saved_memory_count += 1
         topics = explicit_topics
         if topics:
             current = load_json(user.interest_topics_json, [])
@@ -798,6 +1164,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                             confidence=0.8,
                         )
                     )
+                    saved_memory_count += 1
             user.interest_topics_json = dump_json(current[-20:])
         if allow_relation_delta:
             _apply_delta(relation, delta)
@@ -805,6 +1172,28 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             select(MomentInteraction).where(MomentInteraction.actor_id == event.user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
         ).scalars():
             interaction.reflected_in_chat = True
+    _end_reply_stage(
+        side_effects_stage,
+        output={"saved_memory_count": saved_memory_count, "relation_delta": delta.model_dump()},
+        references=references,
+    )
+    diagnostic_point(
+        "reply_output_ready",
+        feature="回复模块",
+        stage="output",
+        summary=f"{reply_mode} lines={len(line_objs)} normal={len(normal)} key={len(key)}",
+        reply_mode=reply_mode,
+        pace_reason=pace_reason,
+        line_count=len(line_objs),
+        normal_reply_count=len(normal),
+        key_reply_count=len(key),
+        saved_memory_count=saved_memory_count,
+        relation_delta=delta.model_dump(),
+        lines=[line.model_dump() for line in line_objs],
+        normal_replies=[reply.model_dump() for reply in normal],
+        key_replies=[reply.model_dump() for reply in key],
+        references=references,
+    )
     return DialoguePayload(
         lines=line_objs,
         normal_replies=normal,
@@ -876,7 +1265,7 @@ def _proactive_target_text(proactive: ProactiveEvent, event_type: str) -> str:
     )
 
 
-def handle_event(session: Session, event: EventIn) -> AppEventOut:
+def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
     user = session.get(User, event.user_id)
     character = session.get(Character, event.character_id)
     if user is None or character is None:
@@ -895,32 +1284,145 @@ def handle_event(session: Session, event: EventIn) -> AppEventOut:
         proactive = mark_proactive_opened(session, proactive_id) if proactive_id else None
         if proactive is None:
             return _no_reply(event.session_id, pace_reason="入口打开没有找到可回流的主动事件。")
-        if proactive.prepared_payload_json and proactive.prepared_payload_json != "{}":
-            payload = DialoguePayload.model_validate(load_json(proactive.prepared_payload_json, {}))
-        else:
-            try:
-                payload = _llm_dialogue(session, event, user, character, _proactive_target_text(proactive, event.event_type))
-            except ProviderError:
-                consume_proactive_event(session, proactive.proactive_event_id)
-                raise
-        if not payload.lines:
-            session.commit()
-            return _no_reply(event.session_id, reply_mode=payload.reply_mode, pace_reason=payload.pace_reason)
-        _save_dialogue_lines(session, event, payload)
-        mark_proactive_reflected(session, proactive)
-        session.commit()
-        return _event("dialogue", payload.model_dump(), event.session_id)
+        target_text = _proactive_target_text(proactive, event.event_type)
+        with diagnostic_span(
+            "reply_trace",
+            feature="回复模块",
+            stage=event.event_type,
+            purpose="Handle proactive reply end-to-end",
+            summary=f"{event.event_type}: {proactive.title[:80]}",
+            input={
+                "event_type": event.event_type,
+                "event_id": event.event_id,
+                "session_id": event.session_id,
+                "proactive_event_id": proactive.proactive_event_id,
+                "input_text": target_text,
+            },
+        ) as reply_span:
+            if proactive.prepared_payload_json and proactive.prepared_payload_json != "{}":
+                with diagnostic_span(
+                    "reply_stage",
+                    feature="回复模块",
+                    stage="load_prepared_payload",
+                    purpose="Load prepared proactive reply",
+                    summary=f"{event.event_type}: prepared payload",
+                    input={"proactive_event_id": proactive.proactive_event_id},
+                ):
+                    payload = DialoguePayload.model_validate(load_json(proactive.prepared_payload_json, {}))
+            else:
+                try:
+                    payload = _llm_dialogue(session, event, user, character, target_text)
+                except ProviderError:
+                    consume_proactive_event(session, proactive.proactive_event_id)
+                    raise
+            if not payload.lines:
+                with diagnostic_span(
+                    "reply_stage",
+                    feature="回复模块",
+                    stage="commit",
+                    purpose="Commit silent proactive reply",
+                    summary=f"{event.event_type}: commit silent",
+                    input={"reply_mode": payload.reply_mode, "pace_reason": payload.pace_reason},
+                ):
+                    session.commit()
+                output = _no_reply(event.session_id, reply_mode=payload.reply_mode, pace_reason=payload.pace_reason)
+                reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
+                return output
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="save_dialogue",
+                purpose="Save proactive reply lines",
+                summary=f"{event.event_type}: save dialogue",
+                input={"line_count": len(payload.lines), "reply_mode": payload.reply_mode},
+            ):
+                _save_dialogue_lines(session, event, payload)
+                mark_proactive_reflected(session, proactive)
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="commit",
+                purpose="Commit proactive reply output",
+                summary=f"{event.event_type}: commit reply",
+                input={"line_count": len(payload.lines), "reply_mode": payload.reply_mode},
+            ):
+                session.commit()
+            output = _event("dialogue", payload.model_dump(), event.session_id)
+            reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
+            return output
     if event.event_type in {"user_message", "option_selected"}:
         text = str(event.payload.get("text") or event.payload.get("reply_text") or "")
         if not text:
             raise ProviderError("user_message payload.text is required")
-        _save_message(session, event=event, sender_type="user", sender_id=event.user_id, content=text)
-        is_normal_reply_option = event.event_type == "user_message" and bool(str(event.payload.get("reply_id") or ""))
-        payload = _llm_dialogue(session, event, user, character, text, allow_relation_delta=not is_normal_reply_option)
-        if not payload.lines:
-            session.commit()
-            return _no_reply(event.session_id, reply_mode=payload.reply_mode, pace_reason=payload.pace_reason)
-        _save_dialogue_lines(session, event, payload)
-        session.commit()
-        return _event("dialogue", payload.model_dump(), event.session_id)
+        with diagnostic_span(
+            "reply_trace",
+            feature="回复模块",
+            stage=event.event_type,
+            purpose="Handle reply end-to-end",
+            summary=f"{event.event_type}: {text[:80]}",
+            input={"event_type": event.event_type, "event_id": event.event_id, "session_id": event.session_id, "input_text": text},
+        ) as reply_span:
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="save_user_message",
+                purpose="Save user input before reply",
+                summary=f"{event.event_type}: save user input",
+                input={"text": text, "session_id": event.session_id},
+            ):
+                _save_message(session, event=event, sender_type="user", sender_id=event.user_id, content=text)
+            is_normal_reply_option = event.event_type == "user_message" and bool(str(event.payload.get("reply_id") or ""))
+            payload = _llm_dialogue(session, event, user, character, text, allow_relation_delta=not is_normal_reply_option)
+            if not payload.lines:
+                with diagnostic_span(
+                    "reply_stage",
+                    feature="回复模块",
+                    stage="commit",
+                    purpose="Commit silent reply state",
+                    summary=f"{event.event_type}: commit silent",
+                    input={"reply_mode": payload.reply_mode, "pace_reason": payload.pace_reason},
+                ):
+                    session.commit()
+                output = _no_reply(event.session_id, reply_mode=payload.reply_mode, pace_reason=payload.pace_reason)
+                reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
+                return output
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="save_dialogue",
+                purpose="Save generated reply lines",
+                summary=f"{event.event_type}: save dialogue",
+                input={"line_count": len(payload.lines), "reply_mode": payload.reply_mode},
+            ):
+                _save_dialogue_lines(session, event, payload)
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="commit",
+                purpose="Commit reply output",
+                summary=f"{event.event_type}: commit reply",
+                input={"line_count": len(payload.lines), "reply_mode": payload.reply_mode},
+            ):
+                session.commit()
+            output = _event("dialogue", payload.model_dump(), event.session_id)
+            reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
+            return output
     raise ProviderError(f"Unsupported event_type: {event.event_type}")
+
+
+def handle_event(session: Session, event: EventIn) -> AppEventOut:
+    text = str(event.payload.get("text") or event.payload.get("reply_text") or event.payload.get("proactive_event_id") or "")
+    with diagnostic_span(
+        "event_trace",
+        feature="事件处理",
+        stage=event.event_type,
+        purpose="Handle app event",
+        summary=f"{event.event_type}: {text[:80]}",
+        user_id=event.user_id,
+        character_id=event.character_id,
+        session_id=event.session_id,
+        input={"event_type": event.event_type, "event_id": event.event_id, "payload": event.payload, "client_context": event.client_context},
+    ) as span:
+        result = _handle_event_inner(session, event)
+        span.add(output={"event_type": result.event_type, "event_id": result.event_id, "payload": result.payload})
+        return result

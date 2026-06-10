@@ -9,10 +9,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.time.OffsetDateTime
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
 
 class ApiClient(private val baseUrl: String) {
     private val client = OkHttpClient.Builder()
@@ -95,19 +100,67 @@ class ApiClient(private val baseUrl: String) {
     }
 
     private suspend fun request(method: String, path: String, json: JSONObject?): JSONObject = withContext(Dispatchers.IO) {
-        val builder = Request.Builder().url(absoluteUrl(path))
-        if (json != null) {
-            builder.method(method, json.toString().toRequestBody("application/json".toMediaType()))
-        } else {
-            builder.method(method, null)
-        }
-        client.newCall(builder.build()).execute().use { response ->
-            val text = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code}: $text")
+        val url = absoluteUrl(path)
+        try {
+            val builder = Request.Builder().url(url)
+            if (json != null) {
+                builder.method(method, json.toString().toRequestBody("application/json".toMediaType()))
+            } else {
+                builder.method(method, null)
             }
-            if (text.isBlank()) JSONObject() else JSONObject(text)
+            client.newCall(builder.build()).execute().use { response ->
+                val text = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: $text")
+                }
+                if (text.isBlank()) JSONObject() else JSONObject(text)
+            }
+        } catch (e: IllegalArgumentException) {
+            throw IOException("后端地址格式无效，请填写 http://IP:8899 或内网穿透提供的完整 http/https 地址。当前地址：$url", e)
+        } catch (e: IOException) {
+            throw IOException(describeNetworkFailure(url, e), e)
         }
+    }
+}
+
+fun normalizeBackendUrl(value: String): String {
+    val cleaned = value.trim().trimEnd('/')
+    if (cleaned.isBlank()) return ""
+    if (cleaned.startsWith("http://", ignoreCase = true) || cleaned.startsWith("https://", ignoreCase = true)) {
+        return cleaned
+    }
+    return "http://$cleaned"
+}
+
+fun describeNetworkFailure(url: String, error: IOException): String {
+    val message = error.message.orEmpty()
+    val causeParts = mutableListOf<String>()
+    var current: Throwable? = error
+    repeat(8) {
+        val item = current ?: return@repeat
+        causeParts += "${item.javaClass.simpleName}: ${item.message.orEmpty()}"
+        current = item.cause
+    }
+    val causeText = causeParts.joinToString(" ")
+    return when {
+        error is SSLHandshakeException ||
+            error is SSLPeerUnverifiedException ||
+            causeText.contains("CertPathValidatorException", ignoreCase = true) ||
+            causeText.contains("Trust anchor", ignoreCase = true) ->
+            "HTTPS 证书不被 Android 信任。内网穿透请优先使用它提供的 http 地址，或换成带公网可信证书的 https 域名；自签证书需要把 CA 安装到手机并让调试版信任。当前地址：$url"
+
+        error is ConnectException ||
+            message.contains("failed to connect", ignoreCase = true) ||
+            message.contains("Connection refused", ignoreCase = true) ->
+            "连接被拒绝：目标端口没有服务在监听。当前电脑后端监听 8899，内网穿透本地目标应填 127.0.0.1:8899；如果你坚持用 8898，请用 AIGALGAME_PORT=8898 启动后端。当前地址：$url"
+
+        error is UnknownHostException ->
+            "找不到这个后端域名或地址，请检查内网穿透域名是否已启动、手机网络是否可访问。当前地址：$url"
+
+        error is SocketTimeoutException ->
+            "连接超时：请确认电脑后端正在运行、内网穿透在线，并且手机能访问该地址。当前地址：$url"
+
+        else -> message.ifBlank { error.javaClass.simpleName }
     }
 }
 

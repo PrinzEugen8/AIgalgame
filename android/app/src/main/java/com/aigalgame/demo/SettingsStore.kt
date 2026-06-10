@@ -4,10 +4,12 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 val Context.settingsDataStore by preferencesDataStore("aigalgame_settings")
@@ -20,6 +22,7 @@ class SettingsStore(private val context: Context) {
         val PreviewEmotion = stringPreferencesKey("preview_emotion")
         val TtsEnabled = booleanPreferencesKey("tts_enabled")
         val NotificationsEnabled = booleanPreferencesKey("notifications_enabled")
+        val LastLocationUploadedAt = longPreferencesKey("last_location_uploaded_at")
     }
 
     val baseUrl: Flow<String> = context.settingsDataStore.data.map { prefs ->
@@ -42,7 +45,7 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveBaseUrl(value: String) {
         context.settingsDataStore.edit { prefs ->
-            prefs[Keys.ServerAddress] = value.trim().trimEnd('/')
+            prefs[Keys.ServerAddress] = normalizeBackendUrl(value)
         }
     }
 
@@ -64,6 +67,14 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveNotificationsEnabled(value: Boolean) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.NotificationsEnabled] = value }
+    }
+
+    suspend fun readLastLocationUploadedAt(): Long {
+        return context.settingsDataStore.data.first()[Keys.LastLocationUploadedAt] ?: 0L
+    }
+
+    suspend fun saveLastLocationUploadedAt(value: Long) {
+        context.settingsDataStore.edit { prefs -> prefs[Keys.LastLocationUploadedAt] = value }
     }
 
     suspend fun savePlacement(character: String, placement: OutfitPlacement) {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,11 +16,14 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
-from app import providers  # noqa: E402
+from app import providers, schedule as schedule_module, scheduler as scheduler_module  # noqa: E402
 from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
+from app.diagnostics import diagnostic_path, diagnostic_span, runtime_logs, write_diagnostic  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TtsVoiceProfile, User, UserLocation, WeatherSnapshot  # noqa: E402
+from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TrendRadarSnapshot, TtsVoiceProfile, User, UserLocation, WeatherSnapshot  # noqa: E402
+from app.news import sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
+from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
@@ -37,6 +41,24 @@ def setup_module() -> None:
     init_db()
     with SessionLocal() as session:
         ensure_seed(session)
+
+
+def _clear_diagnostics() -> None:
+    path = diagnostic_path()
+    if path.exists():
+        path.unlink()
+
+
+def _append_diagnostic_raw(item: dict[str, object]) -> None:
+    path = diagnostic_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _llm_json_response(payload: dict[str, object]) -> httpx.Response:
+    content = json.dumps(payload, ensure_ascii=False)
+    return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
 
 
 def test_health_and_bootstrap() -> None:
@@ -60,19 +82,647 @@ def test_admin_routes_do_not_expose_secrets() -> None:
         assert leaked_value not in serialized
 
 
+def test_runtime_logs_redact_and_reconstruct_spans() -> None:
+    _clear_diagnostics()
+    with diagnostic_span(
+        "unit_span",
+        feature="测试模块",
+        stage="unit",
+        purpose="secret check",
+        summary="runtime secret check",
+        request={"headers": {"Authorization": "Bearer should-not-leak"}, "api_key": "secret-key", "messages": [{"content": "hello"}]},
+    ) as span:
+        write_diagnostic("unit_decision", feature="测试模块", stage="judge", decision={"reason": "ok"})
+        with diagnostic_span("unit_child", feature="测试模块", stage="child", summary="nested child") as child:
+            child.add(output={"child": True})
+        span.add(response={"reply": "done", "token": "hidden-token"})
+    write_diagnostic("unit_running", phase="start", status="running", span_id="span_running_test", feature="测试模块", stage="running", summary="still running")
+
+    payload = runtime_logs(limit=20, feature="测试模块")
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "Bearer should-not-leak" not in serialized
+    assert "secret-key" not in serialized
+    assert "hidden-token" not in serialized
+    assert '"Authorization": "***"' in serialized
+    assert '"api_key": "***"' in serialized
+    assert '"token": "***"' in serialized
+    completed = next(item for item in payload["items"] if item["event"] == "unit_span")
+    child = next(item for item in payload["items"] if item["event"] == "unit_child")
+    assert completed["status"] == "ok"
+    assert completed["elapsed_ms"] >= 0
+    assert child["parent_id"] == completed["id"]
+    assert child["id"] in completed["children_ids"]
+    trace = next(trace for trace in payload["traces"] if trace["trace_id"] == completed["trace_id"])
+    assert any(node["id"] == child["id"] and node["parent_id"] == completed["id"] for node in trace["nodes"])
+    running = next(item for item in payload["items"] if item["event"] == "unit_running")
+    assert running["status"] == "running"
+    assert running["running"] is True
+
+
+def test_admin_runtime_logs_route_filters() -> None:
+    _clear_diagnostics()
+    write_diagnostic("route_filter_test", feature="过滤模块", stage="api", summary="needle trace", trace_id="trace_filter_case")
+    payload = client.get("/api/admin/runtime-logs?feature=%E8%BF%87%E6%BB%A4%E6%A8%A1%E5%9D%97&q=needle&limit=5").json()
+    assert payload["ok"] is True
+    assert payload["total"] == 1
+    assert payload["items"][0]["event"] == "route_filter_test"
+    assert "过滤模块" in payload["features"]
+
+
+def test_runtime_logs_legacy_cache_before_and_flow() -> None:
+    _clear_diagnostics()
+    _append_diagnostic_raw({"ts": 1000.0, "event": "legacy_old", "summary": "older legacy"})
+    _append_diagnostic_raw({"ts": 2000.0, "event": "legacy_new", "feature": "旧模块", "summary": "newer legacy"})
+    _append_diagnostic_raw({"ts": 2100.0, "event": "weather_cache_hit", "feature": "天气服务", "stage": "ensure_weather_snapshot", "summary": "cache", "cache_hit": True})
+    with diagnostic_span("flow_one", feature="流程A", stage="input", trace_id="trace_flow_case", input={"text": "hello"}) as span:
+        span.add(output={"step": "one"})
+        with diagnostic_span("flow_two", feature="流程B", stage="output", trace_id="trace_flow_case", input={"weather": "sunny"}) as child_span:
+            child_span.add(output={"reply": "done"})
+
+    payload = runtime_logs(limit=20, include_cache_hits=False)
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "weather_cache_hit" not in serialized
+    assert payload["legacy_count"] >= 2
+    assert "旧诊断日志" in payload["features"]
+    legacy_trace = next(item for item in payload["traces"] if item["trace_id"] == "legacy")
+    assert legacy_trace["is_legacy"] is True
+    assert any(item["event"] == "legacy_new" for item in legacy_trace["items"])
+    flow = next(item for item in payload["flows"] if item["trace_id"] == "trace_flow_case")
+    assert len(flow["nodes"]) == 2
+    assert flow["edges"][0]["from"] == flow["nodes"][0]["id"]
+    trace = next(item for item in payload["traces"] if item["trace_id"] == "trace_flow_case")
+    assert len(trace["items"]) == 2
+    first = next(item for item in payload["items"] if item["event"] == "flow_one")
+    second = next(item for item in payload["items"] if item["event"] == "flow_two")
+    assert first["next_id"] == second["id"]
+    assert second["prev_id"] == first["id"]
+    assert second["parent_id"] == first["id"]
+    assert second["id"] in first["children_ids"]
+    assert trace["edges"][0]["from"] == first["id"]
+    assert trace["edges"][0]["to"] == second["id"]
+    assert "hello" in first["input_summary"]
+    assert "done" in second["output_summary"]
+
+    with_cache = runtime_logs(limit=20, include_cache_hits=True)
+    assert any(item["event"] == "weather_cache_hit" and item["is_cache_hit"] for item in with_cache["items"])
+    older = runtime_logs(limit=20, before_ts=1500.0, include_cache_hits=True)
+    assert [item["event"] for item in older["items"]] == ["legacy_old"]
+
+
+def test_online_tracker_and_prewarm_interval() -> None:
+    clear_online_state()
+    assert is_online("online_user") is False
+    mark_online("online_user", "phone")
+    mark_online("online_user", "tablet")
+    assert is_online("online_user") is True
+    mark_offline("online_user", "phone")
+    assert is_online("online_user") is True
+    mark_offline("online_user", "tablet")
+    assert is_online("online_user") is False
+    assert scheduler_module._prewarm_interval_minutes(1) == 5
+    assert scheduler_module._prewarm_interval_minutes(15) == 15
+    assert scheduler_module._prewarm_interval_minutes(30) == 30
+    assert scheduler_module._prewarm_interval_minutes("bad") == 15
+
+
+def test_prewarm_once_skips_online_and_fresh_cache() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    online_user_id = f"prewarm_online_{suffix}"
+    cache_user_id = f"prewarm_cache_{suffix}"
+    clear_online_state()
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=online_user_id, character_id="sakura")
+        ensure_seed(session, user_id=cache_user_id, character_id="sakura")
+        for user_id in (online_user_id, cache_user_id):
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+        session.add(
+            OpeningCache(
+                cache_id=f"opening_cache_{suffix}",
+                user_id=cache_user_id,
+                character_id="sakura",
+                kind="greeting",
+                payload_json=dump_json({"lines": [], "relation_delta": {}}),
+                status="ready",
+                expires_at="2099-01-01T00:00:00+00:00",
+            )
+        )
+        session.commit()
+
+        mark_online(online_user_id, "phone")
+        online_result = scheduler_module._prewarm_once(session, user_ids={online_user_id})
+        assert online_result["checked"] == 1
+        assert online_result["skipped_online"] == 1
+        mark_offline(online_user_id, "phone")
+
+        cache_result = scheduler_module._prewarm_once(session, user_ids={cache_user_id})
+        assert cache_result["checked"] == 1
+        assert cache_result["skipped_cache"] == 1
+    clear_online_state()
+
+
+def test_prewarm_once_offline_without_cache_runs_weather_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"prewarm_offline_{suffix}"
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare_due_openings(session: SessionLocal, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"ok": True, "checked": 1, "prepared": 0, "skipped": 1, "failed": 0}
+
+    monkeypatch.setattr(scheduler_module, "prepare_due_openings", fake_prepare_due_openings)
+    clear_online_state()
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="sakura")
+        user = session.get(User, user_id)
+        user.story_completed = True
+        user.notifications_enabled = True
+        session.commit()
+
+        result = scheduler_module._prewarm_once(session, user_ids={user_id})
+        assert result["checked"] == 1
+        assert result["skipped_online"] == 0
+        assert result["skipped_cache"] == 0
+        assert result["skipped_no_event"] == 1
+        assert calls
+        assert calls[0]["generate_weather"] is True
+        assert calls[0]["generate_news"] is False
+
+
+def test_llm_diagnostic_records_request_and_response() -> None:
+    _clear_diagnostics()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        assert body["messages"][1]["content"] == "return json"
+        content = json.dumps({"ok": True, "reply": "recorded"}, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_diag_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            result = providers.OpenAICompatibleClient(config).chat_json(
+                [{"role": "system", "content": "json only"}, {"role": "user", "content": "return json"}],
+                diagnostic={
+                    "feature": "LLM测试",
+                    "stage": "chat_json",
+                    "purpose": "record request",
+                    "input": {"case": "diagnostic", "references": {"weather": {"used": True, "summary": "sunny"}}},
+                    "references": {"weather": {"used": True, "summary": "sunny"}},
+                },
+            )
+            assert result["ok"] is True
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    payload = runtime_logs(limit=20, feature="LLM测试")
+    llm_span = next(item for item in payload["items"] if item["event"] == "llm_request")
+    assert llm_span["status"] == "ok"
+    assert llm_span["details"]["start"]["request"]["messages"][1]["content"] == "return json"
+    assert llm_span["details"]["start"]["references"]["weather"]["used"] is True
+    assert "天气" in llm_span["references_summary"]
+    assert llm_span["details"]["end"]["response"]["reply"] == "recorded"
+
+
+def test_user_message_trace_records_reply_judgement() -> None:
+    _clear_diagnostics()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "用户直接聊天，需要正常回复",
+                "lines": [{"text": "我听见了。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [{"text": "继续说"}],
+                "key_reply_score": 12,
+                "key_reply_reason": "普通聊天，不需要特殊回复",
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [{"layer": "chat", "content": "用户说今天想测试日志", "importance": 0.5, "confidence": 0.8}],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="trace_reply_user", character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_trace_reply_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, "trace_reply_user")
+            assert user is not None
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id="trace_reply_user",
+                    character_id="sakura",
+                    session_id="trace_reply_session",
+                    payload={"text": "今天想测试日志"},
+                    client_context={"local_time": "2026-06-10T10:15:00+08:00"},
+                ),
+            )
+            assert result.event_type == "dialogue"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    payload = runtime_logs(limit=50, feature="回复模块")
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "reply_trace" in serialized
+    for stage in ("save_user_message", "context_build", "llm_dialogue", "payload_build", "tts_lines", "side_effects", "save_dialogue", "commit"):
+        assert stage in serialized
+    assert "reply_context_ready" in serialized
+    assert "reply_llm_judgement" in serialized
+    assert "reply_output_ready" in serialized
+    assert "用户直接聊天，需要正常回复" in serialized
+    assert '"references"' in serialized
+    for key in ("user_input", "schedule", "weather", "memory", "recent_dialogue", "moment_interactions", "gate", "subject_hint"):
+        assert key in serialized
+    reply_span = next(item for item in payload["items"] if item["event"] == "reply_trace")
+    child_spans = [item for item in payload["items"] if item.get("parent_id") == reply_span["id"]]
+    assert child_spans
+    assert reply_span["elapsed_ms"] >= max(item["elapsed_ms"] for item in child_spans)
+    trace = next(trace for trace in payload["traces"] if trace["trace_id"] == reply_span["trace_id"])
+    assert any(node["id"] == reply_span["id"] for node in trace["nodes"])
+    assert any(item["stage"] == "context_build" for item in trace["items"])
+
+
 def test_provider_presets() -> None:
     payload = client.get("/api/config/provider-presets").json()
     assert payload["llm"][0]["provider"] == "volc_ark"
     assert [item["provider"] for item in payload["llm_task"]] == ["volc_ark", "deepseek", "openai_compatible"]
     tts_fields = {item["name"] for item in payload["tts"][0]["fields"]}
     assert {"credential_mode", "parameter_mode", "resource_id", "speaker", "x_api_key", "access_key", "emotion_map"}.issubset(tts_fields)
-    search_fields = {item["name"] for item in payload["search"][0]["fields"]}
+    search_by_provider = {item["provider"]: item for item in payload["search"]}
+    assert {"trend_radar", "volc_ark_web_search"}.issubset(search_by_provider)
+    trend_fields = {item["name"] for item in search_by_provider["trend_radar"]["fields"]}
+    assert {"cache_minutes", "max_titles", "timeout"}.issubset(trend_fields)
+    assert search_by_provider["trend_radar"]["supports_models"] is False
+    search_fields = {item["name"] for item in search_by_provider["volc_ark_web_search"]["fields"]}
     assert {"max_keyword", "limit", "max_tool_calls", "user_location"}.issubset(search_fields)
-    assert payload["search"][0]["supports_models"] is True
+    assert search_by_provider["volc_ark_web_search"]["supports_models"] is True
     weather_fields = {item["name"] for item in payload["weather"][0]["fields"]}
-    assert {"auth_mode", "key_id", "project_id", "private_key", "api_key", "include_minutely"}.issubset(weather_fields)
+    assert {"auth_mode", "key_id", "project_id", "private_key", "api_key", "include_warning", "include_minutely"}.issubset(weather_fields)
     assert [item["provider"] for item in payload["image"]] == ["doubao_seedream", "openai_gpt_image", "gemini_image"]
     assert "supports_web_search" not in str(payload)
+
+
+def _trend_radar_payload() -> dict[str, object]:
+    return {
+        "generated_at": "2026-06-10T12:00:00+08:00",
+        "total_titles_processed": 12,
+        "failed_sources": [],
+        "trends": [
+            {
+                "keyword_group": "AI 游戏",
+                "match_count": 6,
+                "titles": [
+                    {
+                        "title": "AI 游戏原型工具登上热榜",
+                        "url": "https://trend.example/ai-game",
+                        "source": "知乎",
+                        "ranks": [2, 4],
+                        "is_new": True,
+                        "appearance_count": 3,
+                        "time_info": "12时00分",
+                    },
+                    {
+                        "title": "独立游戏团队讨论 AI 角色",
+                        "url": "https://trend.example/ai-character",
+                        "source": "B站",
+                        "ranks": [7],
+                        "is_new": False,
+                        "appearance_count": 1,
+                        "time_info": "11时30分",
+                    },
+                ],
+            },
+            {
+                "keyword_group": "芯片",
+                "match_count": 4,
+                "titles": [
+                    {
+                        "title": "芯片公司发布新品",
+                        "url": "https://trend.example/chip",
+                        "source": "百度",
+                        "ranks": [3],
+                        "is_new": True,
+                        "appearance_count": 2,
+                        "time_info": "12时10分",
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def test_trend_radar_provider_test_reads_trends() -> None:
+    providers._TREND_RADAR_CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://trend.example/api/trends.json"
+        return httpx.Response(200, json=_trend_radar_payload())
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        response = client.post(
+            "/api/config/providers/test",
+            json={
+                "provider_id": "test_trend_radar_provider",
+                "kind": "search",
+                "provider": "trend_radar",
+                "label": "TrendRadar Test",
+                "base_url": "https://trend.example",
+                "metadata": {"cache_minutes": 0, "max_titles": 2, "timeout": 10},
+            },
+        ).json()
+        assert response["ok"] is True
+        assert response["provider"] == "trend_radar"
+        assert response["details"]["trend_count"] == 2
+        assert response["details"]["first_title"]["title"] == "AI 游戏原型工具登上热榜"
+    finally:
+        providers.HTTP_TRANSPORT = None
+        providers._TREND_RADAR_CACHE.clear()
+
+
+def _trend_radar_sqlite_bytes() -> bytes:
+    path = os.path.abspath("backend/.test-data/trend_radar_sample.db")
+    if os.path.exists(path):
+        os.unlink(path)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE platforms (id TEXT PRIMARY KEY, name TEXT NOT NULL, is_active INTEGER DEFAULT 1, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE news_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            platform_id TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            url TEXT DEFAULT '',
+            mobile_url TEXT DEFAULT '',
+            first_crawl_time TEXT NOT NULL,
+            last_crawl_time TEXT NOT NULL,
+            crawl_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE rank_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            news_item_id INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            crawl_time TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    conn.execute("INSERT INTO platforms(id, name) VALUES('zhihu', '知乎')")
+    conn.execute(
+        """
+        INSERT INTO news_items(title, platform_id, rank, url, first_crawl_time, last_crawl_time, crawl_count)
+        VALUES('AI 游戏工具登上热榜', 'zhihu', 2, 'https://example.com/ai-game', '12-00', '13-00', 2)
+        """
+    )
+    conn.execute("INSERT INTO rank_history(news_item_id, rank, crawl_time) VALUES(1, 2, '12-00')")
+    conn.execute("INSERT INTO rank_history(news_item_id, rank, crawl_time) VALUES(1, 1, '13-00')")
+    conn.commit()
+    conn.close()
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def test_trend_radar_provider_test_reads_github_sqlite_output() -> None:
+    providers._TREND_RADAR_CACHE.clear()
+    db_bytes = _trend_radar_sqlite_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "https://api.github.com/repos/PrinzEugen8/AI_news/contents/output/news?ref=master":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "2026-06-10.db",
+                        "download_url": "https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db",
+                    }
+                ],
+            )
+        assert url == "https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"
+        return httpx.Response(200, content=db_bytes)
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        response = client.post(
+            "/api/config/providers/test",
+            json={
+                "provider_id": "test_trend_radar_github_provider",
+                "kind": "search",
+                "provider": "trend_radar",
+                "label": "TrendRadar GitHub Test",
+                "base_url": "https://github.com/PrinzEugen8/AI_news",
+                "metadata": {"cache_minutes": 0, "max_titles": 2, "timeout": 10},
+            },
+        ).json()
+        assert response["ok"] is True
+        assert response["details"]["trend_count"] == 1
+        assert response["details"]["first_title"]["title"] == "AI 游戏工具登上热榜"
+    finally:
+        providers.HTTP_TRANSPORT = None
+        providers._TREND_RADAR_CACHE.clear()
+
+
+def test_trend_radar_snapshot_sync_uses_dated_github_raw_db() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    db_bytes = _trend_radar_sqlite_bytes()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        calls.append(url)
+        assert "api.github.com" not in url
+        assert url == "https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"
+        return httpx.Response(200, content=db_bytes)
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_snapshot_raw_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            snapshot = sync_trend_radar_snapshot(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T04:00:00+08:00"),
+                force=True,
+            )
+            assert snapshot is not None
+            assert snapshot.status == "ok"
+            assert snapshot.local_date == "2026-06-10"
+            assert snapshot.generated_at == "2026-06-10T13:00:00+08:00"
+            assert calls == ["https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"]
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_news_candidate_uses_trend_radar_snapshot_without_http() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected TrendRadar HTTP request: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            user_id = f"trend_snapshot_user_{suffix}"
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
+            user.news_enabled = True
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_snapshot_news_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://trend.example",
+                    metadata={"cache_minutes": 0, "max_titles": 2},
+                ),
+            )
+            session.add(
+                TrendRadarSnapshot(
+                    snapshot_id=f"trend_snapshot_{suffix}",
+                    provider_id=config.provider_id,
+                    local_date="2026-06-10",
+                    status="ok",
+                    generated_at="2026-06-10T12:00:00+08:00",
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                    endpoint="https://trend.example/api/trends.json",
+                    payload_json=json.dumps(_trend_radar_payload(), ensure_ascii=False),
+                )
+            )
+            session.commit()
+            event = ensure_news_candidate(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-10T12:15:00+08:00"),
+            )
+            assert event is not None
+            payload = json.loads(event.payload_json)
+            assert payload["generated_at"] == "2026-06-10T12:00:00+08:00"
+            assert payload["topic"] == "AI 游戏"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_lazy_sync_records_error_once_after_window() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(403, text="rate limited")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_lazy_once_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            first = trend_radar_payload_for_news(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T04:10:00+08:00"),
+            )
+            second = trend_radar_payload_for_news(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T05:10:00+08:00"),
+            )
+            assert first is None
+            assert second is None
+            assert calls == ["https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"]
+            errors = session.execute(
+                select(TrendRadarSnapshot).where(
+                    TrendRadarSnapshot.provider_id == config.provider_id,
+                    TrendRadarSnapshot.local_date == "2026-06-10",
+                    TrendRadarSnapshot.status == "error",
+                )
+            ).scalars().all()
+            assert len(errors) == 1
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_does_not_lazy_sync_before_daily_window() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_trend_radar_payload())
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_before_window_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://trend.example",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            payload = trend_radar_payload_for_news(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T03:59:00+08:00"),
+            )
+            assert payload is None
+            assert calls == []
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def test_task_llm_prefers_task_provider_and_falls_back_to_chat_provider() -> None:
@@ -1444,12 +2094,87 @@ def test_app_opened_without_proactive_event_returns_no_reply() -> None:
         assert result.event_type == "no_reply"
 
 
-def test_location_upload_refreshes_qweather_and_creates_weather_proactive() -> None:
+def test_location_upload_reads_existing_weather_without_qweather_refresh() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"weather_location_user_{suffix}"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        raise AssertionError(f"location upload must not call QWeather: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.news_enabled = False
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_qweather_location_{suffix}",
+                    kind="weather",
+                    provider="qweather",
+                    base_url="https://qweather.example",
+                    secrets={"api_key": "qweather-key"},
+                    metadata={"auth_mode": "api_key", "include_minutely": True, "cache_minutes": 120},
+                ),
+            )
+            session.add(
+                WeatherSnapshot(
+                    snapshot_id=f"weather_existing_{suffix}",
+                    user_id=user_id,
+                    weather_date="2026-06-10",
+                    location_key="101280601",
+                    city_name="深圳",
+                    observed_at="2026-06-10T04:00:00+08:00",
+                    fetched_at="2026-06-10T04:00:00+08:00",
+                    expires_at="2026-06-11T04:00:00+08:00",
+                    weather_text="雷阵雨",
+                    severity="severe",
+                    severity_score=94,
+                    trigger_key="thunderstorm",
+                    summary="深圳现在雷阵雨，晚上可能有雨。",
+                    now_json=dump_json({"now": {"temp": "28", "text": "雷阵雨"}}),
+                    hourly_json=dump_json({"hourly": [{"fxTime": "2026-06-10T20:00+08:00", "temp": "27", "text": "雷阵雨", "pop": "80"}]}),
+                    daily_json=dump_json({"daily": [{"textDay": "雷阵雨", "textNight": "雷阵雨", "tempMin": "25", "tempMax": "30", "precip": "12"}]}),
+                    warning_json=dump_json({"warning": []}),
+                    minutely_json=dump_json({}),
+                )
+            )
+            session.commit()
+        payload = client.post(
+            f"/api/location?user_id={user_id}&character_id=sakura",
+            json={
+                "latitude": 22.54,
+                "longitude": 114.06,
+                "accuracy_m": 32,
+                "provider": "test",
+                "local_time": "2026-06-10T15:30:00+08:00",
+            },
+        ).json()
+        assert payload["ok"] is True
+        assert calls == []
+        assert payload["location"]["qweather_location_id"] == ""
+        assert payload["weather"]["trigger_key"] == "thunderstorm"
+        assert payload["weather"]["severity_score"] >= 90
+        assert payload["proactive_event_id"] == ""
+        with SessionLocal() as session:
+            location = session.get(UserLocation, user_id)
+            assert location.city_name == ""
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_manual_weather_refreshes_qweather_once_and_creates_weather_proactive() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"weather_manual_refresh_user_{suffix}"
+    calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        calls.append(path)
         assert request.headers.get("X-QW-Api-Key") == "qweather-key"
         if path == "/geo/v2/city/lookup":
             return httpx.Response(
@@ -1497,8 +2222,6 @@ def test_location_upload_refreshes_qweather_and_creates_weather_proactive() -> N
                     ],
                 },
             )
-        if path == "/v7/warning/now":
-            return httpx.Response(200, json={"code": "200", "warning": []})
         if path == "/v7/minutely/5m":
             return httpx.Response(200, json={"code": "200", "summary": "未来两小时有阵雨", "minutely": []})
         return httpx.Response(404, json={"code": "404"})
@@ -1509,33 +2232,37 @@ def test_location_upload_refreshes_qweather_and_creates_weather_proactive() -> N
             ensure_seed(session, user_id=user_id, character_id="sakura")
             user = session.get(User, user_id)
             user.story_completed = True
+            user.news_enabled = False
+            session.add(UserLocation(user_id=user_id, latitude=22.54, longitude=114.06, accuracy_m=32, provider="test"))
             upsert_provider(
                 session,
                 ProviderConfigIn(
-                    provider_id=f"test_qweather_location_{suffix}",
+                    provider_id=f"test_qweather_manual_{suffix}",
                     kind="weather",
                     provider="qweather",
                     base_url="https://qweather.example",
                     secrets={"api_key": "qweather-key"},
-                    metadata={"auth_mode": "api_key", "include_minutely": True, "cache_minutes": 120},
+                    metadata={"auth_mode": "api_key", "include_minutely": True, "include_warning": False},
                 ),
             )
             session.commit()
         payload = client.post(
-            f"/api/location?user_id={user_id}&character_id=sakura",
-            json={
-                "latitude": 22.54,
-                "longitude": 114.06,
-                "accuracy_m": 32,
-                "provider": "test",
-                "local_time": "2026-06-10T15:30:00+08:00",
-            },
+            f"/api/weather/refresh?user_id={user_id}&character_id=sakura",
+            json={"local_time": "2026-06-10T15:30:00+08:00"},
         ).json()
         assert payload["ok"] is True
         assert payload["location"]["qweather_location_id"] == "101280601"
         assert payload["weather"]["trigger_key"] == "thunderstorm"
         assert payload["weather"]["severity_score"] >= 90
         assert payload["proactive_event_id"]
+        assert "/v7/warning/now" not in calls
+        first_call_count = len(calls)
+        second = client.post(
+            f"/api/weather/refresh?user_id={user_id}&character_id=sakura",
+            json={"local_time": "2026-06-10T15:30:10+08:00"},
+        ).json()
+        assert second["weather"]["snapshot_id"] == payload["weather"]["snapshot_id"]
+        assert len(calls) == first_call_count
         with SessionLocal() as session:
             proactive = session.get(ProactiveEvent, payload["proactive_event_id"])
             assert proactive is not None
@@ -1547,15 +2274,146 @@ def test_location_upload_refreshes_qweather_and_creates_weather_proactive() -> N
         providers.HTTP_TRANSPORT = None
 
 
-def test_proactive_pending_delivery_limits_sleep_and_gap() -> None:
+def test_proactive_pending_uses_existing_weather_without_qweather_refresh() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
-    user_id = f"proactive_limit_user_{suffix}"
+    user_id = f"weather_pending_user_{suffix}"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        raise AssertionError(f"pending proactive must not call QWeather: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.news_enabled = False
+            user.proactive_next_check_at = "2026-06-10T12:00:00+00:00"
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_qweather_pending_{suffix}",
+                    kind="weather",
+                    provider="qweather",
+                    base_url="https://qweather.example",
+                    secrets={"api_key": "qweather-key"},
+                    metadata={"auth_mode": "api_key"},
+                ),
+            )
+            session.add(
+                WeatherSnapshot(
+                    snapshot_id=f"weather_pending_snapshot_{suffix}",
+                    user_id=user_id,
+                    weather_date="2026-06-10",
+                    location_key="101280601",
+                    city_name="深圳",
+                    observed_at="2026-06-10T04:00:00+08:00",
+                    fetched_at="2026-06-10T04:00:00+08:00",
+                    expires_at="2026-06-11T04:00:00+08:00",
+                    weather_text="雷阵雨",
+                    severity="severe",
+                    severity_score=94,
+                    trigger_key="thunderstorm",
+                    summary="深圳现在雷阵雨，晚上可能有雨。",
+                    now_json=dump_json({"now": {"temp": "28", "text": "雷阵雨"}}),
+                    hourly_json=dump_json({"hourly": []}),
+                    daily_json=dump_json({"daily": []}),
+                    warning_json=dump_json({"warning": []}),
+                    minutely_json=dump_json({}),
+                )
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-10T15:30:00+08:00"),
+                generate_news=False,
+            )
+            assert result["ok"] is True
+            weather_event = session.execute(
+                select(ProactiveEvent).where(ProactiveEvent.user_id == user_id, ProactiveEvent.source_type == "weather")
+            ).scalar_one_or_none()
+            assert weather_event is not None
+            assert weather_event.priority >= 90
+        assert calls == []
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_daily_cycle_invokes_weather_refresh_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"weather_daily_user_{suffix}"
+    calls = {"refresh": 0, "candidate": 0}
+
+    def fake_refresh_weather_snapshot(session: object, **kwargs: object) -> object:
+        calls["refresh"] += 1
+        assert kwargs["user_id"] == user_id
+        assert kwargs["force"] is False
+        return object()
+
+    def fake_ensure_weather_candidate(session: object, **kwargs: object) -> None:
+        calls["candidate"] += 1
+        assert kwargs["user_id"] == user_id
+        assert "force" not in kwargs
+        return None
+
+    monkeypatch.setattr(schedule_module, "refresh_weather_snapshot", fake_refresh_weather_snapshot)
+    monkeypatch.setattr(schedule_module, "ensure_weather_candidate", fake_ensure_weather_candidate)
     with SessionLocal() as session:
         ensure_seed(session, user_id=user_id, character_id="sakura")
-        for index in range(3):
-            session.add(
-                ProactiveEvent(
-                    proactive_event_id=f"pe_limit_delivered_{suffix}_{index}",
+        user = session.get(User, user_id)
+        user.story_completed = True
+        session.commit()
+        run_daily_cycle(session, user_id=user_id, character_id="sakura", day=datetime.fromisoformat("2099-06-10T04:00:00+08:00"))
+    assert calls == {"refresh": 1, "candidate": 1}
+
+
+def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_limit_user_{suffix}"
+    selected_event_id = ""
+    judge_contexts: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        context = json.loads(prompt.split("上下文 JSON：\n", 1)[1])
+        judge_contexts.append(context)
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": selected_event_id,
+                "reason": "虽然处在睡眠和短间隔上下文里，但这条候选更重要。",
+                "next_check_after_minutes": 120,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_judge_select_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.sleep_start = "00:30"
+            user.sleep_end = "08:00"
+            for index in range(3):
+                delivered = create_proactive_event(
+                    session,
                     user_id=user_id,
                     character_id="sakura",
                     source_type="memory",
@@ -1563,178 +2421,403 @@ def test_proactive_pending_delivery_limits_sleep_and_gap() -> None:
                     title=f"已投递标题 {index}",
                     text=f"已投递内容 {index}",
                     priority=50,
-                    status="delivered",
                     dedupe_key=f"delivered_{suffix}_{index}",
-                    scheduled_at="2026-06-09T01:00:00+00:00",
-                    delivered_at=f"2026-06-09T0{index + 1}:00:00+08:00",
-                    created_at=f"2026-06-09T0{index + 1}:00:00+08:00",
-                    updated_at=f"2026-06-09T0{index + 1}:00:00+08:00",
+                    scheduled_at=datetime.fromisoformat("2026-06-08T16:00:00+00:00"),
                 )
+                delivered.status = "delivered"
+                delivered.delivered_at = f"2026-06-09T00:{10 + index:02d}:00+08:00"
+            high = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_high_{suffix}",
+                title="高优先级但不选",
+                text="这条优先级更高，但判断器不选它。",
+                priority=95,
+                dedupe_key=f"pending_high_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-08T16:00:00+00:00"),
             )
+            selected = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_selected_{suffix}",
+                title="判断器选择目标",
+                text="这条由判断器指定投递。",
+                priority=40,
+                dedupe_key=f"pending_selected_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-08T16:00:00+00:00"),
+            )
+            selected_event_id = selected.proactive_event_id
+            session.commit()
+
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T01:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"]["proactive_event_id"] == selected_event_id
+            assert judge_contexts
+            context = judge_contexts[0]
+            assert context["delivery_history"]["today_delivered_count"] == 3
+            assert context["sleep_window"]["is_sleep_time"] is True
+            candidate_ids = {item["proactive_event_id"] for item in context["candidates"]}
+            assert {high.proactive_event_id, selected_event_id}.issubset(candidate_ids)
+            session.refresh(user)
+            judgement = json.loads(user.proactive_judgement_json)
+            assert judgement["selected_event_id"] == selected_event_id
+            assert judgement["next_check_after_minutes"] == 120
+            assert user.proactive_next_check_at
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_judge_can_defer_and_store_next_check() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_defer_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _llm_json_response(
+            {
+                "should_send": False,
+                "selected_event_id": "",
+                "reason": "现在不打扰，稍后再看。",
+                "next_check_after_minutes": 45,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_judge_defer_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_defer_{suffix}",
+                title="暂缓测试",
+                text="这条可以被判断器暂缓。",
+                priority=80,
+                dedupe_key=f"pending_defer_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"] is None
+            session.refresh(user)
+            judgement = json.loads(user.proactive_judgement_json)
+            assert judgement["should_send"] is False
+            assert judgement["next_check_after_minutes"] == 45
+            assert datetime.fromisoformat(user.proactive_next_check_at) == datetime.fromisoformat("2026-06-09T04:45:00+00:00")
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_next_check_skips_llm_until_due() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_next_check_user_{suffix}"
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _llm_json_response({"should_send": True, "selected_event_id": "should_not_be_used", "reason": "", "next_check_after_minutes": 10})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_judge_skip_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_next_check_at = "2026-06-09T05:00:00+00:00"
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_skip_{suffix}",
+                title="未到判断时间",
+                text="这条不应该触发判断器。",
+                priority=90,
+                dedupe_key=f"pending_skip_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"] is None
+            assert calls == 0
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_bad_json_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": "not json"}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_judge_bad_json_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_bad_json_{suffix}",
+                title="非法 JSON 测试",
+                text="模型非法输出时不应该投递。",
+                priority=90,
+                dedupe_key=f"pending_bad_json_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"] is None
+            session.refresh(user)
+            judgement = json.loads(user.proactive_judgement_json)
+            assert judgement["status"] == "error"
+            assert judgement["should_send"] is False
+            assert judgement["next_check_after_minutes"] == 30
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_judge_missing_provider_defaults_to_no_send() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_no_provider_user_{suffix}"
+    with SessionLocal() as session:
+        for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind.in_(["llm", "llm_task"]))).scalars():
+            config.enabled = False
+        ensure_seed(session, user_id=user_id, character_id="sakura")
+        user = session.get(User, user_id)
+        user.story_completed = True
+        user.notifications_enabled = True
         create_proactive_event(
             session,
             user_id=user_id,
             character_id="sakura",
             source_type="memory",
-            source_id=f"pending_limit_{suffix}",
-            title="待投递标题",
-            text="待投递内容",
+            source_id=f"pending_no_provider_{suffix}",
+            title="无模型测试",
+            text="没有判断器模型时不应该投递。",
             priority=90,
-            dedupe_key=f"pending_limit_{suffix}",
+            dedupe_key=f"pending_no_provider_{suffix}",
             scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
         )
         session.commit()
-        limited = pending_proactive_response(
+        result = pending_proactive_response(
             session,
             user_id=user_id,
             character_id="sakura",
             local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
             generate_news=False,
+            generate_weather=False,
         )
-        assert limited["event"] is None
-
-        gap_user_id = f"proactive_gap_user_{suffix}"
-        ensure_seed(session, user_id=gap_user_id, character_id="sakura")
-        user = session.get(User, gap_user_id)
-        user.sleep_start = "00:30"
-        user.sleep_end = "08:00"
-        session.add(
-            ProactiveEvent(
-                proactive_event_id=f"pe_gap_recent_{suffix}",
-                user_id=gap_user_id,
-                character_id="sakura",
-                source_type="memory",
-                source_id=f"gap_recent_{suffix}",
-                title="刚投递标题",
-                text="刚投递内容",
-                priority=50,
-                status="delivered",
-                dedupe_key=f"gap_recent_{suffix}",
-                scheduled_at="2026-06-09T02:00:00+00:00",
-                delivered_at="2026-06-09T12:00:00+08:00",
-                created_at="2026-06-09T12:00:00+08:00",
-                updated_at="2026-06-09T12:00:00+08:00",
-            )
-        )
-        create_proactive_event(
-            session,
-            user_id=gap_user_id,
-            character_id="sakura",
-            source_type="memory",
-            source_id=f"pending_gap_{suffix}",
-            title="间隔测试",
-            text="间隔不够时不应该投递。",
-            priority=90,
-            dedupe_key=f"pending_gap_{suffix}",
-            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
-        )
-        session.commit()
-        too_soon = pending_proactive_response(
-            session,
-            user_id=gap_user_id,
-            character_id="sakura",
-            local_time=datetime.fromisoformat("2026-06-09T12:30:00+08:00"),
-            generate_news=False,
-        )
-        assert too_soon["event"] is None
-        after_gap = pending_proactive_response(
-            session,
-            user_id="proactive_gap_user",
-            character_id="sakura",
-            local_time=datetime.fromisoformat("2026-06-09T13:31:00+08:00"),
-            generate_news=False,
-        )
-        assert after_gap["event"]["proactive_event_id"]
-
-        ensure_seed(session, user_id="proactive_sleep_user", character_id="sakura")
-        create_proactive_event(
-            session,
-            user_id="proactive_sleep_user",
-            character_id="sakura",
-            source_type="memory",
-            source_id="pending_sleep",
-            title="睡眠测试",
-            text="睡眠时间不应该投递。",
-            priority=90,
-            dedupe_key="pending_sleep",
-            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
-        )
-        session.commit()
-        sleeping = pending_proactive_response(
-            session,
-            user_id="proactive_sleep_user",
-            character_id="sakura",
-            local_time=datetime.fromisoformat("2026-06-09T01:00:00+08:00"),
-            generate_news=False,
-        )
-        assert sleeping["event"] is None
+        assert result["event"] is None
+        session.refresh(user)
+        judgement = json.loads(user.proactive_judgement_json)
+        assert judgement["status"] == "error"
+        assert judgement["error_type"] == "missing_provider"
 
 
 def test_proactive_pending_and_delivered_routes() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_route_user_{suffix}"
-    with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
-        event = create_proactive_event(
-            session,
-            user_id=user_id,
-            character_id="sakura",
-            source_type="memory",
-            source_id=f"route_memory_{suffix}",
-            title="路由测试",
-            text="这是一条可以投递的主动消息。",
-            priority=88,
-            dedupe_key=f"route_memory_{suffix}",
-            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+    event_id = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": event_id,
+                "reason": "路由测试允许投递。",
+                "next_check_after_minutes": 60,
+            }
         )
-        event_id = event.proactive_event_id
-        session.commit()
-    payload = client.get(
-        f"/api/proactive/pending?user_id={user_id}&character_id=sakura&local_time=2026-06-09T12:00:00%2B08:00"
-    ).json()
-    assert payload["event"]["proactive_event_id"] == event_id
-    assert payload["widget"]["unread_count"] == 1
-    assert payload["widget"]["chibi_url"] == "/media/asset_chibi_sakura_widget"
-    delivered = client.post(f"/api/proactive/{event_id}/delivered").json()
-    assert delivered["event"]["status"] == "delivered"
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    with SessionLocal() as session:
+        try:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_route_judge_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"route_memory_{suffix}",
+                title="路由测试",
+                text="这是一条可以投递的主动消息。",
+                priority=88,
+                dedupe_key=f"route_memory_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            event_id = event.proactive_event_id
+            session.commit()
+            payload = client.get(
+                f"/api/proactive/pending?user_id={user_id}&character_id=sakura&local_time=2026-06-09T12:00:00%2B08:00"
+            ).json()
+            assert payload["event"]["proactive_event_id"] == event_id
+            assert payload["widget"]["unread_count"] == 1
+            assert payload["widget"]["chibi_url"] == "/media/asset_chibi_sakura_widget"
+            delivered = client.post(f"/api/proactive/{event_id}/delivered").json()
+            assert delivered["event"]["status"] == "delivered"
+        finally:
+            providers.HTTP_TRANSPORT = None
 
 
 def test_proactive_consume_clears_widget_pending_event() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_consume_user_{suffix}"
+    event_id = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": event_id,
+                "reason": "清红点测试允许投递。",
+                "next_check_after_minutes": 60,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
-        event = create_proactive_event(
-            session,
-            user_id=user_id,
-            character_id="sakura",
-            source_type="memory",
-            source_id=f"consume_memory_{suffix}",
-            title="清红点测试",
-            text="这条主动消息被点击后应该马上清掉红点。",
-            priority=90,
-            dedupe_key=f"consume_memory_{suffix}",
-            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
-        )
-        session.commit()
-        before = pending_proactive_response(
-            session,
-            user_id=user_id,
-            character_id="sakura",
-            local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
-            generate_news=False,
-        )
-        assert before["event"]["proactive_event_id"] == event.proactive_event_id
-        consume_proactive_event(session, event.proactive_event_id)
-        after = pending_proactive_response(
-            session,
-            user_id=user_id,
-            character_id="sakura",
-            local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
-            generate_news=False,
-        )
-        assert after["event"] is None
-        assert after["widget"]["unread_count"] == 0
+        try:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_consume_judge_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"consume_memory_{suffix}",
+                title="清红点测试",
+                text="这条主动消息被点击后应该马上清掉红点。",
+                priority=90,
+                dedupe_key=f"consume_memory_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            event_id = event.proactive_event_id
+            session.commit()
+            before = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert before["event"]["proactive_event_id"] == event.proactive_event_id
+            consume_proactive_event(session, event.proactive_event_id)
+            after = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert after["event"] is None
+            assert after["widget"]["unread_count"] == 0
+        finally:
+            providers.HTTP_TRANSPORT = None
 
 
 def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
@@ -1818,11 +2901,22 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"opening_prewarm_user_{suffix}"
     llm_calls = 0
+    event_id = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal llm_calls
         llm_calls += 1
         body = json.loads(request.content.decode())
+        if "上下文 JSON：" in body["messages"][1]["content"]:
+            llm_calls -= 1
+            return _llm_json_response(
+                {
+                    "should_send": True,
+                    "selected_event_id": event_id,
+                    "reason": "预热主动开场前允许投递。",
+                    "next_check_after_minutes": 60,
+                }
+            )
         assert "主动想告诉用户" in body["messages"][1]["content"]
         content = json.dumps(
             {
@@ -1871,6 +2965,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
                 scheduled_at=datetime.fromisoformat("2026-06-09T11:50:00+08:00"),
             )
             assert event is not None
+            event_id = event.proactive_event_id
             session.commit()
 
             prewarmed = prepare_due_openings(
@@ -1990,6 +3085,184 @@ def test_notification_opened_reflects_proactive_event_in_chat() -> None:
             assert refreshed.reflected_at
     finally:
         providers.HTTP_TRANSPORT = None
+
+
+def test_news_candidate_uses_trend_radar_all_keywords() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    providers._TREND_RADAR_CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert str(request.url) == "https://trend.example/api/trends.json"
+        return httpx.Response(200, json=_trend_radar_payload())
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            user_id = f"trend_news_user_{suffix}"
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.interest_topics_json = json.dumps(["AI 游戏", "完全不匹配"], ensure_ascii=False)
+            user.news_enabled = True
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_news_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://trend.example",
+                    metadata={"cache_minutes": 0, "max_titles": 2},
+                ),
+            )
+            session.commit()
+            event = ensure_news_candidate(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-10T12:15:00+08:00"),
+            )
+            assert event is not None
+            payload = json.loads(event.payload_json)
+            assert event.source_type == "news"
+            assert payload["topic"] == "AI 游戏"
+            assert payload["keyword_group"] == "AI 游戏"
+            assert payload["generated_at"] == "2026-06-10T12:00:00+08:00"
+            assert len(payload["sources"]) == 2
+            assert event.priority < 90
+    finally:
+        providers.HTTP_TRANSPORT = None
+        providers._TREND_RADAR_CACHE.clear()
+
+
+def test_news_candidate_skips_deduped_trend_radar_topic() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    providers._TREND_RADAR_CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_trend_radar_payload())
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            user_id = f"trend_dedupe_user_{suffix}"
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.interest_topics_json = json.dumps(["AI 游戏", "芯片"], ensure_ascii=False)
+            user.news_enabled = True
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="news",
+                source_id="existing_ai_game",
+                title="existing",
+                text="already created",
+                dedupe_key=f"news:{user_id}:AI 游戏:2026-06-10",
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_dedupe_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://trend.example/api/trends.json",
+                    metadata={"cache_minutes": 0, "max_titles": 3},
+                ),
+            )
+            session.commit()
+            event = ensure_news_candidate(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-10T13:00:00+08:00"),
+            )
+            assert event is not None
+            payload = json.loads(event.payload_json)
+            assert payload["topic"] == "芯片"
+            assert event.dedupe_key == f"news:{user_id}:芯片:2026-06-10"
+    finally:
+        providers.HTTP_TRANSPORT = None
+        providers._TREND_RADAR_CACHE.clear()
+
+
+def test_news_candidate_falls_back_to_ark_when_trend_radar_has_no_match() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    calls: list[str] = []
+    providers._TREND_RADAR_CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url) == "https://trend.example/api/trends.json":
+            return httpx.Response(200, json={**_trend_radar_payload(), "trends": []})
+        body = json.loads(request.content.decode())
+        assert "AI 游戏" in json.dumps(body, ensure_ascii=False)
+        return httpx.Response(
+            200,
+            json={
+                "output_text": "找到一条 AI 游戏新闻。",
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "annotations": [
+                                    {
+                                        "title": "AI 游戏新闻",
+                                        "url": "https://ark.example/news",
+                                        "published_at": "2026-06-10T11:00:00+08:00",
+                                        "summary": "Ark 搜索来源摘要",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ],
+            },
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            user_id = f"trend_fallback_user_{suffix}"
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
+            user.news_enabled = True
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_fallback_ark_{suffix}",
+                    kind="search",
+                    provider="volc_ark_web_search",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-response-search",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_fallback_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://trend.example",
+                    metadata={"cache_minutes": 0},
+                ),
+            )
+            session.commit()
+            event = ensure_news_candidate(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-10T14:00:00+08:00"),
+            )
+            assert event is not None
+            payload = json.loads(event.payload_json)
+            assert payload["topic"] == "AI 游戏"
+            assert payload["sources"][0]["published_at"] == "2026-06-10T11:00:00+08:00"
+            assert any(url.endswith("/responses") for url in calls)
+    finally:
+        providers.HTTP_TRANSPORT = None
+        providers._TREND_RADAR_CACHE.clear()
 
 
 def test_news_candidate_requires_verifiable_publish_time() -> None:
@@ -2343,6 +3616,8 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
     ).json()
     assert created["user_id"] == user_id
     assert created["display_name"] == "测试用户"
+    assert created["proactive_next_check_at"] == ""
+    assert created["proactive_judgement"] == {}
     users_page = client.get(f"/api/admin/users?q={user_id}&page=1&page_size=5").json()
     assert users_page["total"] >= 1
     assert users_page["page"] == 1

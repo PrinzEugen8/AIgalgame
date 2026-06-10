@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, update_calendar_event
 from .database import get_session, init_db
-from .diagnostics import tail_diagnostics, write_diagnostic
+from .diagnostics import runtime_logs, tail_diagnostics, write_diagnostic
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
@@ -38,6 +38,7 @@ from .models import (
     UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
+from .online import mark_offline, mark_online
 from .pipeline import handle_event
 from .proactive import consume_proactive_event, create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
 from .providers import (
@@ -65,7 +66,7 @@ from .schedule import ensure_schedule, run_daily_cycle
 from .scheduler import start_scheduler, stop_scheduler
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
 from .utils import clamp, dump_json, load_json, uid
-from .weather import ensure_weather_candidate, ensure_weather_snapshot, update_user_location, weather_snapshot_to_dict
+from .weather import ensure_weather_candidate, read_weather_snapshot, refresh_weather_snapshot, update_user_location, weather_snapshot_to_dict
 
 
 setup_logging()
@@ -242,6 +243,8 @@ def _user_to_out(user: User) -> dict[str, Any]:
         "sleep_end": user.sleep_end,
         "interest_topics": load_json(user.interest_topics_json, []),
         "proactive_daily_limit": user.proactive_daily_limit,
+        "proactive_next_check_at": user.proactive_next_check_at,
+        "proactive_judgement": load_json(user.proactive_judgement_json, {}),
         "notifications_enabled": user.notifications_enabled,
         "widget_bubbles_enabled": user.widget_bubbles_enabled,
         "news_enabled": user.news_enabled,
@@ -854,13 +857,12 @@ def location_update(
         captured_at=str(body.get("captured_at") or ""),
     )
     local_time = _parse_client_time(str(body.get("local_time") or ""))
-    snapshot = ensure_weather_snapshot(session, user_id=location.user_id, local_time=local_time, force=bool(body.get("refresh", False)))
-    event = ensure_weather_candidate(session, user_id=location.user_id, character_id=character_id, local_time=local_time) if snapshot is not None else None
+    snapshot = read_weather_snapshot(session, user_id=location.user_id, local_time=local_time, allow_stale=True)
     return {
         "ok": True,
         "location": _location_to_out(location),
         "weather": weather_snapshot_to_dict(snapshot),
-        "proactive_event_id": event.proactive_event_id if event is not None else "",
+        "proactive_event_id": "",
     }
 
 
@@ -872,7 +874,7 @@ def weather_current(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     ensure_seed(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID)
-    snapshot = ensure_weather_snapshot(session, user_id=user_id, local_time=_parse_client_time(local_time), force=refresh)
+    snapshot = read_weather_snapshot(session, user_id=user_id, local_time=_parse_client_time(local_time), allow_stale=True)
     location = session.get(UserLocation, user_id)
     return {"ok": True, "location": _location_to_out(location), "weather": weather_snapshot_to_dict(snapshot)}
 
@@ -889,7 +891,7 @@ def weather_refresh(
     effective_user_id = str(body.get("user_id") or user_id)
     effective_character_id = str(body.get("character_id") or character_id)
     local_time = _parse_client_time(str(body.get("local_time") or ""))
-    snapshot = ensure_weather_snapshot(session, user_id=effective_user_id, local_time=local_time, force=True)
+    snapshot = refresh_weather_snapshot(session, user_id=effective_user_id, local_time=local_time, force=True)
     event = ensure_weather_candidate(session, user_id=effective_user_id, character_id=effective_character_id, local_time=local_time) if snapshot is not None else None
     location = session.get(UserLocation, effective_user_id)
     return {
@@ -976,6 +978,7 @@ def opening_ready(
 @app.websocket("/ws/app")
 async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id: str = "device") -> None:
     await websocket.accept()
+    mark_online(user_id, device_id)
     logger.info("websocket connected user_id=%s device_id=%s", user_id, device_id)
     await websocket.send_json({"event_type": "connected", "event_id": uid("evt"), "payload": {"user_id": user_id, "device_id": device_id}})
     try:
@@ -997,6 +1000,8 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
     except WebSocketDisconnect:
         logger.info("websocket disconnected user_id=%s device_id=%s", user_id, device_id)
         return
+    finally:
+        mark_offline(user_id, device_id)
 
 
 @app.get("/api/state/home")
@@ -1179,6 +1184,29 @@ def debug_daily(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHAR
 @app.get("/api/debug/logs")
 def debug_logs(limit: int = 200) -> dict[str, Any]:
     return {"ok": True, "items": tail_diagnostics(limit)}
+
+
+@app.get("/api/admin/runtime-logs")
+def admin_runtime_logs(
+    limit: int = 200,
+    feature: str = "",
+    status: str = "",
+    q: str = "",
+    trace_id: str = "",
+    before_ts: float | None = None,
+    include_legacy: bool = True,
+    include_cache_hits: bool = False,
+) -> dict[str, Any]:
+    return runtime_logs(
+        limit=limit,
+        feature=feature,
+        status=status,
+        q=q,
+        trace_id=trace_id,
+        before_ts=before_ts,
+        include_legacy=include_legacy,
+        include_cache_hits=include_cache_hits,
+    )
 
 
 @app.post("/api/debug/generate-proactive")
