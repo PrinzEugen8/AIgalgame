@@ -14,17 +14,19 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.time.OffsetDateTime
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 class ApiClient(private val baseUrl: String) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val client = backendHttpClient()
 
     fun absoluteUrl(path: String): String {
         if (path.startsWith("http://") || path.startsWith("https://")) return path
@@ -123,6 +125,32 @@ class ApiClient(private val baseUrl: String) {
     }
 }
 
+private fun backendHttpClient(): OkHttpClient {
+    return OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .apply {
+            if (BuildConfig.DEBUG) {
+                trustAllHttpsCertificatesForDebug()
+            }
+        }
+        .build()
+}
+
+private fun OkHttpClient.Builder.trustAllHttpsCertificatesForDebug(): OkHttpClient.Builder {
+    val trustAllManager = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+    }
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
+    sslSocketFactory(sslContext.socketFactory, trustAllManager)
+    hostnameVerifier(HostnameVerifier { _, _ -> true })
+    return this
+}
+
 fun normalizeBackendUrl(value: String): String {
     val cleaned = value.trim().trimEnd('/')
     if (cleaned.isBlank()) return ""
@@ -168,10 +196,7 @@ fun describeNetworkFailure(url: String, error: IOException): String {
 }
 
 object HttpDownloader {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    private val client = backendHttpClient()
 
     suspend fun bytes(url: String): ByteArray = withContext(Dispatchers.IO) {
         val request = Request.Builder().url(url).build()

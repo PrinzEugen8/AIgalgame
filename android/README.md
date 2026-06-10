@@ -26,7 +26,7 @@ $env:AIGALGAME_PORT = "8898"
 
 The phone-facing address must be HTTPS, for example `https://your-tunnel-domain.example`. The tunnel can still forward privately to `127.0.0.1:8899` on the PC.
 
-If the app reports `Trust anchor for certification path not found`, Android does not trust the HTTPS certificate served by the tunnel. Use an HTTPS tunnel/domain with a public trusted certificate. If your tunnel uses a self-signed or private-CA certificate, install that CA certificate on the phone; debug builds include a network security config that trusts user-installed CAs while still blocking cleartext HTTP. Release builds trust only system CAs.
+Debug APKs trust all HTTPS certificates to make personal tunnel testing painless, while still blocking cleartext HTTP. If the debug app reports a certificate error, rebuild/reinstall the latest debug APK. Release builds do not bypass certificate checks and should use a public trusted HTTPS certificate.
 
 Implemented surfaces:
 
