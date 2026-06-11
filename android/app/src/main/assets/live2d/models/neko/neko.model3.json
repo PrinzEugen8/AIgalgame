@@ -11,7 +11,15 @@
 			"neko.4096/texture_05.png"
 		],
 		"Physics": "neko.physics3.json",
-		"DisplayInfo": "neko.cdi3.json"
+		"DisplayInfo": "neko.cdi3.json",
+		"Expressions": [
+			{"Name": "calm", "File": "expressions/calm.exp3.json"},
+			{"Name": "happy", "File": "expressions/happy.exp3.json"},
+			{"Name": "shy", "File": "expressions/shy.exp3.json"},
+			{"Name": "sad", "File": "expressions/sad.exp3.json"},
+			{"Name": "thinking", "File": "expressions/thinking.exp3.json"},
+			{"Name": "angry", "File": "expressions/angry.exp3.json"}
+		]
 	},
 	"Groups": [
 		{

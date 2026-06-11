@@ -25,12 +25,12 @@ from app.models import CalendarEvent, Character, DeviceRegistration, Experience,
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
-from app.pipeline import _tts_for_line, handle_event  # noqa: E402
+from app.pipeline import _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
 from app.push import register_device, send_proactive_push  # noqa: E402
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
-from app.schemas import EventIn, ProviderConfigIn  # noqa: E402
+from app.schemas import DialogueLine, EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
 from app.utils import dump_json  # noqa: E402
 
@@ -4672,3 +4672,23 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
     assert client.delete(f"/api/admin/calendar-events/{event['event_id']}").json()["ok"] is True
 
     assert client.delete(f"/api/admin/users/{user_id}").json()["ok"] is True
+
+
+def test_split_expression_tag_strips_inline_marker() -> None:
+    text, expression = _split_expression_tag("你好呀[shy]")
+    assert text == "你好呀"
+    assert expression == "shy"
+
+
+def test_dialogue_line_supports_expression_field() -> None:
+    line = DialogueLine(
+        line_id="line_test",
+        text="你好呀。",
+        emotion="happy",
+        pose="idle",
+        expression="shy",
+    )
+    payload = line.model_dump()
+    assert payload["expression"] == "shy"
+    restored = DialogueLine.model_validate(payload)
+    assert restored.expression == "shy"

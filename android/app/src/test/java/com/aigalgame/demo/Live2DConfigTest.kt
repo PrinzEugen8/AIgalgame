@@ -81,7 +81,9 @@ class Live2DConfigTest {
             mainKt.contains("modifier = Modifier\n                        .fillMaxSize()\n                        .zIndex(1f)"))
         assertTrue(mainKt.contains("PlacementEditInputOverlay"))
         assertTrue(mainKt.contains("editable = false"))
-        assertTrue(mainKt.contains("showEditBar = false"))
+        assertTrue(mainKt.contains("CharacterTapZone"))
+        assertTrue(mainKt.contains("HomeStandeeEditBar"))
+        assertFalse(mainKt.contains("padding(top = 104.dp, end = 18.dp)"))
         assertFalse(mainKt.contains("padding(start = 16.dp, top = 88.dp, end = 16.dp)"))
         assertFalse(mainKt.contains("Color(0x22FFFFFF)"))
         assertTrue(stageKt.contains("showCharacter"))
@@ -133,6 +135,21 @@ class Live2DConfigTest {
         assertEquals("hand", config.hitAreas.first { it.contains(0.2f, 0.5f) }.id)
         assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Flirty })
         assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Boundary })
+    }
+
+    @Test
+    fun stageTapLayerAppliesModifierChain() {
+        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
+        assertTrue(stageKt.contains("modifier = modifier.pointerInput"))
+        assertTrue(stageKt.contains("fun CharacterTapZone"))
+    }
+
+    @Test
+    fun hitTestMapsPlacementAdjustedCoordinates() {
+        val centered = Live2DHitTest.mapScreenToModelSpace(0.5f, 0.4f, OutfitPlacement())
+        val shifted = Live2DHitTest.mapScreenToModelSpace(0.5f, 0.4f, OutfitPlacement(scale = 1.4f, offsetX = 40f))
+        assertTrue(centered.first in 0.3f..0.7f)
+        assertTrue(shifted.first != centered.first || shifted.second != centered.second)
     }
 
     @Test

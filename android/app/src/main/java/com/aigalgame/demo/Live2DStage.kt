@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -28,9 +29,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.max
+import kotlin.math.roundToInt
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.Lifecycle
@@ -61,7 +65,9 @@ fun Live2DStage(
     stageMode: String = "home",
     showCharacter: Boolean = true,
     live2DVisible: Boolean = true,
-    onRendererStatus: (OfficialLive2DRendererStatus) -> Unit = {}
+    onRendererStatus: (OfficialLive2DRendererStatus) -> Unit = {},
+    tapBridge: Live2DTapBridge? = null,
+    useInternalTapLayer: Boolean = true
 ) {
     val context = LocalContext.current
     val controller = remember(character) { Live2DController(context, character) }
@@ -113,10 +119,31 @@ fun Live2DStage(
         val reaction = controller.handleTap(
             normalizedX = normalizedX.coerceIn(0f, 1f),
             normalizedY = normalizedY.coerceIn(0f, 1f),
+            placement = effectivePlacement,
             relation = relation,
             nowMs = System.currentTimeMillis()
         )
         if (reaction != null) onReaction(reaction)
+    }
+
+    DisposableEffect(tapBridge) {
+        tapBridge?.setHandler { normalizedX, normalizedY ->
+            handleStageTap(normalizedX, normalizedY)
+        }
+        onDispose {
+            tapBridge?.setHandler(null)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(50L)
+            val nowMs = System.currentTimeMillis()
+            controller.tickLookDecay(nowMs)
+            if (character != Live2DCharacterConfigs.DefaultCharacter) {
+                nekoController.tickLookDecay(nowMs)
+            }
+        }
     }
 
     val hostState = if (state.character == Live2DCharacterConfigs.DefaultCharacter && state.rendererMode == CharacterRendererMode.Live2D) {
@@ -160,7 +187,12 @@ fun Live2DStage(
                     .fillMaxSize()
                     .zIndex(1f)
             )
-            if (stageMode == "home" && showLive2DCharacter && live2dReady && !editable) {
+            if (
+                useInternalTapLayer &&
+                showLive2DCharacter &&
+                live2dReady &&
+                !editable
+            ) {
                 StageTapLayer(
                     onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
                     modifier = Modifier
@@ -362,12 +394,45 @@ private fun Live2DLoadingLayer(modifier: Modifier = Modifier) {
 }
 
 @Composable
+fun CharacterTapZone(
+    enabled: Boolean,
+    headerBottomPx: Int,
+    panelTopPx: Int,
+    onTap: (Float, Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (!enabled || panelTopPx <= headerBottomPx) return
+
+    val density = LocalDensity.current
+    val topPx = headerBottomPx.coerceAtLeast(0)
+    val heightPx = max(panelTopPx - headerBottomPx, 1)
+
+    BoxWithConstraints(modifier) {
+        val screenWidthPx = with(density) { maxWidth.toPx() }
+        val screenHeightPx = with(density) { maxHeight.toPx() }
+        Box(
+            Modifier
+                .offset { IntOffset(0, topPx) }
+                .fillMaxWidth()
+                .height(with(density) { heightPx.toDp() })
+                .pointerInput(enabled, topPx, heightPx, screenWidthPx, screenHeightPx) {
+                    detectTapGestures { offset ->
+                        val screenX = offset.x / screenWidthPx.coerceAtLeast(1f)
+                        val screenY = (topPx + offset.y) / screenHeightPx.coerceAtLeast(1f)
+                        onTap(screenX.coerceIn(0f, 1f), screenY.coerceIn(0f, 1f))
+                    }
+                }
+        )
+    }
+}
+
+@Composable
 private fun StageTapLayer(
     onTap: (Float, Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Box(
-        modifier.pointerInput(Unit) {
+        modifier = modifier.pointerInput(Unit) {
             detectTapGestures { offset ->
                 onTap(
                     offset.x / size.width.coerceAtLeast(1).toFloat(),

@@ -14,6 +14,7 @@ import com.live2d.sdk.cubism.framework.math.CubismMatrix44;
 import com.live2d.sdk.cubism.framework.model.CubismModel;
 import com.live2d.sdk.cubism.framework.model.CubismModelMultiplyAndScreenColor;
 import com.live2d.sdk.cubism.framework.model.CubismUserModel;
+import com.live2d.sdk.cubism.framework.motion.CubismExpressionMotion;
 import com.live2d.sdk.cubism.framework.rendering.CubismRenderer;
 import com.live2d.sdk.cubism.framework.rendering.android.CubismRendererAndroid;
 
@@ -25,9 +26,11 @@ import java.util.Map;
 
 final class NekoLive2DModel extends CubismUserModel {
     private static final int MAX_RUNTIME_TEXTURE_EDGE = 2048;
+    private static final int EXPRESSION_PRIORITY = 2;
 
     private final Context appContext;
     private final Map<String, Integer> parameterIndices = new HashMap<String, Integer>();
+    private final Map<String, CubismExpressionMotion> expressionMotions = new HashMap<String, CubismExpressionMotion>();
     private ICubismModelSetting modelSetting;
     private String modelHomeDirectory = "";
     private float elapsedSeconds;
@@ -36,6 +39,11 @@ final class NekoLive2DModel extends CubismUserModel {
     private float smoothedLookY;
     private float motionPulse;
     private long lastCommandNonce = Long.MIN_VALUE;
+    private String activeExpression = "";
+    private float smoothedDroopyEye;
+    private float smoothedDroopyBrow;
+    private float smoothedPupilSize;
+    private float idleSway;
 
     NekoLive2DModel(Context context) {
         appContext = context.getApplicationContext();
@@ -73,6 +81,7 @@ final class NekoLive2DModel extends CubismUserModel {
         }
 
         indexParameters();
+        loadExpressions();
         CubismRenderer renderer = CubismRendererAndroid.create(Math.max(width, 1), Math.max(height, 1));
         renderer.setModelColor(1.0f, 1.0f, 1.0f, 1.0f);
         setupRenderer(renderer);
@@ -85,6 +94,8 @@ final class NekoLive2DModel extends CubismUserModel {
     void deleteModel() {
         delete();
         parameterIndices.clear();
+        expressionMotions.clear();
+        activeExpression = "";
         isInitialized(false);
     }
 
@@ -122,7 +133,7 @@ final class NekoLive2DModel extends CubismUserModel {
             lastCommandNonce = command.getCommandNonce();
             motionPulse = 1.0f;
         }
-        motionPulse = approach(motionPulse, 0.0f, deltaSeconds * 2.8f);
+        motionPulse = approach(motionPulse, 0.0f, deltaSeconds * 1.8f);
 
         String emotion = command == null ? "calm" : normalize(command.getEmotion());
         String motion = command == null ? "idle" : normalize(command.getMotion());
@@ -135,9 +146,12 @@ final class NekoLive2DModel extends CubismUserModel {
         smoothedMouth = smooth(smoothedMouth, targetMouth, 0.45f);
         smoothedLookX = smooth(smoothedLookX, lookX, 0.18f);
         smoothedLookY = smooth(smoothedLookY, lookY, 0.18f);
+        idleSway = (float) Math.sin(elapsedSeconds * 0.85f) * 0.35f;
 
         model.loadParameters();
-        applyPoseParameters(emotion, motion);
+        applyExpression(emotion);
+        expressionManager.updateMotion(model, deltaSeconds);
+        applyPoseParameters(emotion, motion, deltaSeconds);
         if (physics != null) {
             physics.evaluate(model, deltaSeconds);
         }
@@ -155,6 +169,53 @@ final class NekoLive2DModel extends CubismUserModel {
         CubismMatrix44.multiply(modelMatrix.getArray(), matrix.getArray(), matrix.getArray());
         renderer.setMvpMatrix(matrix);
         renderer.drawModel();
+    }
+
+    private void loadExpressions() {
+        expressionMotions.clear();
+        if (modelSetting == null) {
+            return;
+        }
+        for (int i = 0; i < modelSetting.getExpressionCount(); i++) {
+            String name = normalize(modelSetting.getExpressionName(i));
+            String file = modelSetting.getExpressionFileName(i);
+            if (name.isEmpty() || file == null || file.isEmpty()) {
+                continue;
+            }
+            byte[] buffer = OfficialLive2DRenderer.readAsset(appContext, modelHomeDirectory + file);
+            if (buffer == null || buffer.length == 0) {
+                continue;
+            }
+            CubismExpressionMotion motion = loadExpression(buffer);
+            if (motion != null) {
+                expressionMotions.put(name, motion);
+            }
+        }
+    }
+
+    private void applyExpression(String emotion) {
+        String mapped = mapExpressionName(emotion);
+        if (mapped.equals(activeExpression)) {
+            return;
+        }
+        activeExpression = mapped;
+        CubismExpressionMotion motion = expressionMotions.get(mapped);
+        if (motion == null) {
+            motion = expressionMotions.get("calm");
+        }
+        if (motion != null) {
+            expressionManager.startMotionPriority(motion, EXPRESSION_PRIORITY);
+        }
+    }
+
+    private String mapExpressionName(String emotion) {
+        if (expressionMotions.containsKey(emotion)) {
+            return emotion;
+        }
+        if ("sleep".equals(emotion) && expressionMotions.containsKey("calm")) {
+            return "calm";
+        }
+        return expressionMotions.containsKey("calm") ? "calm" : emotion;
     }
 
     private void setupTextures() {
@@ -224,16 +285,23 @@ final class NekoLive2DModel extends CubismUserModel {
         }
     }
 
-    private void applyPoseParameters(String emotion, String motion) {
+    private void applyPoseParameters(String emotion, String motion, float deltaSeconds) {
         float pulse = motionPulse * motionMultiplier(motion);
         float breath = (float) Math.sin(elapsedSeconds * 2.0f) * 0.5f + 0.5f;
         float blinkOpen = blinkOpenValue(emotion);
         float mouthForm = mouthFormFor(emotion);
         float browY = browYFor(emotion);
         float browForm = browFormFor(emotion);
-        float angleX = smoothedLookX * 28.0f + pulse * 4.0f;
-        float angleY = smoothedLookY * 18.0f - ("shy".equals(emotion) ? 4.0f : 0.0f);
+        float droopyEye = droopyEyeFor(emotion);
+        float droopyBrow = droopyBrowFor(emotion);
+        float pupilSize = pupilSizeFor(emotion);
+        float angleX = smoothedLookX * 28.0f + pulse * 4.0f + idleSway;
+        float angleY = smoothedLookY * 18.0f - ("shy".equals(emotion) ? 4.0f : 0.0f) + ("thinking".equals(emotion) ? 2.5f : 0.0f);
         float angleZ = -smoothedLookX * 8.0f + pulse * 2.0f;
+
+        smoothedDroopyEye = smoothToward(smoothedDroopyEye, droopyEye, deltaSeconds, 3.2f);
+        smoothedDroopyBrow = smoothToward(smoothedDroopyBrow, droopyBrow, deltaSeconds, 3.2f);
+        smoothedPupilSize = smoothToward(smoothedPupilSize, pupilSize, deltaSeconds, 3.2f);
 
         setParam("ParamMouthOpenY", smoothedMouth);
         setParam("ParamMouthForm", mouthForm);
@@ -243,15 +311,18 @@ final class NekoLive2DModel extends CubismUserModel {
         setParam("ParamEyeLOpen", blinkOpen);
         setParam("ParamEyeROpen", blinkOpen);
         setParam("ParamEyeBallX", smoothedLookX);
-        setParam("ParamEyeBallY", smoothedLookY);
+        setParam("ParamEyeBallY", smoothedLookY + ("thinking".equals(emotion) ? 0.12f : 0.0f));
         setParam("ParamBrowLY", browY);
         setParam("ParamBrowRY", browY);
         setParam("ParamBrowLForm", browForm);
         setParam("ParamBrowRForm", browForm);
-        setParam("ParamBodyAngleX", smoothedLookX * 8.0f + pulse * 3.0f);
+        setParam("ParamBodyAngleX", smoothedLookX * 8.0f + pulse * 3.0f + idleSway * 0.6f);
         setParam("ParamBodyAngleY", smoothedLookY * 5.0f);
         setParam("ParamBodyAngleZ", -smoothedLookX * 3.0f);
         setParam("ParamBreath", breath);
+        setParam("Param44", smoothedDroopyEye);
+        setParam("Param45", smoothedDroopyBrow);
+        setParam("Param46", smoothedPupilSize);
     }
 
     private void setParam(String id, float value) {
@@ -289,6 +360,7 @@ final class NekoLive2DModel extends CubismUserModel {
         if ("sad".equals(emotion)) return -0.45f;
         if ("angry".equals(emotion)) return -0.65f;
         if ("sleep".equals(emotion)) return -0.2f;
+        if ("thinking".equals(emotion)) return -0.1f;
         return 0.0f;
     }
 
@@ -309,6 +381,24 @@ final class NekoLive2DModel extends CubismUserModel {
         return 0.0f;
     }
 
+    private static float droopyEyeFor(String emotion) {
+        if ("shy".equals(emotion)) return 0.55f;
+        if ("sad".equals(emotion)) return 0.45f;
+        return 0.0f;
+    }
+
+    private static float droopyBrowFor(String emotion) {
+        if ("shy".equals(emotion)) return 0.35f;
+        if ("sad".equals(emotion)) return 0.25f;
+        return 0.0f;
+    }
+
+    private static float pupilSizeFor(String emotion) {
+        if ("shy".equals(emotion)) return -0.25f;
+        if ("angry".equals(emotion)) return 0.15f;
+        return 0.0f;
+    }
+
     private static float motionMultiplier(String motion) {
         if (motion.contains("taphead")) return 1.0f;
         if (motion.contains("taphand")) return 0.7f;
@@ -320,6 +410,10 @@ final class NekoLive2DModel extends CubismUserModel {
 
     private static float smooth(float current, float target, float ratio) {
         return current + (target - current) * clamp(ratio, 0.0f, 1.0f);
+    }
+
+    private static float smoothToward(float current, float target, float deltaSeconds, float speed) {
+        return approach(current, target, deltaSeconds * speed);
     }
 
     private static float approach(float current, float target, float delta) {

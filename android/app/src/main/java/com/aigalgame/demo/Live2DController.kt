@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.IOException
+import kotlin.math.abs
 import kotlin.math.max
 
 data class Live2DRenderState(
@@ -48,6 +49,7 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
     private var config: Live2DCharacterConfig = Live2DCharacterConfigs.forCharacter(Live2DCharacterConfigs.DefaultCharacter)
     private val cooldownUntilByHitArea = mutableMapOf<String, Long>()
     private var commandNonce = 0L
+    private var lookResetAtMs = 0L
 
     var state by mutableStateOf(Live2DRenderState())
         private set
@@ -108,30 +110,52 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         )
     }
 
-    fun handleTap(normalizedX: Float, normalizedY: Float, relation: RelationState, nowMs: Long): Live2DReaction? {
-        val hitArea = config.hitAreas.firstOrNull { it.contains(normalizedX, normalizedY) } ?: return null
+    fun handleTap(
+        normalizedX: Float,
+        normalizedY: Float,
+        placement: OutfitPlacement,
+        relation: RelationState,
+        nowMs: Long
+    ): Live2DReaction? {
+        val (modelX, modelY) = Live2DHitTest.mapScreenToModelSpace(normalizedX, normalizedY, placement)
+        val hitArea = config.hitAreas.firstOrNull { it.contains(modelX, modelY) } ?: return null
         val cooldownUntil = cooldownUntilByHitArea[hitArea.id] ?: 0L
         if (nowMs < cooldownUntil) return null
 
         val reactionConfig = chooseReaction(hitArea.id, relation, nowMs) ?: return null
         cooldownUntilByHitArea[hitArea.id] = nowMs + max(0L, reactionConfig.cooldownMs)
+        val tapMotion = chooseTapMotion(hitArea.id, nowMs)
         val reaction = Live2DReaction(
             hitArea = hitArea.id,
             intensity = reactionConfig.intensity,
-            motion = reactionConfig.motion,
+            motion = tapMotion.ifBlank { reactionConfig.motion },
             expression = reactionConfig.expression,
             text = chooseText(reactionConfig.localTextCandidates, nowMs),
             relationDelta = reactionConfig.relationDelta
         )
+        lookResetAtMs = nowMs + 2500L
         state = state.copy(
             motion = reaction.motion.ifBlank { state.motion },
             expression = reaction.expression.ifBlank { state.expression },
-            lookX = ((normalizedX - 0.5f) * 2f).coerceIn(-1f, 1f),
-            lookY = ((0.5f - normalizedY) * 2f).coerceIn(-1f, 1f),
+            lookX = ((modelX - 0.5f) * 2f).coerceIn(-1f, 1f),
+            lookY = ((0.5f - modelY) * 2f).coerceIn(-1f, 1f),
             lastHitArea = hitArea.id,
             commandNonce = nextCommandNonce(nowMs)
         )
         return reaction
+    }
+
+    fun tickLookDecay(nowMs: Long) {
+        if (state.lookX == 0f && state.lookY == 0f) return
+        if (nowMs < lookResetAtMs) return
+
+        val decayedX = state.lookX * 0.9f
+        val decayedY = state.lookY * 0.9f
+        if (abs(decayedX) < 0.02f && abs(decayedY) < 0.02f) {
+            state = state.copy(lookX = 0f, lookY = 0f, commandNonce = nextCommandNonce(nowMs))
+        } else {
+            state = state.copy(lookX = decayedX, lookY = decayedY, commandNonce = nextCommandNonce(nowMs))
+        }
     }
 
     private fun applyEmotionPose(
@@ -170,6 +194,21 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
             candidates.firstOrNull { it.intensity == desired }?.let { return it }
         }
         return candidates[(nowMs % candidates.size).toInt()]
+    }
+
+    private fun chooseTapMotion(hitArea: String, nowMs: Long): String {
+        val candidates = config.modelConfig.tapMotions.filter { it.hitArea == hitArea }
+        if (candidates.isEmpty()) return ""
+        val totalWeight = candidates.sumOf { it.weight.toDouble() }.toFloat().coerceAtLeast(0.01f)
+        val pick = (nowMs % 1000L) / 1000f * totalWeight
+        var cursor = 0f
+        for (candidate in candidates) {
+            cursor += candidate.weight
+            if (pick <= cursor) {
+                return candidate.motion
+            }
+        }
+        return candidates.last().motion
     }
 
     private fun chooseText(candidates: List<String>, nowMs: Long): String {

@@ -4,8 +4,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val aigalgameCompileSdk: Int = (findProperty("aigalgame.compileSdkOverride") as? String)?.toInt() ?: 36
-val aigalgameTargetSdk: Int = (findProperty("aigalgame.targetSdkOverride") as? String)?.toInt() ?: 36
+val aigalgameCompileSdk: Int = (findProperty("aigalgame.compileSdkOverride") as? String)?.toInt()
+    ?: (findProperty("PROP_COMPILE_SDK_VERSION") as? String)?.toInt()
+    ?: 35
+val aigalgameTargetSdk: Int = (findProperty("aigalgame.targetSdkOverride") as? String)?.toInt()
+    ?: (findProperty("PROP_TARGET_SDK_VERSION") as? String)?.toInt()
+    ?: 35
 
 android {
     namespace = "com.aigalgame.demo"

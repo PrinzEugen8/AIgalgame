@@ -42,6 +42,27 @@ object Live2DCharacterConfigs {
         "sleep" to "idle"
     )
 
+    private val nekoEmotionMap = mapOf(
+        "calm" to "calm",
+        "happy" to "happy",
+        "shy" to "shy",
+        "sad" to "sad",
+        "thinking" to "thinking",
+        "angry" to "angry",
+        "sleep" to "calm"
+    )
+
+    private val nekoTapMotions = listOf(
+        Live2DTapMotionConfig("head", "TapHead", 1.0f),
+        Live2DTapMotionConfig("head", "idle", 0.25f),
+        Live2DTapMotionConfig("chest", "TapChest", 1.0f),
+        Live2DTapMotionConfig("chest", "StepBack", 0.35f),
+        Live2DTapMotionConfig("hand", "TapHand", 1.0f),
+        Live2DTapMotionConfig("hand", "happy", 0.3f),
+        Live2DTapMotionConfig("body", "TapBody", 1.0f),
+        Live2DTapMotionConfig("body", "thinking", 0.3f)
+    )
+
     private val nekoModelConfig = Live2DModelConfig(
         name = "NEKO",
         assetPath = DefaultModelAssetPath,
@@ -49,15 +70,15 @@ object Live2DCharacterConfigs {
         initialXShift = 0f,
         initialYShift = 0f,
         idleMotionGroupName = "",
-        emotionMap = emptyMap(),
-        tapMotions = emptyList()
+        emotionMap = nekoEmotionMap,
+        tapMotions = nekoTapMotions
     )
 
     private val defaultHitAreas = listOf(
-        Live2DHitArea("head", "head", left = 0.34f, top = 0.08f, right = 0.66f, bottom = 0.30f),
-        Live2DHitArea("chest", "chest", left = 0.37f, top = 0.34f, right = 0.63f, bottom = 0.52f),
-        Live2DHitArea("hand", "hand", left = 0.18f, top = 0.42f, right = 0.82f, bottom = 0.70f),
-        Live2DHitArea("body", "body", left = 0.30f, top = 0.30f, right = 0.70f, bottom = 0.82f)
+        Live2DHitArea("head", "head", left = 0.36f, top = 0.06f, right = 0.64f, bottom = 0.28f),
+        Live2DHitArea("chest", "chest", left = 0.38f, top = 0.30f, right = 0.62f, bottom = 0.50f),
+        Live2DHitArea("hand", "hand", left = 0.20f, top = 0.38f, right = 0.80f, bottom = 0.68f),
+        Live2DHitArea("body", "body", left = 0.32f, top = 0.28f, right = 0.68f, bottom = 0.80f)
     )
 
     private val defaultReactions = listOf(

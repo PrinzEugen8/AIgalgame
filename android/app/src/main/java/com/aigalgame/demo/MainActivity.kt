@@ -85,6 +85,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -933,6 +935,7 @@ fun AiGalgameApp(vm: MainViewModel) {
                             .zIndex(0f)
                     )
                 }
+                val live2DTapBridge = remember { Live2DTapBridge() }
                 Live2DStage(
                     background = vm.selectedBackground,
                     character = vm.selectedCharacter,
@@ -949,6 +952,8 @@ fun AiGalgameApp(vm: MainViewModel) {
                     showCharacter = stageShowsCharacter,
                     live2DVisible = vm.selectedCharacter == "neko" && stageShowsCharacter,
                     onRendererStatus = { vm.updateLive2DBootStatus(it) },
+                    tapBridge = live2DTapBridge,
+                    useInternalTapLayer = vm.screen == AppScreen.DressUp,
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(1f)
@@ -975,7 +980,12 @@ fun AiGalgameApp(vm: MainViewModel) {
                                 .padding(padding)
                         ) {
                             when (vm.screen) {
-                                AppScreen.Home -> HomeScreen(vm, showStage = false, showEditBar = false, modifier = Modifier.zIndex(2f))
+                                AppScreen.Home -> HomeScreen(
+                                    vm,
+                                    showStage = false,
+                                    tapBridge = live2DTapBridge,
+                                    modifier = Modifier.zIndex(2f)
+                                )
                                 AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
                                 AppScreen.Settings -> SettingsScreen(vm)
                                 AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
@@ -1006,17 +1016,6 @@ fun AiGalgameApp(vm: MainViewModel) {
                             modifier = Modifier
                                 .fillMaxSize()
                                 .zIndex(8f)
-                        )
-                    }
-                    if (vm.screen == AppScreen.Home) {
-                        HomeStandeeEditBar(
-                            editing = vm.standeeEditMode,
-                            onToggle = { vm.togglePlacementEdit() },
-                            onReset = { vm.resetPlacement() },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(top = 104.dp, end = 18.dp)
-                                .zIndex(9f)
                         )
                     }
                 }
@@ -1184,11 +1183,13 @@ fun AppBottomBar(vm: MainViewModel) {
 fun HomeScreen(
     vm: MainViewModel,
     showStage: Boolean = true,
-    showEditBar: Boolean = true,
+    tapBridge: Live2DTapBridge? = null,
     modifier: Modifier = Modifier
 ) {
     var input by remember { mutableStateOf("") }
     var historyExpanded by remember { mutableStateOf(false) }
+    var headerBottomPx by remember { mutableIntStateOf(0) }
+    var panelTopPx by remember { mutableIntStateOf(0) }
     val line = vm.currentLine()
     val visibleLine = vm.live2dReactionLine ?: line
     val lastLine = visibleLine ?: vm.lines.lastOrNull()
@@ -1220,20 +1221,23 @@ fun HomeScreen(
             )
         }
 
-        HomeHeader(
-            vm = vm,
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
+                .fillMaxWidth()
                 .padding(horizontal = 18.dp, vertical = 18.dp)
-        )
-        if (showEditBar) {
+                .onGloballyPositioned { coordinates ->
+                    headerBottomPx = coordinates.boundsInRoot().bottom.toInt()
+                }
+        ) {
+            HomeHeader(vm = vm, modifier = Modifier.fillMaxWidth())
             HomeStandeeEditBar(
                 editing = vm.standeeEditMode,
                 onToggle = { vm.togglePlacementEdit() },
                 onReset = { vm.resetPlacement() },
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 104.dp, end = 18.dp)
+                    .align(Alignment.End)
+                    .padding(top = 8.dp)
             )
         }
 
@@ -1254,6 +1258,24 @@ fun HomeScreen(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .padding(start = 14.dp, top = 12.dp, end = 14.dp, bottom = 12.dp + keyboardLift)
+                .onGloballyPositioned { coordinates ->
+                    panelTopPx = coordinates.boundsInRoot().top.toInt()
+                }
+        )
+
+        CharacterTapZone(
+            enabled = tapBridge != null &&
+                vm.live2dBootReady &&
+                vm.selectedCharacter == "neko" &&
+                !vm.standeeEditMode,
+            headerBottomPx = headerBottomPx,
+            panelTopPx = panelTopPx,
+            onTap = { normalizedX, normalizedY ->
+                tapBridge?.dispatch(normalizedX, normalizedY)
+            },
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(3f)
         )
 
         if (historyExpanded) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -107,6 +108,18 @@ def _build_recent_dialogue(session: Session, event: EventIn) -> str:
         if content:
             lines.append(f"{speaker}：{content[:120]}")
     return "\n".join(lines) or "暂无近期对话。"
+
+
+_EXPRESSION_TAG_RE = re.compile(r"\[(happy|shy|thinking|calm|sad|angry)\]", re.IGNORECASE)
+
+
+def _split_expression_tag(text: str) -> tuple[str, str]:
+    match = _EXPRESSION_TAG_RE.search(text or "")
+    if not match:
+        return text, ""
+    expression = match.group(1).lower()
+    cleaned = _EXPRESSION_TAG_RE.sub("", text).strip()
+    return cleaned, expression
 
 
 def _summary_text(value: str, limit: int = 120) -> str:
@@ -879,7 +892,8 @@ def _llm_dialogue(
 {{
   "reply_mode": "silent|light|normal|key_moment",
   "pace_reason": "为什么这次选择这个节奏",
-  "lines": [{{"text": "短中文台词", "emotion": "happy|shy|thinking|calm|sad", "pose": "idle|happy|shy|thinking"}}],
+  "lines": [{{"text": "短中文台词", "emotion": "happy|shy|thinking|calm|sad", "pose": "idle|happy|shy|thinking", "expression": "happy|shy|thinking|calm|sad|angry|"}}],
+expression 可留空；需要更强面部表现时填写，与 emotion 可不同。也可在 text 内写 [shy] 这类标签。
   "normal_replies": [{{"text": "用户可选回复"}}],
   "key_reply_score": 0,
   "key_reply_reason": "为什么这次需要或不需要特殊回复",
@@ -1035,7 +1049,11 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
     )
     for item in (result.get("lines") or [])[:max_lines]:
         line_emotion = str(item.get("emotion") or "calm")
+        line_expression = str(item.get("expression") or "").strip()
         line_text = " ".join(str(item.get("text") or "").split()).strip()
+        line_text, inline_expression = _split_expression_tag(line_text)
+        if not line_expression:
+            line_expression = inline_expression
         ja_candidate = str(item.get("tts_text_ja") or item.get("tts_text") or item.get("ja") or "").strip()
         if not _has_tts_readable_text(line_text):
             continue
@@ -1063,6 +1081,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                 text=line_text,
                 emotion=line_emotion,
                 pose=str(item.get("pose") or "idle"),
+                expression=line_expression,
                 tts_audio_url=tts_url,
                 tts_error=tts_error,
             )

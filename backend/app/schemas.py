@@ -121,6 +121,7 @@ class DialogueLine(BaseModel):
     text: str
     emotion: str = "calm"
     pose: str = "idle"
+    expression: str = ""
     background: str = "classroom_sakura"
     tts_audio_url: str = ""
     tts_error: str = ""
