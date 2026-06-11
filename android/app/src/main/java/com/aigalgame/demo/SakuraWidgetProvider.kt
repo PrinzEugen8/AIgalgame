@@ -14,18 +14,25 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 
 class SakuraWidgetProvider : AppWidgetProvider() {
+    override fun onEnabled(context: Context) {
+        refreshNow(context)
+    }
+
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         appWidgetIds.forEach { id ->
             updateWidget(context, appWidgetManager, id, "小樱", "想聊天", "今天也想听你说说话。", 0, "", null)
         }
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            "sakura_widget_refresh_once",
-            ExistingWorkPolicy.REPLACE,
-            OneTimeWorkRequestBuilder<NotificationWorker>().build()
-        )
+        enqueueRefresh(context)
     }
 
     companion object {
+        fun refreshNow(context: Context) {
+            val manager = AppWidgetManager.getInstance(context)
+            val ids = manager.getAppWidgetIds(ComponentName(context, SakuraWidgetProvider::class.java))
+            ids.forEach { updateWidget(context, manager, it, "小樱", "想聊天", "今天也想听你说说话。", 0, "", null) }
+            enqueueRefresh(context)
+        }
+
         fun updateAll(context: Context, name: String, status: String, bubble: String, unreadCount: Int, proactiveEventId: String = "", chibi: Bitmap? = null) {
             val manager = AppWidgetManager.getInstance(context)
             val ids = manager.getAppWidgetIds(ComponentName(context, SakuraWidgetProvider::class.java))
@@ -68,6 +75,14 @@ class SakuraWidgetProvider : AppWidgetProvider() {
             )
             views.setOnClickPendingIntent(R.id.widget_root, pending)
             manager.updateAppWidget(id, views)
+        }
+
+        private fun enqueueRefresh(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "sakura_widget_refresh_once",
+                ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<NotificationWorker>().build()
+            )
         }
     }
 }

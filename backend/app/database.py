@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
@@ -14,9 +14,19 @@ class Base(DeclarativeBase):
 
 engine = create_engine(
     f"sqlite:///{settings.db_path}",
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
     future=True,
 )
+
+
+@event.listens_for(engine, "connect")
+def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
 
 
@@ -32,6 +42,9 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA busy_timeout=30000"))
     _upgrade_sqlite_schema()
 
 
@@ -39,6 +52,12 @@ def _upgrade_sqlite_schema() -> None:
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
     with engine.begin() as conn:
+        if "users" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("users")}
+            if "proactive_next_check_at" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN proactive_next_check_at VARCHAR DEFAULT ''"))
+            if "proactive_judgement_json" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN proactive_judgement_json TEXT DEFAULT '{}'"))
         if "moment_interactions" in table_names:
             columns = {item["name"] for item in inspector.get_columns("moment_interactions")}
             if "actor_name" not in columns:
@@ -76,3 +95,20 @@ def _upgrade_sqlite_schema() -> None:
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE proactive_events ADD COLUMN {name} {definition}"))
+        if "trend_radar_snapshots" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("trend_radar_snapshots")}
+            additions = {
+                "provider_id": "VARCHAR DEFAULT ''",
+                "local_date": "VARCHAR DEFAULT ''",
+                "status": "VARCHAR DEFAULT 'ok'",
+                "generated_at": "VARCHAR DEFAULT ''",
+                "fetched_at": "VARCHAR DEFAULT ''",
+                "endpoint": "VARCHAR DEFAULT ''",
+                "error_message": "TEXT DEFAULT ''",
+                "payload_json": "TEXT DEFAULT '{}'",
+                "created_at": "VARCHAR DEFAULT ''",
+                "updated_at": "VARCHAR DEFAULT ''",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE trend_radar_snapshots ADD COLUMN {name} {definition}"))

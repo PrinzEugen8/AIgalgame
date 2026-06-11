@@ -7,18 +7,23 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .availability import get_user_availability, is_event_in_busy_window, is_user_unavailable
 from .diagnostics import write_diagnostic
-from .models import Character, ProactiveEvent, User
-from .providers import VolcArkWebSearchClient, get_enabled_provider, provider_ready
+from .models import Character, ProactiveEvent, ProviderConfig, User
+from .news import trend_radar_payload_for_news
+from .proactive_rules import build_judge_messages
+from .providers import OpenAICompatibleClient, ProviderError, VolcArkWebSearchClient, get_enabled_provider, get_task_llm_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
 from .weather import ensure_weather_candidate
 
 
 PROACTIVE_STATUSES = {"pending", "delivered", "opened", "reflected", "expired", "dismissed"}
-PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather"}
-MAX_DAILY_DELIVERIES = 3
-MIN_DELIVERY_GAP = timedelta(minutes=90)
+PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather", "calendar_event", "appointment"}
 DEFAULT_EXPIRY = timedelta(days=2)
+PROACTIVE_JUDGE_CANDIDATE_LIMIT = 8
+JUDGE_TEXT_LIMIT = 180
+ON_TIME_DELIVERY_WINDOW = timedelta(minutes=10)
+SOURCE_TYPE_RANK = {"appointment": 0, "calendar_event": 1, "schedule": 2, "weather": 3, "news": 4, "moment_interaction": 5, "memory": 6}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -240,6 +245,245 @@ def create_memory_proactive_event(
     )
 
 
+def _news_topic_records(session: Session, *, user_id: str, topics: list[str], now_local: datetime) -> tuple[list[dict[str, Any]], list[ProactiveEvent]]:
+    records: list[dict[str, Any]] = []
+    existing_events: list[ProactiveEvent] = []
+    seen: set[str] = set()
+    for topic in topics:
+        normalized = " ".join(topic.split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        dedupe_key = f"news:{user_id}:{normalized}:{now_local.date().isoformat()}"
+        existing = session.execute(
+            select(ProactiveEvent).where(ProactiveEvent.user_id == user_id, ProactiveEvent.dedupe_key == dedupe_key)
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing_events.append(existing)
+            continue
+        records.append({"topic": normalized, "dedupe_key": dedupe_key})
+    return records, existing_events
+
+
+def _normalize_match_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _topic_matches(topic: str, haystack: str) -> bool:
+    normalized_topic = _normalize_match_text(topic)
+    normalized_haystack = _normalize_match_text(haystack)
+    if not normalized_topic or not normalized_haystack:
+        return False
+    tokens = normalized_topic.split()
+    if len(tokens) > 1:
+        return all(token in normalized_haystack for token in tokens)
+    return normalized_topic in normalized_haystack
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _trend_radar_score(trend: dict[str, Any], title: dict[str, Any]) -> int:
+    ranks = [rank for rank in title.get("ranks") or [] if isinstance(rank, int)]
+    best_rank = min(ranks) if ranks else 999
+    rank_score = max(0, 45 - best_rank * 3)
+    new_score = 55 if title.get("is_new") else 0
+    trend_score = min(_as_int(trend.get("match_count")), 60)
+    appearance_score = min(_as_int(title.get("appearance_count"), 1) * 4, 32)
+    return new_score + rank_score + trend_score + appearance_score
+
+
+def _related_trend_sources(trend: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for item in trend.get("titles") or []:
+        if not isinstance(item, dict):
+            continue
+        sources.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "source": str(item.get("source") or ""),
+                "ranks": item.get("ranks") or [],
+                "is_new": bool(item.get("is_new")),
+                "appearance_count": _as_int(item.get("appearance_count"), 1),
+                "time_info": str(item.get("time_info") or ""),
+            }
+        )
+        if len(sources) >= limit:
+            break
+    return sources
+
+
+def _trend_radar_max_titles(config: ProviderConfig) -> int:
+    metadata = load_json(config.metadata_json, {})
+    return max(1, min(_as_int(metadata.get("max_titles"), 3), 10))
+
+
+def _ensure_trend_radar_news_candidate(
+    session: Session,
+    *,
+    config: ProviderConfig,
+    user_id: str,
+    character_id: str,
+    topic_records: list[dict[str, Any]],
+    now_local: datetime,
+) -> ProactiveEvent | None:
+    if not provider_ready(config):
+        write_diagnostic("proactive_news_skipped", reason="trend_radar_not_ready", provider_id=config.provider_id, user_id=user_id)
+        return None
+    try:
+        payload = trend_radar_payload_for_news(session, config=config, local_time=now_local)
+    except Exception as exc:  # noqa: BLE001
+        write_diagnostic(
+            "proactive_news_skipped",
+            reason="trend_radar_error",
+            provider_id=config.provider_id,
+            user_id=user_id,
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+        return None
+    if not payload:
+        write_diagnostic("proactive_news_skipped", reason="trend_radar_no_snapshot", provider_id=config.provider_id, user_id=user_id)
+        return None
+    best: dict[str, Any] | None = None
+    for record in topic_records:
+        topic = str(record["topic"])
+        for trend in payload.get("trends") or []:
+            if not isinstance(trend, dict):
+                continue
+            keyword_group = str(trend.get("keyword_group") or "")
+            for title in trend.get("titles") or []:
+                if not isinstance(title, dict):
+                    continue
+                haystack = " ".join([keyword_group, str(title.get("title") or ""), str(title.get("source") or "")])
+                if not _topic_matches(topic, haystack):
+                    continue
+                score = _trend_radar_score(trend, title)
+                if best is None or score > int(best["score"]):
+                    best = {"score": score, "record": record, "trend": trend, "title": title}
+    if best is None:
+        write_diagnostic("proactive_news_skipped", reason="trend_radar_no_match", user_id=user_id, topics=[item["topic"] for item in topic_records])
+        return None
+
+    record = best["record"]
+    trend = best["trend"]
+    title = best["title"]
+    topic = str(record["topic"])
+    related_sources = _related_trend_sources(trend, limit=_trend_radar_max_titles(config))
+    first_source = related_sources[0] if related_sources else {}
+    headline = str(title.get("title") or "").strip()
+    source_name = str(title.get("source") or "").strip()
+    summary = headline if not source_name else f"{headline}（{source_name}）"
+    priority = min(89, 66 + int(best["score"]) // 6)
+    return create_proactive_event(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        source_type="news",
+        source_id=str(title.get("url") or ""),
+        title="小樱看到了一条热点",
+        text=f"我刚看到和「{topic}」有关的热点：{summary}",
+        priority=priority,
+        dedupe_key=str(record["dedupe_key"]),
+        payload={
+            "topic": topic,
+            "keyword_group": str(trend.get("keyword_group") or ""),
+            "generated_at": str(payload.get("generated_at") or ""),
+            "source": source_name,
+            "ranks": title.get("ranks") or [],
+            "time_info": str(title.get("time_info") or ""),
+            "match_count": _as_int(trend.get("match_count")),
+            "sources": related_sources,
+            "summary": summary,
+            "trend_radar": {
+                "total_titles_processed": payload.get("total_titles_processed") or 0,
+                "failed_sources": payload.get("failed_sources") or [],
+                "report_image_url": payload.get("report_image_url") or "",
+            },
+            "first_source": first_source,
+        },
+        expires_at=now_local.astimezone(timezone.utc) + timedelta(hours=18),
+    )
+
+
+def _ark_search_candidates(session: Session, primary: ProviderConfig | None) -> list[ProviderConfig]:
+    candidates: list[ProviderConfig] = []
+    if primary is not None and primary.provider == "volc_ark_web_search":
+        candidates.append(primary)
+    for item in session.execute(
+        select(ProviderConfig)
+        .where(
+            ProviderConfig.kind == "search",
+            ProviderConfig.provider == "volc_ark_web_search",
+            ProviderConfig.enabled == True,  # noqa: E712
+        )
+        .order_by(ProviderConfig.enabled.desc(), ProviderConfig.updated_at.desc())
+    ).scalars():
+        if all(existing.provider_id != item.provider_id for existing in candidates):
+            candidates.append(item)
+    return candidates
+
+
+def _ensure_ark_news_candidate(
+    session: Session,
+    *,
+    primary: ProviderConfig | None,
+    user_id: str,
+    character_id: str,
+    topic_records: list[dict[str, Any]],
+    now_local: datetime,
+) -> ProactiveEvent | None:
+    candidates = _ark_search_candidates(session, primary)
+    if not candidates:
+        write_diagnostic("proactive_news_skipped", reason="ark_search_not_configured", user_id=user_id)
+        return None
+    last_error: Exception | None = None
+    for record in reversed(topic_records):
+        topic = str(record["topic"])
+        for search in candidates:
+            try:
+                result = VolcArkWebSearchClient(search).search(
+                    f"请联网搜索与「{topic}」相关的最新内容，必须返回标题、链接、发布时间。",
+                    require_published_at=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                continue
+            sources = result.get("sources") or []
+            if not sources or not sources[0].get("published_at"):
+                write_diagnostic("proactive_news_skipped", reason="missing_verifiable_source", topic=topic)
+                continue
+            first = sources[0]
+            summary = str(result.get("summary") or first.get("title") or "").strip()
+            return create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                source_type="news",
+                source_id=str(first.get("url") or ""),
+                title="小樱看到了一条新消息",
+                text=f"我刚看到和「{topic}」有关的新内容：{summary}",
+                priority=80,
+                dedupe_key=str(record["dedupe_key"]),
+                payload={"topic": topic, "sources": sources[:3], "summary": summary},
+                expires_at=now_local.astimezone(timezone.utc) + timedelta(hours=18),
+            )
+    if last_error is not None:
+        write_diagnostic(
+            "proactive_news_skipped",
+            reason="search_error",
+            user_id=user_id,
+            error_type=type(last_error).__name__,
+            message=str(last_error),
+        )
+    return None
+
+
 def ensure_news_candidate(session: Session, *, user_id: str, character_id: str, local_time: datetime | None = None) -> ProactiveEvent | None:
     user = session.get(User, user_id)
     if user is None or not user.news_enabled:
@@ -248,67 +492,416 @@ def ensure_news_candidate(session: Session, *, user_id: str, character_id: str, 
     if not topics:
         return None
     now_local = _local_now(user, local_time)
-    topic = topics[-1]
-    topic_key = f"news:{user_id}:{topic}:{now_local.date().isoformat()}"
-    existing = session.execute(
-        select(ProactiveEvent).where(ProactiveEvent.user_id == user_id, ProactiveEvent.dedupe_key == topic_key)
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
+    topic_records, existing_events = _news_topic_records(session, user_id=user_id, topics=topics, now_local=now_local)
+    if not topic_records:
+        return existing_events[-1] if existing_events else None
     search = get_enabled_provider(session, "search")
     if search is None:
-        write_diagnostic("proactive_news_skipped", reason="search_not_configured", user_id=user_id, topic=topic)
-        return None
-    if search.provider != "volc_ark_web_search" or not provider_ready(search):
-        write_diagnostic("proactive_news_skipped", reason="search_not_ready", provider_id=search.provider_id, topic=topic)
-        return None
-    try:
-        result = VolcArkWebSearchClient(search).search(
-            f"请联网搜索与「{topic}」相关的最新内容，必须返回标题、链接、发布时间。",
-            require_published_at=True,
+        write_diagnostic("proactive_news_skipped", reason="search_not_configured", user_id=user_id)
+        return _ensure_ark_news_candidate(session, primary=None, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
+    if search.provider == "trend_radar":
+        event = _ensure_trend_radar_news_candidate(
+            session,
+            config=search,
+            user_id=user_id,
+            character_id=character_id,
+            topic_records=topic_records,
+            now_local=now_local,
         )
-    except Exception as exc:  # noqa: BLE001
-        write_diagnostic("proactive_news_skipped", reason="search_error", topic=topic, error_type=type(exc).__name__, message=str(exc))
-        return None
-    sources = result.get("sources") or []
-    if not sources or not sources[0].get("published_at"):
-        write_diagnostic("proactive_news_skipped", reason="missing_verifiable_source", topic=topic)
-        return None
-    first = sources[0]
-    summary = str(result.get("summary") or first.get("title") or "").strip()
-    text = f"我刚看到和「{topic}」有关的新内容：{summary}"
-    return create_proactive_event(
-        session,
-        user_id=user_id,
-        character_id=character_id,
-        source_type="news",
-        source_id=str(first.get("url") or ""),
-        title="小樱看到了一条新消息",
-        text=text,
-        priority=80,
-        dedupe_key=topic_key,
-        payload={"topic": topic, "sources": sources[:3], "summary": summary},
-        expires_at=now_local.astimezone(timezone.utc) + timedelta(hours=18),
-    )
+        if event is not None:
+            return event
+        return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
+    if search.provider == "volc_ark_web_search":
+        return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
+    write_diagnostic("proactive_news_skipped", reason="search_not_ready", provider_id=search.provider_id, provider=search.provider)
+    return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
 
 
-def _next_due_pending(session: Session, *, user_id: str, character_id: str, now_utc: datetime) -> ProactiveEvent | None:
+def _event_payload(event: ProactiveEvent) -> dict[str, Any]:
+    payload = load_json(event.payload_json, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _source_type_rank(source_type: str) -> int:
+    return SOURCE_TYPE_RANK.get(source_type, 9)
+
+
+def _due_pending_events(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    now_utc: datetime,
+    now_local: datetime | None = None,
+    user: User | None = None,
+    appointment_only: bool = False,
+    limit: int = PROACTIVE_JUDGE_CANDIDATE_LIMIT,
+) -> list[ProactiveEvent]:
     events = session.execute(
-        select(ProactiveEvent)
-        .where(
+        select(ProactiveEvent).where(
             ProactiveEvent.user_id == user_id,
             ProactiveEvent.character_id == character_id,
             ProactiveEvent.status == "pending",
         )
-        .order_by(ProactiveEvent.priority.desc(), ProactiveEvent.created_at)
     ).scalars().all()
+    due: list[ProactiveEvent] = []
     for event in events:
+        if appointment_only and event.source_type != "appointment":
+            continue
         scheduled_at = _parse_iso(event.scheduled_at) or now_utc
         if scheduled_at.tzinfo is None:
             scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-        if scheduled_at <= now_utc:
+        if scheduled_at > now_utc:
+            continue
+        payload = _event_payload(event)
+        if now_local is not None and is_event_in_busy_window(payload, now_local):
+            continue
+        due.append(event)
+    due.sort(
+        key=lambda item: (
+            _source_type_rank(item.source_type),
+            -int(item.priority),
+            _parse_iso(item.scheduled_at) or now_utc,
+            item.created_at,
+        )
+    )
+    return due[:limit]
+
+
+def _unread_selected_event(session: Session, user: User, *, character_id: str) -> ProactiveEvent | None:
+    judgement = load_json(user.proactive_judgement_json, {})
+    selected_event_id = str(judgement.get("selected_event_id") or "").strip() if isinstance(judgement, dict) else ""
+    if selected_event_id:
+        event = session.get(ProactiveEvent, selected_event_id)
+        if (
+            event is not None
+            and event.user_id == user.user_id
+            and event.character_id == character_id
+            and event.status in {"pending", "delivered"}
+        ):
             return event
     return None
+
+
+def _event_minutes_since(value: str, now_utc: datetime) -> int | None:
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int((now_utc - parsed.astimezone(timezone.utc)).total_seconds() // 60))
+
+
+def _judge_text(value: Any, limit: int = JUDGE_TEXT_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _payload_for_judge(payload: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in ("topic", "summary", "activity_title", "memory", "interaction_type", "content", "trigger_key", "severity"):
+        if key in payload:
+            compact[key] = _judge_text(payload.get(key))
+    sources = payload.get("sources")
+    if isinstance(sources, list) and sources:
+        first = sources[0]
+        if isinstance(first, dict):
+            compact["first_source"] = {
+                "title": _judge_text(first.get("title")),
+                "source": _judge_text(first.get("source"), 60),
+                "time_info": _judge_text(first.get("time_info"), 60),
+            }
+    return compact
+
+
+def _appointment_timing_context(payload: dict[str, Any], now_utc: datetime, now_local: datetime) -> dict[str, Any]:
+    delivery_timing = str(payload.get("delivery_timing") or "").strip().lower()
+    event_at = _parse_iso(str(payload.get("event_at") or ""))
+    remind_at = _parse_iso(str(payload.get("remind_at") or ""))
+    busy_start = _parse_iso(str(payload.get("busy_start") or ""))
+    busy_end = _parse_iso(str(payload.get("busy_end") or ""))
+    minutes_until_event = None
+    if event_at is not None:
+        minutes_until_event = int((event_at.astimezone(timezone.utc) - now_utc).total_seconds() // 60)
+    scheduled_ref = str(payload.get("remind_at") or payload.get("event_at") or "")
+    minutes_since_scheduled = _event_minutes_since(scheduled_ref, now_utc) if scheduled_ref else None
+    missed_on_time = False
+    if delivery_timing == "on_time" and remind_at is not None:
+        missed_on_time = now_utc > remind_at.astimezone(timezone.utc) + ON_TIME_DELIVERY_WINDOW
+    return {
+        "delivery_timing": delivery_timing,
+        "event_at": payload.get("event_at") or "",
+        "remind_at": payload.get("remind_at") or "",
+        "busy_start": payload.get("busy_start") or "",
+        "busy_end": payload.get("busy_end") or "",
+        "minutes_until_event": minutes_until_event,
+        "minutes_since_scheduled": minutes_since_scheduled,
+        "is_in_busy_window": is_event_in_busy_window(payload, now_local),
+        "missed_on_time": missed_on_time,
+    }
+
+
+def _event_for_judge(event: ProactiveEvent, now_utc: datetime, now_local: datetime) -> dict[str, Any]:
+    payload = _event_payload(event)
+    item = {
+        "proactive_event_id": event.proactive_event_id,
+        "source_type": event.source_type,
+        "source_id": event.source_id,
+        "title": _judge_text(event.title),
+        "text": _judge_text(event.text, 220),
+        "priority": event.priority,
+        "scheduled_at": event.scheduled_at,
+        "expires_at": event.expires_at,
+        "created_at": event.created_at,
+        "age_minutes": _event_minutes_since(event.created_at, now_utc),
+        "payload": _payload_for_judge(payload),
+    }
+    if event.source_type == "appointment":
+        item["appointment"] = _appointment_timing_context(payload, now_utc, now_local)
+    return item
+
+
+def _judge_sleep_context(user: User, now_local: datetime) -> dict[str, Any]:
+    return {
+        "sleep_start": user.sleep_start,
+        "sleep_end": user.sleep_end,
+        "is_sleep_time": _is_sleep_time(user, now_local),
+    }
+
+
+def _proactive_judge_context(
+    session: Session,
+    *,
+    user: User,
+    character: Character | None,
+    events: list[ProactiveEvent],
+    now_local: datetime,
+    now_utc: datetime,
+    delivery_channel: str = "background",
+    foreground_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    latest = _latest_delivery(session, user)
+    delivered_today = _daily_delivery_count(session, user, now_local)
+    previous = load_json(user.proactive_judgement_json, {})
+    if not isinstance(previous, dict):
+        previous = {}
+    return {
+        "current_local_time": now_local.isoformat(),
+        "current_utc_time": now_utc.isoformat(),
+        "user": {
+            "user_id": user.user_id,
+            "display_name": user.display_name,
+            "timezone": user.timezone,
+            "interest_topics": load_json(user.interest_topics_json, []),
+            "proactive_frequency_preference": user.proactive_daily_limit,
+            "notifications_enabled": user.notifications_enabled,
+            "story_completed": user.story_completed,
+        },
+        "character": {
+            "character_id": character.character_id if character is not None else "",
+            "name": character.name if character is not None else "小樱",
+        },
+        "delivery_history": {
+            "today_delivered_count": delivered_today,
+            "latest_delivery_at": latest.isoformat() if latest is not None else "",
+        },
+        "delivery_channel": delivery_channel,
+        "foreground_presence": foreground_context or {},
+        "sleep_window": _judge_sleep_context(user, now_local),
+        "user_availability": get_user_availability(user, now_local),
+        "previous_judgement": {
+            "status": previous.get("status") or "",
+            "should_send": previous.get("should_send"),
+            "selected_event_id": previous.get("selected_event_id") or "",
+            "reason": _judge_text(previous.get("reason")),
+        },
+        "candidates": [_event_for_judge(event, now_utc, now_local) for event in events],
+    }
+
+
+def _judge_messages(context: dict[str, Any]) -> list[dict[str, str]]:
+    return build_judge_messages(context)
+
+
+def _store_judgement(
+    user: User,
+    *,
+    now_utc: datetime,
+    status: str,
+    candidate_ids: list[str],
+    should_send: bool,
+    selected_event_id: str,
+    reason: str,
+    raw: dict[str, Any] | None = None,
+    error_type: str = "",
+) -> None:
+    user.proactive_judgement_json = dump_json(
+        {
+            "status": status,
+            "should_send": should_send,
+            "selected_event_id": selected_event_id,
+            "reason": reason,
+            "candidate_ids": candidate_ids,
+            "decided_at": _utc_iso(now_utc),
+            "error_type": error_type,
+            "raw": raw or {},
+        }
+    )
+
+
+def _try_appointment_fast_path(
+    events: list[ProactiveEvent],
+    *,
+    now_utc: datetime,
+) -> ProactiveEvent | None:
+    for event in events:
+        if event.source_type != "appointment":
+            continue
+        payload = _event_payload(event)
+        delivery_timing = str(payload.get("delivery_timing") or "").strip().lower()
+        remind_at = _parse_iso(str(payload.get("remind_at") or event.scheduled_at or ""))
+        if remind_at is None:
+            continue
+        if remind_at.tzinfo is None:
+            remind_at = remind_at.replace(tzinfo=timezone.utc)
+        remind_utc = remind_at.astimezone(timezone.utc)
+        if delivery_timing == "on_time":
+            if remind_utc <= now_utc <= remind_utc + ON_TIME_DELIVERY_WINDOW:
+                write_diagnostic(
+                    "proactive_appointment_fast_path",
+                    proactive_event_id=event.proactive_event_id,
+                    delivery_timing=delivery_timing,
+                    reason="on_time window",
+                )
+                return event
+            expires_at = _parse_iso(event.expires_at)
+            if expires_at is not None and now_utc > remind_utc + ON_TIME_DELIVERY_WINDOW and now_utc <= expires_at:
+                write_diagnostic(
+                    "proactive_appointment_fast_path",
+                    proactive_event_id=event.proactive_event_id,
+                    delivery_timing=delivery_timing,
+                    reason="missed_on_time",
+                )
+                return event
+    return None
+
+
+def _judge_proactive_delivery(
+    session: Session,
+    *,
+    user: User,
+    character: Character | None,
+    events: list[ProactiveEvent],
+    now_local: datetime,
+    now_utc: datetime,
+    delivery_channel: str = "background",
+    foreground_context: dict[str, Any] | None = None,
+) -> ProactiveEvent | None:
+    candidate_ids = [event.proactive_event_id for event in events]
+    write_diagnostic(
+        "proactive_judge_started",
+        user_id=user.user_id,
+        character_id=character.character_id if character is not None else "",
+        candidate_count=len(events),
+        candidate_ids=candidate_ids,
+        local_time=now_local.isoformat(),
+    )
+    config = get_task_llm_provider(session)
+    if config is None:
+        reason = "llm_not_configured"
+        _store_judgement(
+            user,
+            now_utc=now_utc,
+            status="error",
+            candidate_ids=candidate_ids,
+            should_send=False,
+            selected_event_id="",
+            reason=reason,
+            error_type="missing_provider",
+        )
+        write_diagnostic("proactive_judge_error", user_id=user.user_id, reason=reason)
+        return None
+
+    context = _proactive_judge_context(
+        session,
+        user=user,
+        character=character,
+        events=events,
+        now_local=now_local,
+        now_utc=now_utc,
+        delivery_channel=delivery_channel,
+        foreground_context=foreground_context,
+    )
+    try:
+        result = OpenAICompatibleClient(config).chat_json(
+            _judge_messages(context),
+            max_tokens=2400,
+            temperature=0.1,
+            diagnostic={
+                "feature": "主动消息判断器",
+                "stage": "judge",
+                "purpose": "Judge proactive delivery",
+                "input": context,
+            },
+        )
+        if not isinstance(result, dict):
+            raise ProviderError("proactive judge did not return a JSON object")
+    except Exception as exc:  # noqa: BLE001
+        reason = str(exc)
+        _store_judgement(
+            user,
+            now_utc=now_utc,
+            status="error",
+            candidate_ids=candidate_ids,
+            should_send=False,
+            selected_event_id="",
+            reason=reason,
+            error_type=type(exc).__name__,
+        )
+        write_diagnostic("proactive_judge_error", user_id=user.user_id, error_type=type(exc).__name__, message=reason)
+        return None
+
+    should_send = bool(result.get("should_send"))
+    selected_event_id = str(result.get("selected_event_id") or "").strip()
+    reason = str(result.get("reason") or "").strip()
+    selected = {event.proactive_event_id: event for event in events}.get(selected_event_id)
+    if should_send and selected is None:
+        error_reason = f"invalid selected_event_id: {selected_event_id}"
+        _store_judgement(
+            user,
+            now_utc=now_utc,
+            status="error",
+            candidate_ids=candidate_ids,
+            should_send=False,
+            selected_event_id=selected_event_id,
+            reason=error_reason,
+            raw=result,
+            error_type="invalid_selection",
+        )
+        write_diagnostic("proactive_judge_error", user_id=user.user_id, reason="invalid_selection", selected_event_id=selected_event_id, candidate_ids=candidate_ids)
+        return None
+
+    if not should_send:
+        selected_event_id = ""
+
+    _store_judgement(
+        user,
+        now_utc=now_utc,
+        status="decided",
+        candidate_ids=candidate_ids,
+        should_send=should_send,
+        selected_event_id=selected_event_id,
+        reason=reason,
+        raw=result,
+    )
+    write_diagnostic(
+        "proactive_judge_decided",
+        user_id=user.user_id,
+        should_send=should_send,
+        selected_event_id=selected_event_id,
+        reason=reason,
+    )
+    return selected if should_send else None
 
 
 def proactive_event_payload(event: ProactiveEvent | None) -> dict[str, Any] | None:
@@ -365,34 +958,109 @@ def pending_proactive_response(
     local_time: datetime | None = None,
     generate_news: bool = True,
     generate_weather: bool = True,
+    delivery_channel: str = "background",
+    foreground_context: dict[str, Any] | None = None,
+    appointment_only: bool = False,
 ) -> dict[str, Any]:
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
     if user is None:
         return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    if generate_news:
-        ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
-    if generate_weather:
-        ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     now_local = _local_now(user, local_time)
     now_utc = now_local.astimezone(timezone.utc)
+    if not user.story_completed:
+        write_diagnostic("proactive_judge_skipped", user_id=user_id, character_id=character_id, reason="story_not_ready")
+        session.commit()
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
+    if not user.notifications_enabled:
+        write_diagnostic("proactive_judge_skipped", user_id=user_id, character_id=character_id, reason="notifications_disabled")
+        session.commit()
+        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
+    if not appointment_only:
+        if generate_news:
+            ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+        if generate_weather:
+            ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     _expire_old_pending(session, user_id, now_utc)
-    event = _next_due_pending(session, user_id=user_id, character_id=character_id, now_utc=now_utc)
-    if event is None:
+    unread_event = _unread_selected_event(session, user, character_id=character_id)
+    if unread_event is not None:
+        write_diagnostic(
+            "proactive_unread_retained",
+            user_id=user_id,
+            character_id=character_id,
+            proactive_event_id=unread_event.proactive_event_id,
+            status=unread_event.status,
+        )
+        session.commit()
+        event_payload = proactive_event_payload(unread_event) if unread_event.status == "pending" else None
+        return {"ok": True, "event": event_payload, "widget": proactive_widget_payload(unread_event, character)}
+    events = _due_pending_events(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        now_utc=now_utc,
+        now_local=now_local,
+        user=user,
+        appointment_only=appointment_only,
+    )
+    if not events:
+        write_diagnostic("proactive_judge_skipped", user_id=user_id, character_id=character_id, reason="no_due_event")
         session.commit()
         return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    if _is_sleep_time(user, now_local):
+    fast_path = _try_appointment_fast_path(events, now_utc=now_utc)
+    if fast_path is not None:
+        _store_judgement(
+            user,
+            now_utc=now_utc,
+            status="decided",
+            candidate_ids=[item.proactive_event_id for item in events],
+            should_send=True,
+            selected_event_id=fast_path.proactive_event_id,
+            reason="appointment fast path",
+        )
         session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    if _daily_delivery_count(session, user, now_local) >= MAX_DAILY_DELIVERIES:
-        session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    latest = _latest_delivery(session, user)
-    if latest is not None and now_local - latest < MIN_DELIVERY_GAP:
-        session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
+        return {"ok": True, "event": proactive_event_payload(fast_path), "widget": proactive_widget_payload(fast_path, character)}
+    event = _judge_proactive_delivery(
+        session,
+        user=user,
+        character=character,
+        events=events,
+        now_local=now_local,
+        now_utc=now_utc,
+        delivery_channel=delivery_channel,
+        foreground_context=foreground_context,
+    )
     session.commit()
     return {"ok": True, "event": proactive_event_payload(event), "widget": proactive_widget_payload(event, character)}
+
+
+def deliver_commitment_reminder(session: Session, commitment_id: str) -> dict[str, Any]:
+    from .models import UserCommitment
+
+    commitment = session.get(UserCommitment, commitment_id)
+    if commitment is None:
+        write_diagnostic("commitment_delivery_skipped", commitment_id=commitment_id, reason="not_found")
+        return {"ok": False, "reason": "not_found"}
+    remind_at = _parse_iso(commitment.remind_at)
+    if remind_at is not None and remind_at.astimezone(timezone.utc) > datetime.now(timezone.utc) + timedelta(seconds=30):
+        write_diagnostic("commitment_delivery_skipped", commitment_id=commitment_id, reason="not_due")
+        return {"ok": False, "reason": "not_due"}
+    result = pending_proactive_response(
+        session,
+        user_id=commitment.user_id,
+        character_id=commitment.character_id,
+        local_time=None,
+        generate_news=False,
+        generate_weather=False,
+        appointment_only=True,
+    )
+    write_diagnostic(
+        "commitment_delivery_finished",
+        commitment_id=commitment_id,
+        delivered=bool(result.get("event")),
+        proactive_event_id=(result.get("event") or {}).get("proactive_event_id") if isinstance(result.get("event"), dict) else "",
+    )
+    return result
 
 
 def mark_proactive_delivered(session: Session, event_id: str) -> ProactiveEvent | None:
@@ -432,6 +1100,17 @@ def consume_proactive_event(session: Session, event_id: str) -> ProactiveEvent |
     event.updated_at = now
     session.commit()
     write_diagnostic("proactive_consumed", proactive_event_id=event.proactive_event_id, source_type=event.source_type)
+    return event
+
+
+def mark_proactive_dismissed(session: Session, event_id: str) -> ProactiveEvent | None:
+    event = session.get(ProactiveEvent, event_id)
+    if event is None:
+        return None
+    event.status = "dismissed"
+    event.updated_at = utc_now()
+    session.commit()
+    write_diagnostic("proactive_dismissed", proactive_event_id=event.proactive_event_id, source_type=event.source_type)
     return event
 
 

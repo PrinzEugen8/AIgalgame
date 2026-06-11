@@ -3,16 +3,21 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import os
+import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import jwt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import secret_store
-from .diagnostics import write_diagnostic
+from .diagnostics import diagnostic_span, new_span_id, write_diagnostic
 from .media import media_from_base64, save_media
 from .models import MediaAsset, ProviderConfig
 from .schemas import ProviderConfigIn, ProviderConfigOut, ProviderTestResult
@@ -24,6 +29,19 @@ class ProviderError(RuntimeError):
 
 
 HTTP_TRANSPORT: httpx.BaseTransport | None = None
+JSON_RESPONSE_FORMAT = {"type": "json_object"}
+JSON_MIN_MAX_TOKENS = 256
+JSON_RETRY_MAX_TOKENS = 4096
+JSON_OUTPUT_INSTRUCTION = (
+    "JSON Output mode is required. Return exactly one valid json object matching the user's requested schema. "
+    "Use double-quoted keys and strings. Do not include markdown, code fences, comments, or extra text. "
+    'Illustrative example only: {"ok": true}.'
+)
+JSON_RETRY_INSTRUCTION = (
+    "The previous response was not a valid json object. Return the complete corrected json object only, "
+    "matching the schema requested above. Do not include markdown or commentary. "
+    'Illustrative example only: {"ok": true}.'
+)
 
 
 def _client(timeout: float) -> httpx.Client:
@@ -72,6 +90,40 @@ def _json_or_empty(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_max_tokens(max_tokens: int, metadata: dict[str, Any]) -> int:
+    try:
+        floor = int(metadata.get("json_min_max_tokens") or JSON_MIN_MAX_TOKENS)
+    except (TypeError, ValueError):
+        floor = JSON_MIN_MAX_TOKENS
+    return max(max_tokens, max(0, floor))
+
+
+def _json_retry_max_tokens(max_tokens: int, metadata: dict[str, Any]) -> int:
+    try:
+        limit = int(metadata.get("json_retry_max_tokens") or JSON_RETRY_MAX_TOKENS)
+    except (TypeError, ValueError):
+        limit = JSON_RETRY_MAX_TOKENS
+    if limit <= max_tokens:
+        return max_tokens
+    return min(max_tokens * 2, limit)
+
+
+def _json_output_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    prepared = [dict(message) for message in messages]
+    for message in prepared:
+        if message.get("role") == "system":
+            content = str(message.get("content") or "")
+            message["content"] = f"{content}\n\n{JSON_OUTPUT_INSTRUCTION}".strip()
+            return prepared
+    return [{"role": "system", "content": JSON_OUTPUT_INSTRUCTION}, *prepared]
+
+
+def _json_retry_messages(messages: list[dict[str, str]], content: str, finish_reason: Any) -> list[dict[str, str]]:
+    preview = content[:1200] if content else "<empty content>"
+    repair_prompt = f"{JSON_RETRY_INSTRUCTION}\nPrevious finish_reason: {finish_reason or ''}\nPrevious content preview: {preview}"
+    return [*messages, {"role": "user", "content": repair_prompt}]
 
 
 def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
@@ -222,6 +274,34 @@ def provider_presets() -> dict[str, Any]:
         ],
         "search": [
             {
+                "provider": "trend_radar",
+                "label": "TrendRadar Hot Trends",
+                "base_url": "https://github.com/PrinzEugen8/AI_news",
+                "model": "",
+                "docs": "https://github.com/joyce677/TrendRadar",
+                "supports_models": False,
+                "description": "Read TrendRadar JSON or GitHub output/news SQLite files and match hot news against user interest topics.",
+                "fields": [
+                    _field("label", "Display name", "core", default="TrendRadar Hot Trends"),
+                    _field(
+                        "base_url",
+                        "TrendRadar URL",
+                        "core",
+                        default="https://github.com/PrinzEugen8/AI_news",
+                        required=True,
+                        placeholder="https://github.com/owner/repo or https://your-domain.example/api/trends.json",
+                    ),
+                    _field("cache_minutes", "Cache minutes", "metadata", type_="number", default=15),
+                    _field("max_titles", "Max related titles", "metadata", type_="number", default=3),
+                    _field("github_token", "GitHub workflow token", "secret", placeholder="Fine-grained PAT with Actions: write"),
+                    _field("github_workflow_id", "GitHub workflow id", "metadata", default="crawler.yml"),
+                    _field("github_ref", "GitHub ref", "metadata", default="master"),
+                    _field("github_dispatch_poll_seconds", "GitHub dispatch poll seconds", "metadata", type_="number", default=15),
+                    _field("github_dispatch_timeout_minutes", "GitHub dispatch timeout minutes", "metadata", type_="number", default=25),
+                    _field("timeout", "Timeout seconds", "metadata", type_="number", default=20),
+                ],
+            },
+            {
                 "provider": "volc_ark_web_search",
                 "label": "火山方舟 Web Search",
                 "base_url": "https://ark.cn-beijing.volces.com/api/v3",
@@ -267,7 +347,7 @@ def provider_presets() -> dict[str, Any]:
                 "model": "",
                 "docs": "https://dev.qweather.com/docs/",
                 "supports_models": False,
-                "description": "使用和风天气 API Host，支持 GeoAPI、实时天气、逐小时、每日预报、灾害预警和可选分钟降水。",
+                "description": "使用和风天气 API Host，支持 GeoAPI、实时天气、逐小时、每日预报、可选灾害预警和分钟降水。",
                 "fields": [
                     _field("label", "显示名称", "core", default="和风天气 QWeather"),
                     _field("base_url", "API Host", "core", required=True, placeholder="https://abcxyz.qweatherapi.com"),
@@ -289,12 +369,32 @@ def provider_presets() -> dict[str, Any]:
                     _field("test_location", "测试 LocationID 或经纬度", "metadata", default="101010100", placeholder="101010100 或 116.41,39.92"),
                     _field("daily_days", "每日预报天数", "metadata", type_="select", default="3d", options=["3d", "7d"]),
                     _field("hourly_hours", "逐小时预报时长", "metadata", type_="select", default="24h", options=["24h", "72h", "168h"]),
+                    _field("include_warning", "灾害预警", "metadata", type_="checkbox", default=False),
                     _field("include_minutely", "分钟降水", "metadata", type_="checkbox", default=True),
                     _field("geo_range", "GeoAPI 搜索范围", "metadata", default="cn", placeholder="cn；留空表示全球"),
                     _field("lang", "语言", "metadata", default="zh"),
                     _field("unit", "单位", "metadata", type_="select", default="m", options=["m", "i"]),
                     _field("cache_minutes", "天气缓存分钟", "metadata", type_="number", default=120),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                ],
+            }
+        ],
+        "push": [
+            {
+                "provider": "fcm_http_v1",
+                "label": "Firebase Cloud Messaging HTTP v1",
+                "base_url": "https://fcm.googleapis.com/v1",
+                "model": "",
+                "docs": "https://firebase.google.com/docs/cloud-messaging/send-message",
+                "supports_models": False,
+                "description": "Sends proactive messages to Android devices through Firebase Cloud Messaging HTTP v1.",
+                "fields": [
+                    _field("label", "Display name", "core", default="Firebase Cloud Messaging HTTP v1"),
+                    _field("base_url", "FCM API Base URL", "core", default="https://fcm.googleapis.com/v1", required=True),
+                    _field("project_id", "Firebase project_id", "metadata", placeholder="Optional when service account JSON includes project_id"),
+                    _field("service_account_json", "Service account JSON", "secret", required=True, type_="textarea"),
+                    _field("channel_id", "Android notification channel", "metadata", default="sakura"),
+                    _field("timeout", "Timeout seconds", "metadata", type_="number", default=20),
                 ],
             }
         ],
@@ -595,6 +695,116 @@ def get_task_llm_provider(session: Session) -> ProviderConfig | None:
     return get_enabled_provider(session, "llm_task") or get_enabled_provider(session, "llm")
 
 
+class FcmHttpV1Client:
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.metadata = load_json(config.metadata_json, {})
+        raw_service_account = _secret(config, "service_account_json")
+        if not raw_service_account:
+            raise ProviderError("FCM service account JSON is not configured")
+        try:
+            self.service_account = json.loads(raw_service_account)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("FCM service account JSON is invalid") from exc
+        self.project_id = str(self.metadata.get("project_id") or self.service_account.get("project_id") or "").strip()
+        self.client_email = str(self.service_account.get("client_email") or "").strip()
+        self.private_key = str(self.service_account.get("private_key") or "").strip()
+        self.token_uri = str(self.service_account.get("token_uri") or "https://oauth2.googleapis.com/token").strip()
+        if not self.project_id:
+            raise ProviderError("FCM project_id is not configured")
+        if not self.client_email or not self.private_key:
+            raise ProviderError("FCM service account must include client_email and private_key")
+
+    def _access_token(self) -> str:
+        now = datetime.now(timezone.utc)
+        claims = {
+            "iss": self.client_email,
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+            "aud": self.token_uri,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=55)).timestamp()),
+        }
+        assertion = jwt.encode(claims, self.private_key, algorithm="RS256")
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            response = client.post(
+                self.token_uri,
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response.raise_for_status()
+        token = str(response.json().get("access_token") or "")
+        if not token:
+            raise ProviderError("FCM OAuth token response did not include access_token")
+        return token
+
+    def _url(self) -> str:
+        return f"{self.config.base_url.rstrip('/')}/projects/{self.project_id}/messages:send"
+
+    def send(
+        self,
+        *,
+        token: str,
+        title: str,
+        body: str,
+        data: dict[str, str],
+        channel_id: str = "",
+    ) -> dict[str, Any]:
+        if not token:
+            raise ProviderError("FCM target token is empty")
+        resolved_channel = channel_id or str(self.metadata.get("channel_id") or "sakura")
+        message = {
+            "token": token,
+            "notification": {"title": title[:120], "body": body[:500]},
+            "data": {key: str(value) for key, value in data.items()},
+            "android": {
+                "priority": "HIGH",
+                "notification": {
+                    "channel_id": resolved_channel,
+                    "visibility": "PUBLIC",
+                    "notification_priority": "PRIORITY_DEFAULT",
+                },
+            },
+        }
+        request_body = {"message": message}
+        started = time.monotonic()
+        with diagnostic_span(
+            "fcm_request",
+            feature="proactive_delivery",
+            stage="fcm_send",
+            purpose="Send proactive event through Firebase Cloud Messaging",
+            provider_id=self.config.provider_id,
+            endpoint=self._url(),
+            request=request_body,
+            input={"token_present": bool(token), "title": title, "data_keys": sorted(data.keys())},
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 20.0))) as client:
+                try:
+                    response = client.post(
+                        self._url(),
+                        headers={"Authorization": f"Bearer {self._access_token()}", "Content-Type": "application/json"},
+                        json=request_body,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    write_diagnostic(
+                        "fcm_error",
+                        provider_id=self.config.provider_id,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                    raise
+            payload = response.json() if response.content else {}
+            span.add(response=payload, status_code=response.status_code)
+            write_diagnostic(
+                "fcm_ok",
+                provider_id=self.config.provider_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                status_code=response.status_code,
+            )
+            return {"status_code": response.status_code, "body": payload, "request": request_body}
+
+
 class OpenAICompatibleClient:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
@@ -615,66 +825,161 @@ class OpenAICompatibleClient:
         data = response.json()
         return [str(item.get("id")) for item in data.get("data", []) if item.get("id")]
 
-    def chat_json(self, messages: list[dict[str, str]], *, max_tokens: int = 800, temperature: float = 0.7) -> dict[str, Any]:
+    def chat_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int = 800,
+        temperature: float = 0.7,
+        diagnostic: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.config.model:
             raise ProviderError("LLM model is not selected")
+        prepared_messages = _json_output_messages(messages)
+        effective_max_tokens = _json_max_tokens(max_tokens, self.metadata)
+        retry_max_tokens = _json_retry_max_tokens(effective_max_tokens, self.metadata)
         body: dict[str, Any] = {
             "model": self.config.model,
-            "messages": messages,
+            "messages": prepared_messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
+            "max_tokens": effective_max_tokens,
+            "response_format": JSON_RESPONSE_FORMAT,
         }
         extra_body = self.metadata.get("extra_body")
         if isinstance(extra_body, dict):
-            body.update(extra_body)
+            body.update({key: value for key, value in extra_body.items() if key not in {"messages", "max_tokens", "response_format"}})
+            body["messages"] = prepared_messages
+            body["max_tokens"] = effective_max_tokens
+            body["response_format"] = JSON_RESPONSE_FORMAT
         started = time.monotonic()
-        with _client(float(self.metadata.get("timeout", 30.0))) as client:
-            try:
-                response = client.post(
-                    self._url("chat/completions"),
-                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                    json=body,
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                write_diagnostic(
-                    "llm_error",
-                    provider_id=self.config.provider_id,
-                    model=self.config.model,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    error_type=type(exc).__name__,
-                    message=str(exc),
-                )
-                raise
-        response_payload = response.json()
-        choice = response_payload["choices"][0]
-        content = choice["message"]["content"]
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as exc:
-            write_diagnostic(
-                "llm_error",
-                provider_id=self.config.provider_id,
-                model=self.config.model,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
-                error_type="json_decode",
-                message=str(exc),
-                raw_preview=content[:180],
-            )
-            raise ProviderError(f"LLM did not return valid JSON: {content[:180]}") from exc
-        write_diagnostic(
-            "llm_ok",
+        diag = diagnostic or {}
+        feature = str(diag.get("feature") or "LLM")
+        stage = str(diag.get("stage") or "chat_json")
+        purpose = str(diag.get("purpose") or "LLM JSON request")
+        with diagnostic_span(
+            "llm_request",
+            feature=feature,
+            stage=stage,
+            purpose=purpose,
+            summary=purpose,
+            parent_span_id=str(diag.get("parent_span_id") or ""),
             provider_id=self.config.provider_id,
+            provider=self.config.provider,
             model=self.config.model,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            keys=list(parsed.keys()) if isinstance(parsed, dict) else [],
-            finish_reason=choice.get("finish_reason", ""),
-            raw_preview=str(content)[:120],
-        )
-        return parsed
+            endpoint=self._url("chat/completions"),
+            request=body,
+            input=diag.get("input") or {},
+            references=diag.get("references") or {},
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 30.0))) as client:
+                attempt_messages = prepared_messages
+                attempts: list[dict[str, Any]] = []
+                for attempt in range(1, 3):
+                    body["messages"] = attempt_messages
+                    try:
+                        response = client.post(
+                            self._url("chat/completions"),
+                            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                            json=body,
+                        )
+                        response.raise_for_status()
+                    except Exception as exc:
+                        write_diagnostic(
+                            "llm_error",
+                            provider_id=self.config.provider_id,
+                            model=self.config.model,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                        raise
+                    response_payload = response.json()
+                    choice = response_payload["choices"][0]
+                    message_payload = choice.get("message") or {}
+                    content = str(message_payload.get("content") or "")
+                    finish_reason = choice.get("finish_reason", "")
+                    reasoning_preview = str(message_payload.get("reasoning_content") or "")[:180]
+                    try:
+                        parsed = json.loads(content)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("JSON root is not an object")
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        error_preview = content[:180]
+                        if not error_preview:
+                            error_preview = f"<empty content>; finish_reason={finish_reason}; reasoning_preview={reasoning_preview}"
+                        elif finish_reason == "length":
+                            error_preview = f"{error_preview}; finish_reason=length; JSON may have been truncated"
+                        error_type = "json_decode" if isinstance(exc, json.JSONDecodeError) else "json_object"
+                        attempts.append(
+                            {
+                                "attempt": attempt,
+                                "error_type": error_type,
+                                "message": str(exc),
+                                "raw_preview": content[:180],
+                                "reasoning_preview": reasoning_preview,
+                                "finish_reason": finish_reason,
+                                "max_tokens": body.get("max_tokens"),
+                            }
+                        )
+                        if attempt == 1:
+                            write_diagnostic(
+                                "llm_retry",
+                                provider_id=self.config.provider_id,
+                                model=self.config.model,
+                                elapsed_ms=int((time.monotonic() - started) * 1000),
+                                error_type=error_type,
+                                message=str(exc),
+                                raw_preview=content[:180],
+                                reasoning_preview=reasoning_preview,
+                                finish_reason=finish_reason,
+                            )
+                            attempt_messages = _json_retry_messages(prepared_messages, content, finish_reason)
+                            body["max_tokens"] = retry_max_tokens
+                            continue
+                        write_diagnostic(
+                            "llm_error",
+                            provider_id=self.config.provider_id,
+                            model=self.config.model,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error_type=error_type,
+                            message=str(exc),
+                            raw_preview=content[:180],
+                            reasoning_preview=reasoning_preview,
+                            finish_reason=finish_reason,
+                        )
+                        span.add(raw_response=response_payload, raw_content=content, attempts=attempts)
+                        raise ProviderError(f"LLM did not return valid JSON: {error_preview}") from exc
+                    span.add(
+                        response=parsed,
+                        raw_response=response_payload,
+                        raw_content=content,
+                        finish_reason=finish_reason,
+                        keys=list(parsed.keys()),
+                        attempts=attempts,
+                        requested_max_tokens=max_tokens,
+                        effective_max_tokens=effective_max_tokens,
+                        retry_max_tokens=retry_max_tokens,
+                    )
+                    write_diagnostic(
+                        "llm_ok",
+                        provider_id=self.config.provider_id,
+                        model=self.config.model,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        keys=list(parsed.keys()),
+                        finish_reason=finish_reason,
+                        raw_preview=str(content)[:120],
+                    )
+                    return parsed
+        raise ProviderError("LLM did not return valid JSON")
 
-    def chat_text(self, messages: list[dict[str, str]], *, max_tokens: int = 240, temperature: float = 0.2) -> str:
+    def chat_text(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int = 240,
+        temperature: float = 0.2,
+        diagnostic: dict[str, Any] | None = None,
+    ) -> str:
         if not self.config.model:
             raise ProviderError("LLM model is not selected")
         body: dict[str, Any] = {
@@ -687,36 +992,61 @@ class OpenAICompatibleClient:
         if isinstance(extra_body, dict):
             body.update({key: value for key, value in extra_body.items() if key != "response_format"})
         started = time.monotonic()
-        with _client(float(self.metadata.get("timeout", 30.0))) as client:
-            try:
-                response = client.post(
-                    self._url("chat/completions"),
-                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                    json=body,
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                write_diagnostic(
-                    "llm_text_error",
-                    provider_id=self.config.provider_id,
-                    model=self.config.model,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    error_type=type(exc).__name__,
-                    message=str(exc),
-                )
-                raise
-        response_payload = response.json()
-        choice = response_payload["choices"][0]
-        content = str(choice["message"]["content"] or "").strip()
-        write_diagnostic(
-            "llm_text_ok",
+        diag = diagnostic or {}
+        feature = str(diag.get("feature") or "LLM")
+        stage = str(diag.get("stage") or "chat_text")
+        purpose = str(diag.get("purpose") or "LLM text request")
+        with diagnostic_span(
+            "llm_request",
+            feature=feature,
+            stage=stage,
+            purpose=purpose,
+            summary=purpose,
+            parent_span_id=str(diag.get("parent_span_id") or ""),
             provider_id=self.config.provider_id,
+            provider=self.config.provider,
             model=self.config.model,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            chars=len(content),
-            finish_reason=choice.get("finish_reason", ""),
-            raw_preview=content[:120],
-        )
+            endpoint=self._url("chat/completions"),
+            request=body,
+            input=diag.get("input") or {},
+            references=diag.get("references") or {},
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 30.0))) as client:
+                try:
+                    response = client.post(
+                        self._url("chat/completions"),
+                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                        json=body,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    write_diagnostic(
+                        "llm_text_error",
+                        provider_id=self.config.provider_id,
+                        model=self.config.model,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                    raise
+            response_payload = response.json()
+            choice = response_payload["choices"][0]
+            content = str(choice["message"]["content"] or "").strip()
+            span.add(
+                response_text=content,
+                raw_response=response_payload,
+                finish_reason=choice.get("finish_reason", ""),
+                chars=len(content),
+            )
+            write_diagnostic(
+                "llm_text_ok",
+                provider_id=self.config.provider_id,
+                model=self.config.model,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                chars=len(content),
+                finish_reason=choice.get("finish_reason", ""),
+                raw_preview=content[:120],
+            )
         return content
 
 
@@ -903,43 +1233,67 @@ class VolcSeedTtsClient:
         cache_key = stable_hash("tts", text, speaker, resource_id, audio_format, dump_json(audio_params), emotion, dump_json(context))
         existing = session.execute(select(MediaAsset).where(MediaAsset.local_cache_key == cache_key)).scalar_one_or_none()
         if existing is not None:
+            write_diagnostic(
+                "tts_cache_hit",
+                feature="TTS",
+                stage="synthesize",
+                provider_id=self.config.provider_id,
+                speaker=speaker,
+                resource_id=resource_id,
+                asset_id=existing.asset_id,
+            )
             return existing
         body = {"user": {"uid": uid_value}, "req_params": req_params}
         headers = self._headers(resource_id)
         started = time.monotonic()
-        with _client(float(self.metadata.get("timeout", 30.0))) as client:
-            try:
-                response = client.post(endpoint, headers=headers, json=body)
-                response.raise_for_status()
-            except Exception as exc:
-                write_diagnostic(
-                    "tts_error",
-                    provider_id=self.config.provider_id,
-                    endpoint=endpoint,
-                    resource_id=resource_id,
-                    speaker=speaker,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    request_id=headers.get("X-Api-Request-Id"),
-                    error_type=type(exc).__name__,
-                    message=str(exc),
-                    audio_params=audio_params,
-                )
-                raise
-        audio_bytes = _decode_tts_response(response)
-        if len(audio_bytes) < 128:
-            raise ProviderError("Volc TTS returned too few audio bytes")
-        write_diagnostic(
-            "tts_ok",
+        with diagnostic_span(
+            "tts_request",
+            feature="TTS",
+            stage="synthesize",
+            purpose="Generate speech audio",
+            summary=f"TTS {speaker}",
             provider_id=self.config.provider_id,
             endpoint=endpoint,
             resource_id=resource_id,
             speaker=speaker,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-            request_id=headers.get("X-Api-Request-Id"),
-            bytes=len(audio_bytes),
+            request=body,
             audio_params=audio_params,
-        )
-        return save_media(session, asset_type="tts_audio", content=audio_bytes, extension=audio_format, cache_key=cache_key)
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 30.0))) as client:
+                try:
+                    response = client.post(endpoint, headers=headers, json=body)
+                    response.raise_for_status()
+                except Exception as exc:
+                    write_diagnostic(
+                        "tts_error",
+                        provider_id=self.config.provider_id,
+                        endpoint=endpoint,
+                        resource_id=resource_id,
+                        speaker=speaker,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        request_id=headers.get("X-Api-Request-Id"),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                        audio_params=audio_params,
+                    )
+                    raise
+            audio_bytes = _decode_tts_response(response)
+            if len(audio_bytes) < 128:
+                raise ProviderError("Volc TTS returned too few audio bytes")
+            asset = save_media(session, asset_type="tts_audio", content=audio_bytes, extension=audio_format, cache_key=cache_key)
+            span.add(request_id=headers.get("X-Api-Request-Id"), bytes=len(audio_bytes), asset_id=asset.asset_id, response_preview=response.text[:500])
+            write_diagnostic(
+                "tts_ok",
+                provider_id=self.config.provider_id,
+                endpoint=endpoint,
+                resource_id=resource_id,
+                speaker=speaker,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                request_id=headers.get("X-Api-Request-Id"),
+                bytes=len(audio_bytes),
+                audio_params=audio_params,
+            )
+            return asset
 
 
 VolcTtsClient = VolcSeedTtsClient
@@ -1027,6 +1381,482 @@ def _response_text(value: Any) -> str:
     return ""
 
 
+_TREND_RADAR_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+class TrendRadarClient:
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.metadata = load_json(config.metadata_json, {})
+        if not config.base_url:
+            raise ProviderError("TrendRadar URL is not configured")
+
+    def _url(self) -> str:
+        base = self.config.base_url.strip()
+        if not base.startswith(("http://", "https://")):
+            base = f"https://{base}"
+        base = base.rstrip("/")
+        if self._github_repo_parts() is not None or base.endswith(".db"):
+            return base
+        if base.endswith(".json"):
+            return base
+        if base.endswith("/api/trends"):
+            return f"{base}.json"
+        return f"{base}/api/trends.json"
+
+    def _github_repo_parts(self) -> tuple[str, str, str] | None:
+        base = self.config.base_url.strip().rstrip("/")
+        marker = "github.com/"
+        if marker not in base:
+            return None
+        tail = base.split(marker, 1)[1].strip("/")
+        parts = [part for part in tail.split("/") if part]
+        if len(parts) < 2:
+            return None
+        owner, repo = parts[0], parts[1]
+        branch = "master"
+        if len(parts) >= 4 and parts[2] in {"tree", "blob", "raw"}:
+            branch = parts[3]
+        metadata_ref = str(self.metadata.get("github_ref") or "").strip()
+        if metadata_ref:
+            branch = metadata_ref
+        return owner, repo, branch
+
+    def endpoint_for_date(self, local_date: date) -> str:
+        parts = self._github_repo_parts()
+        if parts is None:
+            return self._url()
+        owner, repo, branch = parts
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/output/news/{local_date.isoformat()}.db"
+
+    def github_token_configured(self) -> bool:
+        return bool(_secret(self.config, "github_token"))
+
+    def _github_workflow_id(self) -> str:
+        return str(self.metadata.get("github_workflow_id") or "crawler.yml").strip() or "crawler.yml"
+
+    def _github_headers(self, *, require_token: bool = False) -> dict[str, str]:
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "AIgalgame"}
+        token = _secret(self.config, "github_token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        elif require_token:
+            raise ProviderError("TrendRadar GitHub workflow token is not configured")
+        return headers
+
+    @staticmethod
+    def _parse_github_time(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _latest_workflow_run_since(
+        self,
+        client: httpx.Client,
+        *,
+        owner: str,
+        repo: str,
+        workflow_id: str,
+        branch: str,
+        started_at: datetime,
+    ) -> dict[str, Any] | None:
+        url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs"
+        response = client.get(
+            url,
+            headers=self._github_headers(),
+            params={"branch": branch, "event": "workflow_dispatch", "per_page": 10},
+        )
+        response.raise_for_status()
+        runs = response.json().get("workflow_runs") or []
+        candidates: list[dict[str, Any]] = []
+        floor = started_at.astimezone(timezone.utc)
+        for item in runs:
+            if not isinstance(item, dict):
+                continue
+            created_at = self._parse_github_time(item.get("created_at"))
+            if created_at is None or created_at < floor:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: str(item.get("created_at") or ""), reverse=True)[0]
+
+    def dispatch_and_fetch_for_date(self, local_date: date) -> tuple[dict[str, Any], dict[str, Any]]:
+        parts = self._github_repo_parts()
+        if parts is None:
+            raise ProviderError("TrendRadar GitHub repository URL is invalid")
+        owner, repo, branch = parts
+        workflow_id = self._github_workflow_id()
+        poll_seconds = max(0.0, _as_float(self.metadata.get("github_dispatch_poll_seconds"), 15.0))
+        timeout_seconds = max(30.0, _as_float(self.metadata.get("github_dispatch_timeout_minutes"), 25.0) * 60.0)
+        started_at = datetime.now(timezone.utc)
+        dispatch_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+        span_id = new_span_id("trendradar")
+        started = time.monotonic()
+        write_diagnostic(
+            "trend_radar_dispatch",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="TrendRadar",
+            stage="github_workflow_dispatch",
+            provider_id=self.config.provider_id,
+            endpoint=dispatch_url,
+            owner=owner,
+            repo=repo,
+            workflow_id=workflow_id,
+            ref=branch,
+            local_date=local_date.isoformat(),
+        )
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            response = client.post(
+                dispatch_url,
+                headers=self._github_headers(require_token=True),
+                json={"ref": branch},
+            )
+            response.raise_for_status()
+            deadline = time.monotonic() + timeout_seconds
+            selected_run: dict[str, Any] | None = None
+            while True:
+                selected_run = self._latest_workflow_run_since(
+                    client,
+                    owner=owner,
+                    repo=repo,
+                    workflow_id=workflow_id,
+                    branch=branch,
+                    started_at=started_at,
+                )
+                if selected_run is not None and selected_run.get("status") == "completed":
+                    conclusion = str(selected_run.get("conclusion") or "")
+                    if conclusion != "success":
+                        raise ProviderError(f"TrendRadar workflow completed with conclusion={conclusion or 'unknown'}")
+                    break
+                if time.monotonic() >= deadline:
+                    raise ProviderError("TrendRadar workflow dispatch timed out")
+                time.sleep(poll_seconds)
+        payload = self.fetch_for_date(local_date)
+        run_info = {
+            "run_id": selected_run.get("id") if selected_run is not None else "",
+            "run_url": selected_run.get("html_url") if selected_run is not None else "",
+            "dispatch_endpoint": dispatch_url,
+            "workflow_id": workflow_id,
+            "ref": branch,
+        }
+        write_diagnostic(
+            "trend_radar_dispatch",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            provider_id=self.config.provider_id,
+            endpoint=dispatch_url,
+            local_date=local_date.isoformat(),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            **run_info,
+        )
+        return payload, run_info
+
+    @staticmethod
+    def _format_time_info(first_time: str, last_time: str) -> str:
+        first_time = str(first_time or "").strip()
+        last_time = str(last_time or "").strip()
+        if not first_time:
+            return ""
+        if not last_time or first_time == last_time:
+            return first_time
+        return f"[{first_time} ~ {last_time}]"
+
+    @staticmethod
+    def _as_int_list(value: Any) -> list[int]:
+        if not isinstance(value, list):
+            return []
+        result: list[int] = []
+        for item in value:
+            try:
+                result.append(int(float(item)))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _normalize_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ProviderError("TrendRadar response must be a JSON object")
+        trends: list[dict[str, Any]] = []
+        for trend in payload.get("trends") or []:
+            if not isinstance(trend, dict):
+                continue
+            titles: list[dict[str, Any]] = []
+            for item in trend.get("titles") or []:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                titles.append(
+                    {
+                        "title": title,
+                        "url": str(item.get("url") or "").strip(),
+                        "source": str(item.get("source") or "").strip(),
+                        "ranks": self._as_int_list(item.get("ranks")),
+                        "is_new": _as_bool(item.get("is_new"), False),
+                        "appearance_count": _as_int(item.get("appearance_count"), 1),
+                        "time_info": str(item.get("time_info") or "").strip(),
+                    }
+                )
+            trends.append(
+                {
+                    "keyword_group": str(trend.get("keyword_group") or "").strip(),
+                    "match_count": _as_int(trend.get("match_count"), len(titles)),
+                    "titles": titles,
+                }
+            )
+        failed_sources = payload.get("failed_sources")
+        if not isinstance(failed_sources, list):
+            failed_sources = []
+        return {
+            "generated_at": str(payload.get("generated_at") or "").strip(),
+            "total_titles_processed": _as_int(payload.get("total_titles_processed"), 0),
+            "failed_sources": [str(item) for item in failed_sources],
+            "report_image_url": str(payload.get("report_image_url") or "").strip(),
+            "trends": trends,
+        }
+
+    def _fetch_github_latest_db_url(self, client: httpx.Client) -> tuple[str, str]:
+        parts = self._github_repo_parts()
+        if parts is None:
+            raise ProviderError("TrendRadar GitHub repository URL is invalid")
+        owner, repo, branch = parts
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/output/news?ref={branch}"
+        response = client.get(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "AIgalgame"})
+        response.raise_for_status()
+        entries = response.json()
+        if not isinstance(entries, list):
+            raise ProviderError("GitHub output/news listing is not a JSON array")
+        db_entries = [
+            item
+            for item in entries
+            if isinstance(item, dict) and str(item.get("name") or "").endswith(".db") and item.get("download_url")
+        ]
+        if not db_entries:
+            raise ProviderError("TrendRadar GitHub repository has no output/news/*.db files")
+        latest = sorted(db_entries, key=lambda item: str(item.get("name") or ""))[-1]
+        return str(latest["download_url"]), str(latest.get("name") or "")
+
+    def _payload_from_sqlite_bytes(self, db_bytes: bytes, *, db_name: str = "") -> dict[str, Any]:
+        tmp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as fh:
+                fh.write(db_bytes)
+                tmp_path = fh.name
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    n.id,
+                    n.title,
+                    n.url,
+                    n.mobile_url,
+                    n.first_crawl_time,
+                    n.last_crawl_time,
+                    n.crawl_count,
+                    p.name AS source_name,
+                    MIN(r.rank) AS best_rank,
+                    GROUP_CONCAT(r.rank) AS ranks
+                FROM news_items n
+                LEFT JOIN platforms p ON p.id = n.platform_id
+                LEFT JOIN rank_history r ON r.news_item_id = n.id
+                GROUP BY n.id
+                ORDER BY n.crawl_count DESC, best_rank ASC, n.updated_at DESC
+                """
+            ).fetchall()
+            total_titles = int(conn.execute("SELECT COUNT(*) FROM news_items").fetchone()[0] or 0)
+            max_last_time = str(conn.execute("SELECT MAX(last_crawl_time) FROM news_items").fetchone()[0] or "")
+            db_date = db_name[:-3] if db_name.endswith(".db") else ""
+            trends: list[dict[str, Any]] = []
+            for row in rows:
+                ranks = []
+                for raw_rank in str(row["ranks"] or "").split(","):
+                    try:
+                        ranks.append(int(raw_rank))
+                    except ValueError:
+                        continue
+                first_time = str(row["first_crawl_time"] or "")
+                last_time = str(row["last_crawl_time"] or "")
+                title = str(row["title"] or "").strip()
+                if not title:
+                    continue
+                source_name = str(row["source_name"] or "").strip()
+                title_payload = {
+                    "title": title,
+                    "url": str(row["mobile_url"] or row["url"] or "").strip(),
+                    "source": source_name,
+                    "ranks": ranks,
+                    "is_new": first_time == max_last_time,
+                    "appearance_count": _as_int(row["crawl_count"], 1),
+                    "time_info": self._format_time_info(first_time, last_time),
+                }
+                trends.append(
+                    {
+                        "keyword_group": source_name,
+                        "match_count": _as_int(row["crawl_count"], 1),
+                        "titles": [title_payload],
+                    }
+                )
+            generated_at = f"{db_date}T{max_last_time.replace('-', ':')}:00+08:00" if db_date and max_last_time else db_date
+            return {
+                "generated_at": generated_at,
+                "total_titles_processed": total_titles,
+                "failed_sources": [],
+                "report_image_url": "",
+                "trends": trends,
+            }
+        finally:
+            try:
+                conn.close()  # type: ignore[name-defined]
+            except Exception:  # noqa: BLE001
+                pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _fetch_sqlite_payload(self, client: httpx.Client, url: str, *, db_name: str = "") -> dict[str, Any]:
+        response = client.get(url, headers={"Accept": "application/octet-stream", "User-Agent": "AIgalgame"})
+        response.raise_for_status()
+        return self._payload_from_sqlite_bytes(response.content, db_name=db_name)
+
+    def fetch_for_date(self, local_date: date) -> dict[str, Any]:
+        url = self.endpoint_for_date(local_date)
+        span_id = new_span_id("trendradar")
+        started = time.monotonic()
+        write_diagnostic(
+            "trend_radar_request",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="TrendRadar",
+            stage="fetch_trends_for_date",
+            provider_id=self.config.provider_id,
+            endpoint=url,
+            local_date=local_date.isoformat(),
+        )
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            try:
+                if url.endswith(".db"):
+                    normalized = self._fetch_sqlite_payload(client, url, db_name=url.rsplit("/", 1)[-1])
+                else:
+                    response = client.get(url, headers={"Accept": "application/json", "User-Agent": "AIgalgame"})
+                    response.raise_for_status()
+                    normalized = self._normalize_payload(response.json())
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                write_diagnostic(
+                    "trend_radar_request",
+                    phase="end",
+                    status="error",
+                    span_id=span_id,
+                    provider_id=self.config.provider_id,
+                    endpoint=url,
+                    local_date=local_date.isoformat(),
+                    status_code=response.status_code,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    response_preview=response.text[:300],
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                raise
+        write_diagnostic(
+            "trend_radar_request",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            provider_id=self.config.provider_id,
+            endpoint=url,
+            local_date=local_date.isoformat(),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            trend_count=len(normalized["trends"]),
+            total_titles_processed=normalized["total_titles_processed"],
+        )
+        return normalized
+
+    def fetch(self, *, force: bool = False) -> dict[str, Any]:
+        url = self._url()
+        cache_minutes = max(0, _as_int(self.metadata.get("cache_minutes"), 15))
+        now = time.monotonic()
+        cached = _TREND_RADAR_CACHE.get(url)
+        if not force and cached is not None and cached[0] > now:
+            write_diagnostic(
+                "trend_radar_request",
+                phase="cache_hit",
+                status="ok",
+                provider_id=self.config.provider_id,
+                endpoint=url,
+                cache_hit=True,
+            )
+            return cached[1]
+        span_id = new_span_id("trendradar")
+        started = time.monotonic()
+        write_diagnostic(
+            "trend_radar_request",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="TrendRadar",
+            stage="fetch_trends",
+            provider_id=self.config.provider_id,
+            endpoint=url,
+        )
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            try:
+                if self._github_repo_parts() is not None:
+                    db_url, db_name = self._fetch_github_latest_db_url(client)
+                    normalized = self._fetch_sqlite_payload(client, db_url, db_name=db_name)
+                elif url.endswith(".db"):
+                    normalized = self._fetch_sqlite_payload(client, url, db_name=url.rsplit("/", 1)[-1])
+                else:
+                    response = client.get(url, headers={"Accept": "application/json", "User-Agent": "AIgalgame"})
+                    response.raise_for_status()
+                    normalized = self._normalize_payload(response.json())
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                write_diagnostic(
+                    "trend_radar_request",
+                    phase="end",
+                    status="error",
+                    span_id=span_id,
+                    provider_id=self.config.provider_id,
+                    endpoint=url,
+                    status_code=response.status_code,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    response_preview=response.text[:300],
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                raise
+        if cache_minutes > 0:
+            _TREND_RADAR_CACHE[url] = (time.monotonic() + cache_minutes * 60, normalized)
+        write_diagnostic(
+            "trend_radar_request",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            provider_id=self.config.provider_id,
+            endpoint=url,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            trend_count=len(normalized["trends"]),
+            total_titles_processed=normalized["total_titles_processed"],
+        )
+        return normalized
+
+
 class VolcArkWebSearchClient:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
@@ -1059,6 +1889,24 @@ class VolcArkWebSearchClient:
         }
         if self.metadata.get("max_tool_calls") not in (None, ""):
             body["max_tool_calls"] = _as_int(self.metadata.get("max_tool_calls"), 1)
+        span_id = new_span_id("search")
+        started = time.monotonic()
+        write_diagnostic(
+            "search_request",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="联网搜索",
+            stage="ark_web_search",
+            purpose="Search latest verifiable context",
+            summary=query[:120],
+            provider_id=self.config.provider_id,
+            provider=self.config.provider,
+            model=self.config.model,
+            endpoint=self._url(),
+            request=body,
+            require_published_at=require_published_at,
+        )
         with _client(float(self.metadata.get("timeout", 40.0))) as client:
             response = client.post(
                 self._url(),
@@ -1075,9 +1923,30 @@ class VolcArkWebSearchClient:
                     model=self.config.model,
                     endpoint=self._url(),
                     status_code=response.status_code,
+                    span_id=span_id,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
                     error_type=type(exc).__name__,
                     message=str(exc),
                     response_preview=response.text[:300],
+                )
+                write_diagnostic(
+                    "search_request",
+                    phase="end",
+                    status="error",
+                    span_id=span_id,
+                    feature="联网搜索",
+                    stage="ark_web_search",
+                    purpose="Search latest verifiable context",
+                    summary=query[:120],
+                    provider_id=self.config.provider_id,
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    endpoint=self._url(),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    status_code=response.status_code,
+                    response_preview=response.text[:300],
+                    error_type=type(exc).__name__,
+                    message=str(exc),
                 )
                 if response.status_code == 404:
                     raise ProviderError(
@@ -1092,13 +1961,49 @@ class VolcArkWebSearchClient:
             results = [item for item in results if item.published_at]
         if not results:
             requirement = "title/url/published_at" if require_published_at else "title/url"
+            write_diagnostic(
+                "search_request",
+                phase="end",
+                status="error",
+                span_id=span_id,
+                feature="联网搜索",
+                stage="ark_web_search",
+                purpose="Search latest verifiable context",
+                summary=query[:120],
+                provider_id=self.config.provider_id,
+                provider=self.config.provider,
+                model=self.config.model,
+                endpoint=self._url(),
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                raw_response=payload,
+                message=f"missing sources with {requirement}",
+            )
             raise ProviderError(f"Ark Web Search did not return verifiable sources with {requirement}")
-        return {
+        result = {
             "summary": _response_text(payload),
             "sources": [item.model_dump() for item in results],
             "tool_usage": (payload.get("usage") or {}).get("tool_usage_details") if isinstance(payload, dict) else None,
             "raw_id": payload.get("id") if isinstance(payload, dict) else "",
         }
+        write_diagnostic(
+            "search_request",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            feature="联网搜索",
+            stage="ark_web_search",
+            purpose="Search latest verifiable context",
+            summary=query[:120],
+            provider_id=self.config.provider_id,
+            provider=self.config.provider,
+            model=self.config.model,
+            endpoint=self._url(),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            response=result,
+            raw_response=payload,
+            source_count=len(results),
+        )
+        return result
 
 
 class QWeatherClient:
@@ -1143,6 +2048,21 @@ class QWeatherClient:
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         clean_params = {key: value for key, value in params.items() if value not in (None, "")}
+        span_id = new_span_id("weather")
+        started = time.monotonic()
+        write_diagnostic(
+            "weather_request",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="天气服务",
+            stage=path.strip("/") or "weather",
+            purpose="Fetch weather data",
+            summary=path,
+            provider_id=self.config.provider_id,
+            endpoint=self._url(path),
+            request={"params": clean_params, "auth_mode": self.auth_mode},
+        )
         with _client(float(self.metadata.get("timeout", 30.0))) as client:
             response = client.get(self._url(path), headers=self._headers(), params=clean_params)
             try:
@@ -1153,14 +2073,61 @@ class QWeatherClient:
                     provider_id=self.config.provider_id,
                     endpoint=self._url(path),
                     status_code=response.status_code,
+                    span_id=span_id,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
                     response_preview=response.text[:300],
+                )
+                write_diagnostic(
+                    "weather_request",
+                    phase="end",
+                    status="error",
+                    span_id=span_id,
+                    feature="天气服务",
+                    stage=path.strip("/") or "weather",
+                    purpose="Fetch weather data",
+                    summary=path,
+                    provider_id=self.config.provider_id,
+                    endpoint=self._url(path),
+                    status_code=response.status_code,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    response_preview=response.text[:300],
+                    message=str(exc),
                 )
                 raise ProviderError(f"QWeather request failed: HTTP {response.status_code}") from exc
         payload = response.json()
         code = str(payload.get("code") or "")
         if code and code != "200":
-            write_diagnostic("qweather_api_error", provider_id=self.config.provider_id, endpoint=self._url(path), code=code)
+            write_diagnostic("qweather_api_error", provider_id=self.config.provider_id, endpoint=self._url(path), span_id=span_id, elapsed_ms=int((time.monotonic() - started) * 1000), code=code)
+            write_diagnostic(
+                "weather_request",
+                phase="end",
+                status="error",
+                span_id=span_id,
+                feature="天气服务",
+                stage=path.strip("/") or "weather",
+                purpose="Fetch weather data",
+                summary=path,
+                provider_id=self.config.provider_id,
+                endpoint=self._url(path),
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                response=payload,
+                message=f"QWeather API returned code={code}",
+            )
             raise ProviderError(f"QWeather API returned code={code}")
+        write_diagnostic(
+            "weather_request",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            feature="天气服务",
+            stage=path.strip("/") or "weather",
+            purpose="Fetch weather data",
+            summary=path,
+            provider_id=self.config.provider_id,
+            endpoint=self._url(path),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            response=payload,
+        )
         return payload
 
     def city_lookup(self, location: str) -> dict[str, Any]:
@@ -1197,10 +2164,13 @@ class QWeatherClient:
             "daily": self._get(f"/v7/weather/{daily_days}", common),
             "hourly": self._get(f"/v7/weather/{hourly_hours}", common),
         }
-        try:
-            bundle["warning"] = self._get("/v7/warning/now", common)
-        except Exception as exc:  # noqa: BLE001
-            write_diagnostic("qweather_warning_skipped", provider_id=self.config.provider_id, message=str(exc))
+        if _as_bool(self.metadata.get("include_warning"), False):
+            try:
+                bundle["warning"] = self._get("/v7/warning/now", common)
+            except Exception as exc:  # noqa: BLE001
+                write_diagnostic("qweather_warning_skipped", provider_id=self.config.provider_id, message=str(exc))
+                bundle["warning"] = {}
+        else:
             bundle["warning"] = {}
         if _as_bool(self.metadata.get("include_minutely"), True) and coordinate:
             try:
@@ -1231,13 +2201,27 @@ class ImageProvider:
             raise ProviderError("Image provider API key is not configured")
 
     def generate(self, session: Session, prompt: str) -> MediaAsset:
-        if self.config.provider == "doubao_seedream":
-            return self._generate_doubao_seedream(session, prompt)
-        if self.config.provider == "openai_gpt_image":
-            return self._generate_openai_image(session, prompt)
-        if self.config.provider == "gemini_image":
-            return self._generate_gemini_image(session, prompt)
-        raise ProviderError(f"Unsupported image provider: {self.config.provider}")
+        with diagnostic_span(
+            "image_request",
+            feature="图片生成",
+            stage=self.config.provider,
+            purpose="Generate image asset",
+            summary=prompt[:120],
+            provider_id=self.config.provider_id,
+            provider=self.config.provider,
+            model=self.config.model,
+            request={"prompt": prompt, "metadata": self.metadata},
+        ) as span:
+            if self.config.provider == "doubao_seedream":
+                asset = self._generate_doubao_seedream(session, prompt)
+            elif self.config.provider == "openai_gpt_image":
+                asset = self._generate_openai_image(session, prompt)
+            elif self.config.provider == "gemini_image":
+                asset = self._generate_gemini_image(session, prompt)
+            else:
+                raise ProviderError(f"Unsupported image provider: {self.config.provider}")
+            span.add(response={"asset_id": asset.asset_id, "url": asset.url, "asset_type": asset.asset_type})
+            return asset
 
     def _save_downloaded_url(self, session: Session, client: httpx.Client, url: str, prompt: str, fallback_ext: str) -> MediaAsset:
         image_response = client.get(url)
@@ -1362,15 +2346,33 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
             message = "TTS test generated playable audio"
             details = {"asset_id": asset.asset_id, "url": asset.url}
         elif config.kind == "search":
-            if config.provider != "volc_ark_web_search":
+            if config.provider == "trend_radar":
+                result = TrendRadarClient(config).fetch(force=True)
+                first_title: dict[str, Any] = {}
+                for trend in result.get("trends") or []:
+                    titles = trend.get("titles") or []
+                    if titles:
+                        first_title = titles[0]
+                        break
+                ok = True
+                message = "TrendRadar returned trends"
+                details = {
+                    "generated_at": result.get("generated_at") or "",
+                    "total_titles_processed": result.get("total_titles_processed") or 0,
+                    "trend_count": len(result.get("trends") or []),
+                    "first_title": first_title,
+                    "failed_sources": result.get("failed_sources") or [],
+                }
+            elif config.provider == "volc_ark_web_search":
+                result = VolcArkWebSearchClient(config).search(
+                    "请联网搜索今天 AI 游戏或 AI 陪伴应用相关的一条新闻，返回带标题、链接、发布时间的来源。",
+                    require_published_at=True,
+                )
+                ok = True
+                message = "Ark Web Search returned verifiable sources"
+                details = result
+            else:
                 raise ProviderError("DeepSeek experimental search is not enabled for demo acceptance; use Volc Ark Web Search.")
-            result = VolcArkWebSearchClient(config).search(
-                "请联网搜索今天 AI 游戏或 AI 陪伴应用相关的一条新闻，返回带标题、链接、发布时间的来源。",
-                require_published_at=True,
-            )
-            ok = True
-            message = "Ark Web Search returned verifiable sources"
-            details = result
         elif config.kind == "weather":
             if config.provider != "qweather":
                 raise ProviderError("Unsupported weather provider")
@@ -1394,11 +2396,19 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
         details = {"error_type": type(exc).__name__}
         if payload.kind == "search":
             base_url = (config.base_url if config is not None else payload.base_url).rstrip("/")
+            endpoint = ""
+            if config is not None and config.provider == "trend_radar":
+                try:
+                    endpoint = TrendRadarClient(config)._url()
+                except Exception:  # noqa: BLE001
+                    endpoint = base_url
+            elif base_url:
+                endpoint = f"{base_url}/responses"
             details.update(
                 {
                     "provider_id": config.provider_id if config is not None else payload.provider_id,
                     "model": config.model if config is not None else payload.model,
-                    "endpoint": f"{base_url}/responses" if base_url else "",
+                    "endpoint": endpoint,
                 }
             )
     else:
@@ -1416,11 +2426,15 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
             }
         )
         if config.kind == "search":
+            if config.provider == "trend_radar":
+                last_test_endpoint = TrendRadarClient(config)._url()
+            else:
+                last_test_endpoint = f"{config.base_url.rstrip('/')}/responses"
             metadata.update(
                 {
                     "last_test_provider": config.provider,
                     "last_test_model": config.model,
-                    "last_test_endpoint": f"{config.base_url.rstrip('/')}/responses",
+                    "last_test_endpoint": last_test_endpoint,
                 }
             )
         config.metadata_json = dump_json(metadata)

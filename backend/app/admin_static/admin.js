@@ -19,6 +19,23 @@ const state = {
   memories: [],
   calendarEvents: [],
   proactiveEvents: [],
+  aiSchedule: [],
+  proactiveActionResult: null,
+  runtimeLogs: [],
+  runtimeFeatures: [],
+  runtimeFlows: [],
+  runtimeTraces: [],
+  runtimeServerTime: 0,
+  runtimeTotal: 0,
+  runtimeLegacyCount: 0,
+  runtimeOldestTs: null,
+  runtimeHasMore: false,
+  runtimePendingPayload: null,
+  runtimeOpenTraces: new Set(),
+  runtimeOpenItems: new Set(),
+  runtimeSelectedId: "",
+  runtimeTimer: null,
+  runtimeFilters: { feature: "", status: "", q: "", limit: 200, traceId: "", includeLegacy: true, includeCacheHits: false },
   currentPage: "users",
   userPage: { page: 1, pageSize: 20, total: 0, q: "" },
   memoryPage: { page: 1, pageSize: 10, total: 0, q: "" },
@@ -47,6 +64,26 @@ async function api(path, options = {}) {
 
 function pretty(value) {
   return JSON.stringify(value, null, 2);
+}
+
+function formatDateTime(value) {
+  if (!value) return "-";
+  const date = new Date(Number(value) * 1000);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString();
+}
+
+function formatDuration(ms) {
+  const value = Number(ms || 0);
+  if (value < 1000) return `${Math.max(0, Math.round(value))} ms`;
+  return `${(value / 1000).toFixed(value < 10_000 ? 2 : 1)} s`;
+}
+
+function formatIsoTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function escapeHtml(value) {
@@ -86,6 +123,12 @@ function switchPage(page) {
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.classList.toggle("active", button.dataset.pageTarget === page);
   });
+  if (page === "runtime-logs") {
+    readRuntimeFilters();
+    loadRuntimeLogs().catch((error) => {
+      $("#runtimeLogList").innerHTML = `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`;
+    });
+  }
 }
 
 function providerList(kind) {
@@ -627,7 +670,7 @@ function renderUserEditor() {
       <label><span>user_id</span><input name="user_id" value="${escapeHtml(user.user_id)}" disabled></label>
       <label><span>显示名</span><input name="display_name" value="${escapeHtml(user.display_name || "")}"></label>
       <label><span>时区</span><input name="timezone" value="${escapeHtml(user.timezone || "Asia/Hong_Kong")}"></label>
-      <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "low")}"></label>
+      <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "unlimited")}"></label>
       <label><span>睡眠开始</span><input name="sleep_start" value="${escapeHtml(user.sleep_start || "00:30")}"></label>
       <label><span>睡眠结束</span><input name="sleep_end" value="${escapeHtml(user.sleep_end || "08:00")}"></label>
       <label class="wide"><span>兴趣主题（一行一个）</span><textarea name="interest_topics">${escapeHtml((user.interest_topics || []).join("\n"))}</textarea></label>
@@ -829,6 +872,25 @@ function renderProactiveEditor() {
     node.textContent = "请选择用户。";
     return;
   }
+  const scheduleSegments = compactSchedule(state.aiSchedule);
+  const scheduleItems = scheduleSegments.map((slot) => `
+    <article class="data-item">
+      <strong>${escapeHtml(formatIsoTime(slot.start_at))} - ${escapeHtml(formatIsoTime(slot.end_at))} · ${escapeHtml(slot.activity_title || "")}</strong>
+      <small>${escapeHtml(slot.location || "")} · ${escapeHtml(slot.activity_type || "")} · ${escapeHtml(slot.actual_status || "")} · salience ${escapeHtml(slot.salience || 0)}</small>
+    </article>
+  `).join("");
+  const sourceOptions = [
+    ["news", "新闻"],
+    ["weather", "天气"],
+    ["schedule", "AI 日程"],
+    ["calendar_event", "日历事件"],
+    ["moment_interaction", "朋友圈互动"],
+    ["appointment", "约定"],
+    ["memory", "记忆"],
+  ].map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  const slotOptions = state.aiSchedule.map((slot) => `
+    <option value="${escapeHtml(slot.slot_id)}">${escapeHtml(formatIsoTime(slot.start_at))} ${escapeHtml(slot.activity_title || "")}</option>
+  `).join("");
   const items = state.proactiveEvents.map((event) => `
     <article class="data-item">
       <strong>${escapeHtml(event.status)} · ${escapeHtml(event.source_type)} · priority ${escapeHtml(event.priority)}</strong>
@@ -838,6 +900,25 @@ function renderProactiveEditor() {
     </article>
   `).join("");
   node.innerHTML = `
+    <form class="compact-form" id="proactiveGenerateForm">
+      <label><span>主动来源</span><select name="source_type">${sourceOptions}</select></label>
+      <label><span>AI 日程 slot</span><select name="slot_id"><option value="">自动选择</option>${slotOptions}</select></label>
+      <label><span>优先级</span><input name="priority" type="number" min="0" max="100" value="80"></label>
+      <label><span>标题</span><input name="title" placeholder="后台测试主动消息"></label>
+      <label class="wide"><span>内容</span><textarea name="text" placeholder="留空则按来源自动生成测试内容"></textarea></label>
+      <label class="inline-check"><input type="checkbox" name="due_now" checked><span>立刻到期</span></label>
+      <label class="inline-check"><input type="checkbox" name="manual_only"><span>只生成测试候选</span></label>
+      <label class="inline-check"><input type="checkbox" name="prepare"><span>判断后预制对话</span></label>
+      <div class="actions">
+        <button type="button" id="proactiveGenerate">从来源生成</button>
+        <button type="button" class="secondary" id="proactiveJudgeNow">立即判断</button>
+      </div>
+    </form>
+    <section class="data-list">
+      <h4>今天的 AI 日程</h4>
+      ${scheduleItems || "<small>暂无 AI 日程</small>"}
+    </section>
+    <pre id="proactiveActionResult">${state.proactiveActionResult ? escapeHtml(pretty(state.proactiveActionResult)) : "等待主动消息测试操作..."}</pre>
     <div class="table-toolbar">
       <label><span>搜索主动消息</span><input id="proactiveSearch" value="${escapeHtml(state.proactivePage.q)}" placeholder="标题 / 内容 / 来源"></label>
       <label><span>每页</span><select id="proactivePageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.proactivePage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
@@ -847,11 +928,13 @@ function renderProactiveEditor() {
     <div class="data-list">${items || "<small>暂无主动消息</small>"}</div>
     <div class="pager" id="proactivePager"></div>
   `;
+  $("#proactiveGenerate").addEventListener("click", () => generateProactiveFromSource());
+  $("#proactiveJudgeNow").addEventListener("click", () => judgeProactiveNow());
   $("#proactiveRefresh").addEventListener("click", async () => {
     state.proactivePage.q = $("#proactiveSearch").value.trim();
     state.proactivePage.pageSize = Number($("#proactivePageSize").value || 10);
     state.proactivePage.page = 1;
-    await loadProactiveEvents();
+    await Promise.all([loadProactiveEvents(), loadAiSchedule()]);
     renderProactiveEditor();
   });
   $("#proactiveSearch").addEventListener("keydown", async (event) => {
@@ -869,7 +952,7 @@ function renderProactiveEditor() {
     renderProactiveEditor();
   });
   $("#proactivePrewarm").addEventListener("click", async () => {
-    await api("/api/admin/proactive-events/prewarm", {
+    state.proactiveActionResult = await api("/api/admin/proactive-events/prewarm", {
       method: "POST",
       body: JSON.stringify({ user_id: state.activeUserId, character_id: "sakura", limit: 4 }),
     });
@@ -881,6 +964,25 @@ function renderProactiveEditor() {
     await loadProactiveEvents();
     renderProactiveEditor();
   });
+}
+
+function compactSchedule(items) {
+  const segments = [];
+  for (const item of items || []) {
+    const prev = segments[segments.length - 1];
+    const same = prev
+      && prev.activity_title === item.activity_title
+      && prev.activity_type === item.activity_type
+      && prev.location === item.location
+      && prev.actual_status === item.actual_status;
+    if (same) {
+      prev.end_at = item.end_at;
+      prev.salience = Math.max(Number(prev.salience || 0), Number(item.salience || 0));
+    } else {
+      segments.push({ ...item });
+    }
+  }
+  return segments;
 }
 
 function renderTestData() {
@@ -969,10 +1071,58 @@ async function loadProactiveEvents() {
   state.proactivePage.pageSize = payload.page_size || state.proactivePage.pageSize;
 }
 
+async function loadAiSchedule() {
+  if (!state.activeUserId) {
+    state.aiSchedule = [];
+    return;
+  }
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "sakura" });
+  const payload = await api(`/api/admin/ai-schedule/today?${params.toString()}`);
+  state.aiSchedule = payload.items || [];
+}
+
 async function loadTestData() {
   await loadUsers();
-  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents(), loadAiSchedule()]);
   renderTestData();
+}
+
+function proactiveFormPayload() {
+  const form = $("#proactiveGenerateForm");
+  return {
+    user_id: state.activeUserId,
+    character_id: "sakura",
+    source_type: form.elements.source_type.value,
+    slot_id: form.elements.slot_id.value,
+    priority: Number(form.elements.priority.value || 80),
+    title: form.elements.title.value.trim(),
+    text: form.elements.text.value.trim(),
+    due_now: form.elements.due_now.checked,
+    manual_only: form.elements.manual_only.checked,
+    prepare: form.elements.prepare.checked,
+    ignore_next_check: true,
+    idle_seconds: 120,
+    input_active: false,
+  };
+}
+
+async function generateProactiveFromSource() {
+  state.proactiveActionResult = await api("/api/admin/proactive-events/generate", {
+    method: "POST",
+    body: JSON.stringify(proactiveFormPayload()),
+  });
+  state.proactivePage.page = 1;
+  await Promise.all([loadProactiveEvents(), loadAiSchedule()]);
+  renderProactiveEditor();
+}
+
+async function judgeProactiveNow() {
+  state.proactiveActionResult = await api("/api/admin/proactive-events/judge", {
+    method: "POST",
+    body: JSON.stringify(proactiveFormPayload()),
+  });
+  await loadProactiveEvents();
+  renderProactiveEditor();
 }
 
 async function createUser() {
@@ -1178,6 +1328,482 @@ function renderStatus(configured) {
   }
 }
 
+function runtimeStatusLabel(item) {
+  if (item.stale || item.status === "stale") return "可能中断";
+  if (item.running || item.status === "running") return "运行中";
+  if (item.status === "error") return "错误";
+  if (item.status === "warn") return "提醒";
+  return "成功";
+}
+
+function runtimeStatusClass(item) {
+  if (item.stale || item.status === "stale") return "stale";
+  if (item.running || item.status === "running") return "running";
+  if (item.status === "error") return "error";
+  if (item.status === "warn") return "warn";
+  return "ok";
+}
+
+function firstRuntimeValue(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "" && !(Array.isArray(value) && value.length === 0));
+}
+
+function runtimeDetailSection(title, value) {
+  if (value === undefined || value === null || value === "" || (Array.isArray(value) && value.length === 0)) return "";
+  return `
+    <section class="runtime-detail-section">
+      <h3>${escapeHtml(title)}</h3>
+      <pre>${escapeHtml(typeof value === "string" ? value : pretty(value))}</pre>
+    </section>
+  `;
+}
+
+function runtimeItemById(id) {
+  return state.runtimeLogs.find((item) => item.id === id) || null;
+}
+
+function runtimeInspecting() {
+  return [...document.querySelectorAll("#runtimeLogList details")].some((details) => details.open);
+}
+
+function captureRuntimeViewState() {
+  const list = $("#runtimeLogList");
+  if (list) {
+    state.runtimeOpenTraces = new Set(
+      [...list.querySelectorAll("details[data-runtime-trace-id]")]
+        .filter((details) => details.open)
+        .map((details) => details.dataset.runtimeTraceId)
+    );
+    state.runtimeOpenItems = new Set(
+      [...list.querySelectorAll("details[data-runtime-id]")]
+        .filter((details) => details.open)
+        .map((details) => details.dataset.runtimeId)
+    );
+  }
+  return { scrollY: window.scrollY || document.documentElement.scrollTop || 0 };
+}
+
+function restoreRuntimeViewState(view) {
+  if (!view) return;
+  window.requestAnimationFrame(() => {
+    window.scrollTo({ top: view.scrollY || 0 });
+  });
+}
+
+function setRuntimeNotice(visible) {
+  const notice = $("#runtimeNewNotice");
+  if (notice) notice.hidden = !visible;
+}
+
+function runtimeDetailActions(item) {
+  return `
+    <div class="runtime-detail-actions">
+      <button type="button" class="secondary" data-runtime-jump="${escapeHtml(item.prev_id || "")}" ${item.prev_id ? "" : "disabled"}>上一步输入</button>
+      <button type="button" class="secondary" data-runtime-jump="${escapeHtml(item.next_id || "")}" ${item.next_id ? "" : "disabled"}>下一步输出</button>
+      <button type="button" class="secondary" data-runtime-trace="${escapeHtml(item.trace_id || "")}" ${item.trace_id ? "" : "disabled"}>只看本 trace</button>
+      <button type="button" class="secondary" data-runtime-feature="${escapeHtml(item.feature || "")}" ${item.feature ? "" : "disabled"}>只看本功能</button>
+    </div>
+  `;
+}
+
+function runtimeDetailHtml(item) {
+  const details = item.details || {};
+  const start = details.start || {};
+  const end = details.end || {};
+  const point = details.point || {};
+  const points = details.points || [];
+  const judgementPoints = points.filter((entry) => ["reply_llm_judgement", "reply_output_ready", "reply_context_ready"].includes(entry.event));
+  const prev = runtimeItemById(item.prev_id);
+  const next = runtimeItemById(item.next_id);
+  const references = firstRuntimeValue(start.references, end.references, point.references, start.input?.references, end.input?.references, point.input?.references);
+  const errorPayload = firstRuntimeValue(
+    end.error_type || end.message ? { error_type: end.error_type, message: end.message } : null,
+    point.error_type || point.message ? { error_type: point.error_type, message: point.message } : null,
+  );
+  return [
+    runtimeDetailActions(item),
+    runtimeDetailSection("上一步输入", prev ? firstRuntimeValue(prev.input_summary, prev.details?.start?.input, prev.details?.point?.input) : ""),
+    runtimeDetailSection("下一步输出", next ? firstRuntimeValue(next.output_summary, next.details?.end?.output, next.details?.end?.response, next.details?.point?.output) : ""),
+    runtimeDetailSection("输入", firstRuntimeValue(start.input, point.input, end.input)),
+    runtimeDetailSection("引用内容", references),
+    runtimeDetailSection("LLM / 外部请求", firstRuntimeValue(start.request, point.request)),
+    runtimeDetailSection("响应", firstRuntimeValue(end.response, end.response_text, end.raw_content, point.response)),
+    runtimeDetailSection("判断", judgementPoints.length ? judgementPoints : firstRuntimeValue(end.keys, point.keys)),
+    runtimeDetailSection("错误", errorPayload),
+    runtimeDetailSection("原始 JSON", details.raw_events || [point]),
+  ].join("");
+}
+
+function renderRuntimeFeatures() {
+  const select = $("#runtimeFeature");
+  const selected = state.runtimeFilters.feature;
+  select.innerHTML = `<option value="">全部</option>${state.runtimeFeatures.map((feature) => `<option value="${escapeHtml(feature)}">${escapeHtml(feature)}</option>`).join("")}`;
+  select.value = selected;
+}
+
+function renderRuntimeTraceFilter() {
+  const node = $("#runtimeTraceFilter");
+  if (!node) return;
+  if (!state.runtimeFilters.traceId) {
+    node.hidden = true;
+    node.innerHTML = "";
+    return;
+  }
+  node.hidden = false;
+  node.innerHTML = `
+    <span>trace: ${escapeHtml(state.runtimeFilters.traceId)}</span>
+    <button type="button" class="secondary" data-runtime-clear-trace>清除 trace 筛选</button>
+  `;
+}
+
+function runtimeTraceByItemId(id) {
+  for (const trace of state.runtimeTraces || []) {
+    const items = trace.items || [];
+    if (items.some((item) => item.id === id)) return trace;
+  }
+  return null;
+}
+
+function runtimeTraceTitle(trace) {
+  return trace.summary || trace.feature || trace.trace_id || "trace";
+}
+
+function renderRuntimeReferenceBadges(item) {
+  const badges = [];
+  if (item.references_summary) badges.push(`<span class="runtime-reference-chip">${escapeHtml(item.references_summary)}</span>`);
+  if (item.input_summary) badges.push(`<span class="runtime-mini-summary">输入：${escapeHtml(item.input_summary)}</span>`);
+  if (item.output_summary) badges.push(`<span class="runtime-mini-summary">输出：${escapeHtml(item.output_summary)}</span>`);
+  return badges.length ? `<div class="runtime-step-meta">${badges.join("")}</div>` : "";
+}
+
+function renderRuntimeTraceItem(item, index) {
+  const statusClass = runtimeStatusClass(item);
+  const title = [item.feature, item.stage].filter(Boolean).join(" / ") || item.event || "runtime";
+  const trace = item.trace_id ? `trace ${item.trace_id}` : "no trace";
+  const span = item.span_id ? `span ${item.span_id}` : "";
+  const open = state.runtimeOpenItems.has(item.id) ? "open" : "";
+  const selected = state.runtimeSelectedId === item.id ? "selected" : "";
+  const childCount = (item.children_ids || []).length;
+  return `
+    <article class="runtime-step runtime-item ${statusClass} ${selected}" data-runtime-item-id="${escapeHtml(item.id || "")}">
+      <div class="runtime-step-index" aria-hidden="true">${index + 1}</div>
+      <div class="runtime-step-content">
+        <button type="button" class="runtime-node-button" data-runtime-node-id="${escapeHtml(item.id || "")}">
+          <span class="runtime-state ${statusClass}">${escapeHtml(runtimeStatusLabel(item))}</span>
+          <span class="runtime-node-main">
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(formatDateTime(item.started_ts))} · ${escapeHtml(formatDuration(item.elapsed_ms))} · ${escapeHtml(trace)} ${escapeHtml(span)}</small>
+          </span>
+        </button>
+        <p>${escapeHtml(item.summary || item.purpose || item.event || "")}</p>
+        <div class="runtime-node-tags">
+          ${item.feature ? `<button type="button" class="runtime-feature-chip" data-runtime-feature="${escapeHtml(item.feature)}">${escapeHtml(item.feature)}</button>` : ""}
+          ${item.parent_id ? `<span class="runtime-relation-chip">父节点</span>` : ""}
+          ${childCount ? `<span class="runtime-relation-chip">子节点 ${childCount}</span>` : ""}
+        </div>
+        ${renderRuntimeReferenceBadges(item)}
+        <details data-runtime-id="${escapeHtml(item.id || "")}" ${open}>
+          <summary>查看详情</summary>
+          <div class="runtime-detail-grid">${runtimeDetailHtml(item)}</div>
+        </details>
+      </div>
+    </article>
+  `;
+}
+
+function renderRuntimeTraceCard(trace) {
+  const items = trace.items || [];
+  const statusClass = runtimeStatusClass(trace);
+  const open = state.runtimeOpenTraces.has(trace.trace_id) ? "open" : "";
+  const selected = items.some((item) => item.id === state.runtimeSelectedId) ? "selected" : "";
+  const canFilterTrace = trace.trace_id && !trace.is_legacy;
+  return `
+    <details class="runtime-trace-card ${statusClass} ${selected}" data-runtime-trace-id="${escapeHtml(trace.trace_id || "")}" ${open}>
+      <summary class="runtime-trace-summary">
+        <span class="runtime-state ${statusClass}">${escapeHtml(runtimeStatusLabel(trace))}</span>
+        <span class="runtime-trace-main">
+          <strong>${escapeHtml(runtimeTraceTitle(trace))}</strong>
+          <small>${escapeHtml(formatDateTime(trace.started_ts))} · ${escapeHtml(formatDuration(trace.elapsed_ms))} · ${items.length} 个节点 · ${escapeHtml(trace.trace_id || "no trace")}</small>
+        </span>
+        <span class="runtime-trace-actions">
+          ${trace.feature ? `<button type="button" class="secondary" data-runtime-feature="${escapeHtml(trace.feature)}">只看本功能</button>` : ""}
+          <button type="button" class="secondary" data-runtime-trace="${escapeHtml(trace.trace_id || "")}" ${canFilterTrace ? "" : "disabled"}>只看本 trace</button>
+        </span>
+      </summary>
+      <div class="runtime-trace-flow">
+        ${items.map((item, index) => renderRuntimeTraceItem(item, index)).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderRuntimeLogs() {
+  const list = $("#runtimeLogList");
+  const traceCount = state.runtimeTraces.length || 0;
+  $("#runtimeLogStatus").textContent = `${traceCount} traces / ${state.runtimeLogs.length} 条`;
+  $("#runtimeLogStatus").classList.toggle("ok", state.runtimeLogs.length > 0);
+  renderRuntimeFeatures();
+  renderRuntimeTraceFilter();
+  const loadOlder = $("#runtimeLoadOlder");
+  if (loadOlder) loadOlder.disabled = !state.runtimeHasMore || !state.runtimeOldestTs;
+  if (!state.runtimeTraces.length) {
+    list.innerHTML = `<div class="editor-placeholder">暂无运行日志。</div>`;
+    return;
+  }
+  list.innerHTML = state.runtimeTraces.map(renderRuntimeTraceCard).join("");
+  list.querySelectorAll("details[data-runtime-trace-id]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (details.open) state.runtimeOpenTraces.add(details.dataset.runtimeTraceId);
+      else state.runtimeOpenTraces.delete(details.dataset.runtimeTraceId);
+    });
+  });
+  list.querySelectorAll("details[data-runtime-id]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (details.open) state.runtimeOpenItems.add(details.dataset.runtimeId);
+      else state.runtimeOpenItems.delete(details.dataset.runtimeId);
+    });
+  });
+}
+
+function mergeRuntimeItems(existing, incoming) {
+  const byId = new Map();
+  [...existing, ...incoming].forEach((item) => {
+    if (item && item.id) byId.set(item.id, item);
+  });
+  return [...byId.values()].sort((a, b) => Number(b.started_ts || 0) - Number(a.started_ts || 0));
+}
+
+function mergeRuntimeFlows(existing, incoming) {
+  const byTrace = new Map();
+  for (const flow of existing || []) byTrace.set(flow.trace_id, flow);
+  for (const flow of incoming || []) {
+    const current = byTrace.get(flow.trace_id);
+    if (!current) {
+      byTrace.set(flow.trace_id, flow);
+      continue;
+    }
+    const nodeIds = new Set((current.nodes || []).map((node) => node.id));
+    current.nodes = [...(current.nodes || []), ...(flow.nodes || []).filter((node) => !nodeIds.has(node.id))];
+    const edgeIds = new Set((current.edges || []).map((edge) => `${edge.from}->${edge.to}`));
+    current.edges = [...(current.edges || []), ...(flow.edges || []).filter((edge) => !edgeIds.has(`${edge.from}->${edge.to}`))];
+  }
+  return [...byTrace.values()].sort((a, b) => Number(b.started_ts || 0) - Number(a.started_ts || 0));
+}
+
+function mergeRuntimeTraces(existing, incoming) {
+  const byTrace = new Map();
+  for (const trace of existing || []) {
+    if (trace && trace.trace_id) byTrace.set(trace.trace_id, { ...trace, items: [...(trace.items || [])], nodes: [...(trace.nodes || [])], edges: [...(trace.edges || [])] });
+  }
+  for (const trace of incoming || []) {
+    if (!trace || !trace.trace_id) continue;
+    const current = byTrace.get(trace.trace_id);
+    if (!current) {
+      byTrace.set(trace.trace_id, trace);
+      continue;
+    }
+    const itemIds = new Set((current.items || []).map((item) => item.id));
+    current.items = mergeRuntimeItems(current.items || [], (trace.items || []).filter((item) => !itemIds.has(item.id)));
+    const nodeIds = new Set((current.nodes || []).map((node) => node.id));
+    current.nodes = [...(current.nodes || []), ...(trace.nodes || []).filter((node) => !nodeIds.has(node.id))];
+    const edgeIds = new Set((current.edges || []).map((edge) => `${edge.from}->${edge.to}`));
+    current.edges = [...(current.edges || []), ...(trace.edges || []).filter((edge) => !edgeIds.has(`${edge.from}->${edge.to}`))];
+    current.status = trace.status || current.status;
+    current.running = Boolean(trace.running || current.running);
+    current.stale = Boolean(trace.stale || current.stale);
+    current.elapsed_ms = Math.max(Number(current.elapsed_ms || 0), Number(trace.elapsed_ms || 0));
+    current.started_ts = Math.min(Number(current.started_ts || trace.started_ts || 0), Number(trace.started_ts || current.started_ts || 0));
+    current.ended_ts = Math.max(Number(current.ended_ts || 0), Number(trace.ended_ts || 0)) || current.ended_ts || trace.ended_ts || null;
+  }
+  return [...byTrace.values()].sort((a, b) => Number(b.started_ts || 0) - Number(a.started_ts || 0));
+}
+
+function applyRuntimePayload(payload, { append = false, preserve = true } = {}) {
+  const view = preserve ? captureRuntimeViewState() : null;
+  const items = payload.items || [];
+  state.runtimeLogs = append ? mergeRuntimeItems(state.runtimeLogs, items) : items;
+  state.runtimeFeatures = payload.features || state.runtimeFeatures || [];
+  state.runtimeFlows = append ? mergeRuntimeFlows(state.runtimeFlows, payload.flows || []) : (payload.flows || []);
+  state.runtimeTraces = append ? mergeRuntimeTraces(state.runtimeTraces, payload.traces || []) : (payload.traces || []);
+  state.runtimeServerTime = payload.server_time || 0;
+  state.runtimeTotal = payload.total || state.runtimeLogs.length;
+  state.runtimeLegacyCount = payload.legacy_count || 0;
+  state.runtimeHasMore = Boolean(payload.has_more);
+  if (append) {
+    const values = [state.runtimeOldestTs, payload.oldest_ts].filter((value) => value !== null && value !== undefined);
+    state.runtimeOldestTs = values.length ? Math.min(...values) : null;
+  } else {
+    state.runtimeOldestTs = payload.oldest_ts || null;
+  }
+  state.runtimePendingPayload = null;
+  setRuntimeNotice(false);
+  renderRuntimeLogs();
+  restoreRuntimeViewState(view);
+}
+
+function runtimePayloadHasChanges(payload) {
+  const incomingTraces = (payload.traces || []).map((trace) => `${trace.trace_id}:${trace.items?.length || 0}:${trace.elapsed_ms || 0}:${trace.status || ""}`).join("|");
+  const currentTraces = state.runtimeTraces
+    .slice(0, (payload.traces || []).length)
+    .map((trace) => `${trace.trace_id}:${trace.items?.length || 0}:${trace.elapsed_ms || 0}:${trace.status || ""}`)
+    .join("|");
+  const incomingItems = (payload.items || []).map((item) => item.id).join("|");
+  const currentItems = state.runtimeLogs.slice(0, (payload.items || []).length).map((item) => item.id).join("|");
+  return incomingTraces !== currentTraces || incomingItems !== currentItems || Number(payload.total || 0) !== Number(state.runtimeTotal || 0);
+}
+
+async function loadRuntimeLogs({ deferIfInspecting = false, append = false } = {}) {
+  if (append && !state.runtimeOldestTs) return;
+  const params = new URLSearchParams({
+    limit: String(state.runtimeFilters.limit || 200),
+    feature: state.runtimeFilters.feature || "",
+    status: state.runtimeFilters.status || "",
+    q: state.runtimeFilters.q || "",
+    trace_id: state.runtimeFilters.traceId || "",
+    include_legacy: String(Boolean(state.runtimeFilters.includeLegacy)),
+    include_cache_hits: String(Boolean(state.runtimeFilters.includeCacheHits)),
+  });
+  if (append && state.runtimeOldestTs) params.set("before_ts", String(state.runtimeOldestTs));
+  const payload = await api(`/api/admin/runtime-logs?${params.toString()}`);
+  if (deferIfInspecting && runtimeInspecting()) {
+    if (runtimePayloadHasChanges(payload)) {
+      state.runtimePendingPayload = { payload, append };
+      setRuntimeNotice(true);
+    }
+    return;
+  }
+  applyRuntimePayload(payload, { append, preserve: true });
+}
+
+function readRuntimeFilters() {
+  state.runtimeFilters.feature = $("#runtimeFeature").value;
+  state.runtimeFilters.status = $("#runtimeStatus").value;
+  state.runtimeFilters.limit = Number($("#runtimeLimit").value || 200);
+  state.runtimeFilters.q = $("#runtimeSearch").value.trim();
+  state.runtimeFilters.includeLegacy = $("#runtimeIncludeLegacy") ? $("#runtimeIncludeLegacy").checked : true;
+  state.runtimeFilters.includeCacheHits = $("#runtimeIncludeCacheHits") ? $("#runtimeIncludeCacheHits").checked : false;
+}
+
+function restartRuntimeAutoRefresh() {
+  if (state.runtimeTimer) {
+    window.clearInterval(state.runtimeTimer);
+    state.runtimeTimer = null;
+  }
+  const auto = $("#runtimeAutoRefresh");
+  if (!auto || !auto.checked) return;
+  state.runtimeTimer = window.setInterval(async () => {
+    if (state.currentPage !== "runtime-logs" || !$("#runtimeAutoRefresh").checked) return;
+    try {
+      readRuntimeFilters();
+      await loadRuntimeLogs({ deferIfInspecting: true });
+    } catch (_) {
+      // Keep the page quiet during transient backend reloads.
+    }
+  }, 5000);
+}
+
+async function setRuntimeFeatureFilter(feature) {
+  state.runtimeFilters.feature = feature || "";
+  const select = $("#runtimeFeature");
+  if (select) select.value = state.runtimeFilters.feature;
+  await loadRuntimeLogs();
+}
+
+async function setRuntimeTraceFilter(traceId) {
+  state.runtimeFilters.traceId = traceId || "";
+  if (traceId) {
+    state.runtimeFilters.feature = "";
+    const feature = $("#runtimeFeature");
+    if (feature) feature.value = "";
+  }
+  await loadRuntimeLogs();
+}
+
+function selectRuntimeItem(id) {
+  if (!id) return;
+  const item = runtimeItemById(id);
+  if (!item) return;
+  state.runtimeSelectedId = id;
+  state.runtimeOpenItems.add(id);
+  const trace = runtimeTraceByItemId(id);
+  if (trace?.trace_id) state.runtimeOpenTraces.add(trace.trace_id);
+  renderRuntimeLogs();
+  const node = [...document.querySelectorAll("[data-runtime-item-id]")].find((element) => element.dataset.runtimeItemId === id)
+    || [...document.querySelectorAll("[data-runtime-id]")].find((element) => element.dataset.runtimeId === id);
+  if (node) node.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function bindRuntimeLogs() {
+  $("#runtimeRefresh").addEventListener("click", async () => {
+    readRuntimeFilters();
+    await loadRuntimeLogs();
+  });
+  $("#runtimeNewNotice").addEventListener("click", () => {
+    if (state.runtimePendingPayload) {
+      applyRuntimePayload(state.runtimePendingPayload.payload, { append: state.runtimePendingPayload.append, preserve: true });
+    }
+  });
+  $("#runtimeLoadOlder").addEventListener("click", async () => {
+    readRuntimeFilters();
+    await loadRuntimeLogs({ append: true });
+  });
+  $("#runtimeSearch").addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    readRuntimeFilters();
+    await loadRuntimeLogs();
+  });
+  ["runtimeFeature", "runtimeStatus", "runtimeLimit", "runtimeIncludeLegacy", "runtimeIncludeCacheHits"].forEach((id) => {
+    $(`#${id}`).addEventListener("change", async () => {
+      readRuntimeFilters();
+      await loadRuntimeLogs();
+    });
+  });
+  $("#runtimeLogList").addEventListener("click", async (event) => {
+    const jump = event.target.closest("[data-runtime-jump]");
+    if (jump) {
+      event.preventDefault();
+      event.stopPropagation();
+      selectRuntimeItem(jump.dataset.runtimeJump);
+      return;
+    }
+    const trace = event.target.closest("[data-runtime-trace]");
+    if (trace) {
+      event.preventDefault();
+      event.stopPropagation();
+      await setRuntimeTraceFilter(trace.dataset.runtimeTrace);
+      return;
+    }
+    const feature = event.target.closest("[data-runtime-feature]");
+    if (feature) {
+      event.preventDefault();
+      event.stopPropagation();
+      await setRuntimeFeatureFilter(feature.dataset.runtimeFeature);
+      return;
+    }
+    const node = event.target.closest("[data-runtime-node-id]");
+    if (node) {
+      event.preventDefault();
+      event.stopPropagation();
+      selectRuntimeItem(node.dataset.runtimeNodeId);
+      return;
+    }
+  });
+  $("#runtimeLogList").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const node = event.target.closest("[data-runtime-node-id]");
+    if (!node) return;
+    event.preventDefault();
+    selectRuntimeItem(node.dataset.runtimeNodeId);
+  });
+  $("#runtimeTraceFilter").addEventListener("click", async (event) => {
+    if (!event.target.closest("[data-runtime-clear-trace]")) return;
+    await setRuntimeTraceFilter("");
+  });
+  $("#runtimeAutoRefresh").addEventListener("change", restartRuntimeAutoRefresh);
+  restartRuntimeAutoRefresh();
+}
+
 async function loadStatus() {
   const status = await api("/api/admin/status");
   state.providers = status.providers || [];
@@ -1233,6 +1859,7 @@ async function boot() {
   try {
     state.presets = await api("/api/config/provider-presets");
     bindAdminNavigation();
+    bindRuntimeLogs();
     await Promise.all([loadPairing(), loadStatus()]);
     await loadVoices();
     await loadCharacters();

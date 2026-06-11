@@ -20,6 +20,72 @@ import androidx.work.WorkerParameters
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 
+private const val SakuraNotificationChannelId = "sakura"
+
+internal fun shouldMarkProactiveDelivered(pendingEventId: String, notificationPosted: Boolean): Boolean {
+    return pendingEventId.isNotBlank() && notificationPosted
+}
+
+internal fun showProactiveNotification(context: Context, state: JSONObject): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val channel = NotificationChannel(SakuraNotificationChannelId, "Sakura proactive messages", NotificationManager.IMPORTANCE_DEFAULT)
+        channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+    if (!canPostProactiveNotifications(context)) {
+        return false
+    }
+    val eventId = state.optString("proactive_event_id")
+    val title = state.optString("title", "Sakura wants to talk")
+    val text = state.optString("text", "There is a new message for you.")
+    val largeIcon = BitmapFactory.decodeResource(context.resources, R.drawable.chibi_sakura_widget)
+    val openIntent = Intent(context, MainActivity::class.java)
+        .putExtra("proactive_event_id", eventId)
+        .putExtra("proactive_open_type", "notification_opened")
+    val intent = PendingIntent.getActivity(
+        context,
+        31 + eventId.hashCode(),
+        openIntent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+    val notification = NotificationCompat.Builder(context, SakuraNotificationChannelId)
+        .setSmallIcon(R.drawable.ic_stat_sakura)
+        .setLargeIcon(largeIcon)
+        .setContentTitle(title)
+        .setContentText(text)
+        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+        .setContentIntent(intent)
+        .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+        .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+        .setAutoCancel(true)
+        .build()
+    return try {
+        NotificationManagerCompat.from(context).notify(1001 + eventId.hashCode(), notification)
+        true
+    } catch (_: SecurityException) {
+        false
+    }
+}
+
+internal fun canPostProactiveNotifications(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        return false
+    }
+    val compat = NotificationManagerCompat.from(context)
+    if (!compat.areNotificationsEnabled()) {
+        return false
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val channel = manager.getNotificationChannel(SakuraNotificationChannelId)
+        if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) {
+            return false
+        }
+    }
+    return true
+}
+
 class NotificationWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val prefs = applicationContext.settingsDataStore.data.first()
@@ -30,7 +96,8 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             val state = api.proactivePending()
             val widget = state.optObject("widget")
             val event = state.optObject("event")
-            val eventId = event.optString("proactive_event_id", widget.optString("proactive_event_id"))
+            val pendingEventId = event.optString("proactive_event_id")
+            val widgetEventId = widget.optString("proactive_event_id", pendingEventId)
             val chibiUrl = widget.optString("chibi_url")
             val chibi = if (chibiUrl.isNotBlank()) {
                 try {
@@ -48,17 +115,21 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
                 widget.optString("status", "想聊天"),
                 widget.optString("bubble", "今天也想听你说说话。"),
                 widget.optInt("unread_count", 0),
-                eventId,
+                widgetEventId,
                 chibi
             )
-            if (eventId.isNotBlank()) {
-                if (prefs[booleanPreferencesKey("notifications_enabled")] ?: true) {
+            if (pendingEventId.isNotBlank()) {
+                val notificationPosted = if (prefs[booleanPreferencesKey("notifications_enabled")] ?: true) {
                     notify(event)
+                } else {
+                    false
                 }
-                api.markProactiveDelivered(eventId)
+                if (shouldMarkProactiveDelivered(pendingEventId, notificationPosted)) {
+                    api.markProactiveDelivered(pendingEventId)
+                }
             }
             try {
-                api.prepareOpening(eventId)
+                api.prepareOpening(widgetEventId)
             } catch (_: Exception) {
             }
             Result.success()
@@ -67,40 +138,5 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
         }
     }
 
-    private fun notify(state: JSONObject) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("sakura", "小樱主动消息", NotificationManager.IMPORTANCE_DEFAULT)
-            channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-            applicationContext.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
-        val eventId = state.optString("proactive_event_id")
-        val title = state.optString("title", "小樱想和你说话")
-        val text = state.optString("text", "有新的消息想告诉你。")
-        val largeIcon = BitmapFactory.decodeResource(applicationContext.resources, R.drawable.chibi_sakura_widget)
-        val openIntent = Intent(applicationContext, MainActivity::class.java)
-            .putExtra("proactive_event_id", eventId)
-            .putExtra("proactive_open_type", "notification_opened")
-        val intent = PendingIntent.getActivity(
-            applicationContext,
-            31 + eventId.hashCode(),
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val notification = NotificationCompat.Builder(applicationContext, "sakura")
-            .setSmallIcon(R.drawable.ic_stat_sakura)
-            .setLargeIcon(largeIcon)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setContentIntent(intent)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setAutoCancel(true)
-            .build()
-        NotificationManagerCompat.from(applicationContext).notify(1001, notification)
-    }
+    private fun notify(state: JSONObject): Boolean = showProactiveNotification(applicationContext, state)
 }

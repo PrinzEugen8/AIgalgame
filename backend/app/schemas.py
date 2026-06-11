@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class ProviderConfigIn(BaseModel):
     provider_id: str | None = None
-    kind: Literal["llm", "llm_task", "tts", "search", "image", "weather"]
+    kind: Literal["llm", "llm_task", "tts", "search", "image", "weather", "push"]
     provider: str
     label: str = ""
     base_url: str = ""
@@ -121,6 +121,7 @@ class DialogueLine(BaseModel):
     text: str
     emotion: str = "calm"
     pose: str = "idle"
+    expression: str = ""
     background: str = "classroom_sakura"
     tts_audio_url: str = ""
     tts_error: str = ""

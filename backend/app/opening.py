@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .diagnostics import write_diagnostic
+from .diagnostics import diagnostic_span, write_diagnostic
 from .models import Character, OpeningCache, ProactiveEvent, User
 from .pipeline import _event, _llm_dialogue, _no_reply, _proactive_target_text, _save_dialogue_lines, _tts_for_line
 from .proactive import consume_proactive_event, pending_proactive_response
@@ -113,6 +113,42 @@ def _find_ready_cache(
     return fallback
 
 
+def has_fresh_opening_cache(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    local_time: datetime | None = None,
+    proactive_event_id: str = "",
+) -> bool:
+    now_utc = _now(local_time)
+    return _find_ready_cache(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        now_utc=now_utc,
+        proactive_event_id=proactive_event_id,
+    ) is not None
+
+
+def has_fresh_proactive_opening_cache(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    local_time: datetime | None = None,
+) -> bool:
+    now_utc = _now(local_time)
+    for cache in session.execute(_fresh_cache_query(session, user_id, character_id, now_utc)).scalars():
+        if not _is_cache_fresh(cache, now_utc):
+            cache.status = "expired"
+            cache.updated_at = utc_now()
+            continue
+        if cache.kind == "proactive":
+            return True
+    return False
+
+
 def _store_opening_cache(
     session: Session,
     *,
@@ -163,9 +199,13 @@ def _payload_from_prepared_event(event: ProactiveEvent) -> DialoguePayload | Non
 def _instant_greeting_payload(local_time: datetime | None) -> DialoguePayload:
     slot = _slot(local_time)
     choices = GREETING_LINES[slot]
-    index = ((local_time or datetime.now()).day + (local_time or datetime.now()).hour) % len(choices)
-    text, _, emotion = choices[index]
-    return DialoguePayload(lines=[DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion)], relation_delta=RelationDelta())
+    basis = local_time or datetime.now()
+    index = (basis.day + basis.hour) % len(choices)
+    lines: list[DialogueLine] = []
+    for offset in range(2):
+        text, _, emotion = choices[(index + offset) % len(choices)]
+        lines.append(DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion))
+    return DialoguePayload(lines=lines, relation_delta=RelationDelta(), reply_mode="opening", pace_reason="即时预制欢迎问候。")
 
 
 def _greeting_payload(
@@ -180,19 +220,24 @@ def _greeting_payload(
     choices = GREETING_LINES[slot]
     basis = local_time or datetime.now()
     index = (basis.day + basis.hour) % len(choices)
-    text, tts_text_ja, emotion = choices[index]
-    tts_url = ""
-    tts_error = ""
-    if synthesize_tts:
-        try:
-            tts_url, tts_error = _tts_for_line(session, user, character, text, emotion, tts_text_ja=tts_text_ja)
-        except Exception as exc:  # noqa: BLE001
-            tts_error = str(exc)
-            write_diagnostic("opening_greeting_tts_error", character_id=character.character_id, message=str(exc))
+    line_objs: list[DialogueLine] = []
+    for offset in range(3):
+        text, tts_text_ja, emotion = choices[(index + offset) % len(choices)]
+        tts_url = ""
+        tts_error = ""
+        if synthesize_tts:
+            try:
+                tts_url, tts_error = _tts_for_line(session, user, character, text, emotion, tts_text_ja=tts_text_ja)
+            except Exception as exc:  # noqa: BLE001
+                tts_error = str(exc)
+                write_diagnostic("opening_greeting_tts_error", character_id=character.character_id, message=str(exc))
+        line_objs.append(
+            DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion, tts_audio_url=tts_url, tts_error=tts_error)
+        )
     return DialoguePayload(
-        lines=[DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion, tts_audio_url=tts_url, tts_error=tts_error)],
+        lines=line_objs,
         relation_delta=RelationDelta(),
-        reply_mode="light",
+        reply_mode="opening",
         pace_reason="打开应用时没有可用主动事件，使用预制欢迎问候。",
     )
 
@@ -216,7 +261,7 @@ def _prepare_proactive_payload(session: Session, user: User, character: Characte
     )
 
 
-def prepare_opening(
+def _prepare_opening_inner(
     session: Session,
     *,
     user_id: str,
@@ -283,7 +328,38 @@ def prepare_opening(
     return {"ok": True, "prepared": True, "cache_id": cache.cache_id, "kind": "greeting"}
 
 
-def prepare_due_openings(
+def prepare_opening(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    local_time: datetime | None = None,
+    proactive_event_id: str = "",
+    allow_llm: bool = True,
+) -> dict[str, Any]:
+    with diagnostic_span(
+        "opening_prepare_trace",
+        feature="开场预热",
+        stage="prepare_opening",
+        purpose="Prepare cached opening dialogue",
+        summary=f"{user_id}/{character_id} proactive={bool(proactive_event_id)}",
+        user_id=user_id,
+        character_id=character_id,
+        input={"local_time": local_time.isoformat() if local_time is not None else "", "proactive_event_id": proactive_event_id, "allow_llm": allow_llm},
+    ) as span:
+        result = _prepare_opening_inner(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            local_time=local_time,
+            proactive_event_id=proactive_event_id,
+            allow_llm=allow_llm,
+        )
+        span.add(output=result)
+        return result
+
+
+def _prepare_due_openings_inner(
     session: Session,
     *,
     user_id: str = "",
@@ -291,6 +367,7 @@ def prepare_due_openings(
     local_time: datetime | None = None,
     limit: int = 8,
     generate_news: bool = False,
+    generate_weather: bool = True,
 ) -> dict[str, Any]:
     now_utc = _now(local_time)
     prepared = 0
@@ -303,7 +380,14 @@ def prepare_due_openings(
         users = [item for item in users if item.user_id == user_id]
     if character_id:
         characters = [item for item in characters if item.character_id == character_id]
-    write_diagnostic("proactive_prewarm_started", users=len(users), characters=len(characters), limit=limit)
+    write_diagnostic(
+        "proactive_prewarm_started",
+        users=len(users),
+        characters=len(characters),
+        limit=limit,
+        generate_news=generate_news,
+        generate_weather=generate_weather,
+    )
     for user in users:
         if prepared >= limit:
             break
@@ -320,6 +404,7 @@ def prepare_due_openings(
                 character_id=character.character_id,
                 local_time=local_time,
                 generate_news=generate_news,
+                generate_weather=generate_weather,
             )
             event_payload = pending.get("event") or {}
             event_id = str(event_payload.get("proactive_event_id") or "")
@@ -382,7 +467,45 @@ def prepare_due_openings(
     return result
 
 
-def consume_ready_opening(
+def prepare_due_openings(
+    session: Session,
+    *,
+    user_id: str = "",
+    character_id: str = "",
+    local_time: datetime | None = None,
+    limit: int = 8,
+    generate_news: bool = False,
+    generate_weather: bool = True,
+) -> dict[str, Any]:
+    with diagnostic_span(
+        "opening_prewarm_trace",
+        feature="开场预热",
+        stage="prepare_due_openings",
+        purpose="Prewarm due proactive openings",
+        summary=f"limit={limit} user={user_id or '*'} character={character_id or '*'}",
+        input={
+            "user_id": user_id,
+            "character_id": character_id,
+            "local_time": local_time.isoformat() if local_time is not None else "",
+            "limit": limit,
+            "generate_news": generate_news,
+            "generate_weather": generate_weather,
+        },
+    ) as span:
+        result = _prepare_due_openings_inner(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            local_time=local_time,
+            limit=limit,
+            generate_news=generate_news,
+            generate_weather=generate_weather,
+        )
+        span.add(output=result)
+        return result
+
+
+def _consume_ready_opening_inner(
     session: Session,
     *,
     user_id: str,
@@ -428,3 +551,35 @@ def consume_ready_opening(
         },
         session_id,
     )
+
+
+def consume_ready_opening(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    session_id: str = "android",
+    local_time: datetime | None = None,
+    proactive_event_id: str = "",
+) -> AppEventOut:
+    with diagnostic_span(
+        "opening_ready_trace",
+        feature="开场预热",
+        stage="consume_ready_opening",
+        purpose="Consume cached opening dialogue",
+        summary=f"{user_id}/{character_id} proactive={bool(proactive_event_id)}",
+        user_id=user_id,
+        character_id=character_id,
+        session_id=session_id,
+        input={"local_time": local_time.isoformat() if local_time is not None else "", "proactive_event_id": proactive_event_id},
+    ) as span:
+        result = _consume_ready_opening_inner(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            session_id=session_id,
+            local_time=local_time,
+            proactive_event_id=proactive_event_id,
+        )
+        span.add(output={"event_type": result.event_type, "event_id": result.event_id, "payload": result.payload})
+        return result

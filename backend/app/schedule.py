@@ -6,12 +6,13 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .diagnostics import write_diagnostic
+from .calendar_events import ensure_calendar_proactive_candidates
+from .diagnostics import diagnostic_span, write_diagnostic
 from .models import Character, Experience, Memory, Moment, MomentInteraction, ScheduleSlot
 from .proactive import create_schedule_proactive_event
 from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider, get_task_llm_provider
 from .utils import uid
-from .weather import ensure_weather_candidate
+from .weather import ensure_weather_candidate, refresh_weather_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,21 @@ def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, sl
             [{"role": "system", "content": "你是 Galgame 朋友圈内容生成器，只输出 JSON。"}, {"role": "user", "content": prompt}],
             max_tokens=700,
             temperature=0.8,
+            diagnostic={
+                "feature": "日程朋友圈",
+                "stage": "moment_llm",
+                "purpose": "Generate moment post and NPC interactions",
+                "input": {
+                    "user_id": user_id,
+                    "character_id": character_id,
+                    "slot_id": slot.slot_id,
+                    "activity": slot.activity_title,
+                    "location": slot.location,
+                    "experience_id": exp.experience_id,
+                    "experience_summary": exp.summary,
+                    "memory_lines": memory_lines,
+                },
+            },
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("moment LLM generation failed slot_id=%s", slot.slot_id)
@@ -178,8 +194,10 @@ def _npc_name(value: object, index: int) -> str:
     return name[:24] if name else NPC_FALLBACK_NAMES[index % len(NPC_FALLBACK_NAMES)]
 
 
-def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
-    weather_event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=day, force=True)
+def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
+    weather_snapshot = refresh_weather_snapshot(session, user_id=user_id, local_time=day, force=False)
+    weather_event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=day) if weather_snapshot is not None else None
+    calendar_events = ensure_calendar_proactive_candidates(session, user_id=user_id, character_id=character_id, local_time=day)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     slots = session.execute(
         select(ScheduleSlot).where(
@@ -299,5 +317,22 @@ def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: d
         "moments": created_moments,
         "proactive_events": created_proactive_events,
         "weather_events": 1 if weather_event is not None and weather_event.source_type == "weather" else 0,
+        "calendar_events": calendar_events,
         "skipped_moments": skipped_moments,
     }
+
+
+def run_daily_cycle(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
+    with diagnostic_span(
+        "daily_cycle_trace",
+        feature="日程朋友圈",
+        stage="daily_cycle",
+        purpose="Generate daily schedule experiences and moments",
+        summary=f"{user_id} {day.isoformat()}",
+        user_id=user_id,
+        character_id=character_id,
+        input={"day": day.isoformat()},
+    ) as span:
+        result = _run_daily_cycle_inner(session, user_id=user_id, character_id=character_id, day=day)
+        span.add(output=result)
+        return result

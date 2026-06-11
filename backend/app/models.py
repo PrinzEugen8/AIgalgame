@@ -21,7 +21,9 @@ class User(Base):
     sleep_start: Mapped[str] = mapped_column(String, default="00:30")
     sleep_end: Mapped[str] = mapped_column(String, default="08:00")
     interest_topics_json: Mapped[str] = mapped_column(Text, default="[]")
-    proactive_daily_limit: Mapped[str] = mapped_column(String, default="low")
+    proactive_daily_limit: Mapped[str] = mapped_column(String, default="unlimited")
+    proactive_next_check_at: Mapped[str] = mapped_column(String, default="")
+    proactive_judgement_json: Mapped[str] = mapped_column(Text, default="{}")
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     widget_bubbles_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     news_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -210,6 +212,58 @@ class ProactiveEvent(Base):
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
+class DeviceRegistration(Base):
+    __tablename__ = "device_registrations"
+
+    device_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    platform: Mapped[str] = mapped_column(String, default="android", index=True)
+    push_token: Mapped[str] = mapped_column(Text, default="")
+    app_version: Mapped[str] = mapped_column(String, default="")
+    locale: Mapped[str] = mapped_column(String, default="")
+    timezone: Mapped[str] = mapped_column(String, default="")
+    notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_seen_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class ProactiveDeliveryAttempt(Base):
+    __tablename__ = "proactive_delivery_attempts"
+
+    attempt_id: Mapped[str] = mapped_column(String, primary_key=True)
+    proactive_event_id: Mapped[str] = mapped_column(String, index=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    channel: Mapped[str] = mapped_column(String, default="fcm", index=True)
+    target_device_id: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    request_json: Mapped[str] = mapped_column(Text, default="{}")
+    response_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+
+
+class UserCommitment(Base):
+    __tablename__ = "user_commitments"
+
+    commitment_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    title: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(Text, default="")
+    event_at: Mapped[str] = mapped_column(String, default="", index=True)
+    remind_at: Mapped[str] = mapped_column(String, default="", index=True)
+    timezone: Mapped[str] = mapped_column(String, default="")
+    source_message_id: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="active", index=True)
+    dedupe_key: Mapped[str] = mapped_column(String, default="", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
 class UserLocation(Base):
     __tablename__ = "user_locations"
 
@@ -254,6 +308,35 @@ class WeatherSnapshot(Base):
     warning_json: Mapped[str] = mapped_column(Text, default="{}")
     minutely_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class TrendRadarSnapshot(Base):
+    __tablename__ = "trend_radar_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String, default="", index=True)
+    local_date: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="ok", index=True)
+    generated_at: Mapped[str] = mapped_column(String, default="")
+    fetched_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
+    endpoint: Mapped[str] = mapped_column(String, default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class TouchReactionPool(Base):
+    __tablename__ = "touch_reaction_pools"
+
+    pool_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    hit_area: Mapped[str] = mapped_column(String, index=True)
+    tier: Mapped[str] = mapped_column(String, index=True)
+    lines_json: Mapped[str] = mapped_column(Text, default="[]")
+    consumed_indices_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 

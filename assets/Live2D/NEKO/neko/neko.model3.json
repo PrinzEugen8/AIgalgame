@@ -1,0 +1,28 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "neko.moc3",
+		"Textures": [
+			"neko.4096/texture_00.png",
+			"neko.4096/texture_01.png",
+			"neko.4096/texture_02.png",
+			"neko.4096/texture_03.png",
+			"neko.4096/texture_04.png",
+			"neko.4096/texture_05.png"
+		],
+		"Physics": "neko.physics3.json",
+		"DisplayInfo": "neko.cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": []
+		},
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": []
+		}
+	]
+}
