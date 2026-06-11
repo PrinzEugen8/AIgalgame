@@ -307,8 +307,14 @@ def _references_summary(item: dict[str, Any]) -> str:
     labels = {
         "user_input": "用户输入",
         "schedule": "日程",
+        "character_schedule": "角色日程",
+        "user_schedule": "用户日程",
         "weather": "天气",
+        "persona": "人设",
+        "user_profile": "用户画像",
+        "relation_attitude": "关系态度",
         "memory": "记忆",
+        "event_memory": "事件记忆",
         "recent_dialogue": "上下文",
         "moment_interactions": "朋友圈",
     }
@@ -637,7 +643,11 @@ def runtime_logs(
             by_trace.setdefault(trace, []).append(item)
     for rows in by_trace.values():
         ordered = sorted(rows, key=lambda item: float(item.get("started_ts") or 0))
-        span_to_id = {str(item.get("span_id") or ""): str(item.get("id") or "") for item in ordered if item.get("span_id")}
+        span_to_id = {
+            str(item.get("span_id") or ""): str(item.get("id") or "")
+            for item in ordered
+            if item.get("span_id") and ("start" in (item.get("details") or {}) or "end" in (item.get("details") or {}))
+        }
         for index, item in enumerate(ordered):
             item["prev_id"] = ordered[index - 1]["id"] if index > 0 else ""
             item["next_id"] = ordered[index + 1]["id"] if index + 1 < len(ordered) else ""

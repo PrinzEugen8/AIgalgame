@@ -1,6 +1,7 @@
 const kinds = [
   { id: "llm", title: "LLM 对话模型" },
   { id: "llm_task", title: "LLM 任务模型" },
+  { id: "embedding", title: "Embedding 记忆向量" },
   { id: "tts", title: "TTS 语音合成" },
   { id: "search", title: "联网搜索" },
   { id: "weather", title: "天气服务" },
@@ -66,6 +67,12 @@ function pretty(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function parseJsonField(field, fallback = {}) {
+  const raw = field.value.trim();
+  if (!raw) return fallback;
+  return JSON.parse(raw);
+}
+
 function formatDateTime(value) {
   if (!value) return "-";
   const date = new Date(Number(value) * 1000);
@@ -128,6 +135,13 @@ function switchPage(page) {
     loadRuntimeLogs().catch((error) => {
       $("#runtimeLogList").innerHTML = `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`;
     });
+  }
+  if (page === "debug") {
+    Promise.all([loadProactiveEvents(), loadAiSchedule()])
+      .then(() => renderProactiveEditor())
+      .catch((error) => {
+        $("#proactiveEditor").innerHTML = `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`;
+      });
   }
 }
 
@@ -463,6 +477,7 @@ function renderCharacterManager() {
       <label><span>特殊回复阈值</span><input name="key_reply_threshold" type="number" min="0" max="100" value="${escapeHtml(character.key_reply_threshold ?? 75)}"></label>
       <label><span>当前音色</span><select name="tts_voice_profile_id"></select></label>
       <label><span>兼容旧 voice_type</span><input value="${escapeHtml(character.tts_voice_type || "")}" disabled></label>
+      <label class="wide"><span>结构化人设卡 JSON</span><textarea name="persona_card">${escapeHtml(pretty(character.persona_card || {}))}</textarea></label>
       <label class="wide"><span>角色设定</span><textarea name="persona_prompt">${escapeHtml(character.persona_prompt || "")}</textarea></label>
       <label class="wide"><span>表达风格</span><textarea name="speech_style">${escapeHtml(character.speech_style || "")}</textarea></label>
       <label class="wide"><span>关系边界</span><textarea name="relationship_boundary">${escapeHtml(character.relationship_boundary || "")}</textarea></label>
@@ -478,15 +493,16 @@ function renderCharacterManager() {
     .join("");
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const payload = {
-      name: form.elements.name.value.trim(),
-      persona_prompt: form.elements.persona_prompt.value.trim(),
-      speech_style: form.elements.speech_style.value.trim(),
-      relationship_boundary: form.elements.relationship_boundary.value.trim(),
-      tts_voice_profile_id: form.elements.tts_voice_profile_id.value,
-      key_reply_threshold: Number(form.elements.key_reply_threshold.value || 75),
-    };
     try {
+      const payload = {
+        name: form.elements.name.value.trim(),
+        persona_card: parseJsonField(form.elements.persona_card, {}),
+        persona_prompt: form.elements.persona_prompt.value.trim(),
+        speech_style: form.elements.speech_style.value.trim(),
+        relationship_boundary: form.elements.relationship_boundary.value.trim(),
+        tts_voice_profile_id: form.elements.tts_voice_profile_id.value,
+        key_reply_threshold: Number(form.elements.key_reply_threshold.value || 75),
+      };
       const updated = await api(`/api/admin/characters/${encodeURIComponent(character.character_id)}`, {
         method: "PUT",
         body: JSON.stringify(payload),
@@ -674,6 +690,7 @@ function renderUserEditor() {
       <label><span>睡眠开始</span><input name="sleep_start" value="${escapeHtml(user.sleep_start || "00:30")}"></label>
       <label><span>睡眠结束</span><input name="sleep_end" value="${escapeHtml(user.sleep_end || "08:00")}"></label>
       <label class="wide"><span>兴趣主题（一行一个）</span><textarea name="interest_topics">${escapeHtml((user.interest_topics || []).join("\n"))}</textarea></label>
+      <label class="wide"><span>用户画像 JSON</span><textarea name="profile">${escapeHtml(pretty(user.profile || {}))}</textarea></label>
       <label class="inline-check"><input type="checkbox" name="story_completed" ${user.story_completed ? "checked" : ""}><span>已完成开场剧情</span></label>
       <label class="inline-check"><input type="checkbox" name="tts_enabled" ${user.tts_enabled ? "checked" : ""}><span>TTS</span></label>
       <label class="inline-check"><input type="checkbox" name="notifications_enabled" ${user.notifications_enabled ? "checked" : ""}><span>通知</span></label>
@@ -702,6 +719,10 @@ function renderRelationEditor() {
       <label><span>依赖</span><input name="dependency" type="number" value="${escapeHtml(relation.dependency)}"></label>
       <label><span>心情</span><input name="mood" type="number" value="${escapeHtml(relation.mood)}"></label>
       <label class="wide"><span>关系阶段</span><input name="relationship_stage" value="${escapeHtml(relation.relationship_stage || relation.stage || "")}"></label>
+      <div class="wide relation-attitude">
+        <strong>${escapeHtml(relation.attitude_band || "neutral")}</strong>
+        <span>${escapeHtml(relation.attitude_text || "")}</span>
+      </div>
       <div class="actions"><button type="submit">保存关系数值</button></div>
     </form>
   `;
@@ -719,7 +740,8 @@ function renderMemoryEditor() {
     <article class="data-item ${memory.hidden ? "hidden" : ""}">
       <strong>${escapeHtml(memory.layer)} · ${escapeHtml(memory.importance)}</strong>
       <div>${escapeHtml(memory.content)}</div>
-      <small>${escapeHtml(memory.created_at || "")}</small>
+      <small>${escapeHtml(memory.created_at || "")} · vector ${escapeHtml(memory.vector_status || "unknown")} ${memory.vector_updated_at ? `· ${escapeHtml(memory.vector_updated_at)}` : ""}</small>
+      <small>${(memory.tags || []).map((tag) => `#${escapeHtml(tag)}`).join(" ")}</small>
       <div class="actions">
         <button type="button" class="secondary" data-memory-hide="${escapeHtml(memory.memory_id)}">${memory.hidden ? "恢复" : "隐藏"}</button>
         <button type="button" class="secondary" data-memory-delete="${escapeHtml(memory.memory_id)}">删除</button>
@@ -732,7 +754,9 @@ function renderMemoryEditor() {
       <label><span>重要度</span><input name="importance" type="number" step="0.01" value="0.5"></label>
       <label><span>置信度</span><input name="confidence" type="number" step="0.01" value="0.8"></label>
       <label><span>角色</span><input name="character_id" value="sakura"></label>
+      <label><span>Tags（逗号分隔）</span><input name="tags" placeholder="interest,event"></label>
       <label class="wide"><span>内容</span><textarea name="content"></textarea></label>
+      <label class="wide"><span>Metadata JSON</span><textarea name="metadata">{}</textarea></label>
       <div class="actions"><button type="submit">新增记忆</button></div>
     </form>
     <div class="table-toolbar">
@@ -867,10 +891,18 @@ function renderCalendarEventEditor() {
 
 function renderProactiveEditor() {
   const node = $("#proactiveEditor");
+  if (!node) return;
   const user = activeUser();
   if (!user) {
     node.textContent = "请选择用户。";
+    const status = $("#proactiveDebugStatus");
+    if (status) status.textContent = "无用户";
     return;
+  }
+  const status = $("#proactiveDebugStatus");
+  if (status) {
+    status.textContent = `${user.display_name || user.user_id} · ${state.proactivePage.total || state.proactiveEvents.length} 条`;
+    status.classList.toggle("ok", true);
   }
   const scheduleSegments = compactSchedule(state.aiSchedule);
   const scheduleItems = scheduleSegments.map((slot) => `
@@ -900,6 +932,7 @@ function renderProactiveEditor() {
     </article>
   `).join("");
   node.innerHTML = `
+    <div class="proactive-current-user">当前用户：<strong>${escapeHtml(user.display_name || user.user_id)}</strong><span>${escapeHtml(user.user_id)}</span></div>
     <form class="compact-form" id="proactiveGenerateForm">
       <label><span>主动来源</span><select name="source_type">${sourceOptions}</select></label>
       <label><span>AI 日程 slot</span><select name="slot_id"><option value="">自动选择</option>${slotOptions}</select></label>
@@ -993,7 +1026,6 @@ function renderTestData() {
   renderRelationEditor();
   renderMemoryEditor();
   renderCalendarEventEditor();
-  renderProactiveEditor();
 }
 
 async function loadUsers() {
@@ -1136,20 +1168,25 @@ async function createUser() {
 async function saveUser(event) {
   event.preventDefault();
   const form = $("#userForm");
-  const payload = {
-    display_name: form.elements.display_name.value.trim(),
-    timezone: form.elements.timezone.value.trim(),
-    sleep_start: form.elements.sleep_start.value.trim(),
-    sleep_end: form.elements.sleep_end.value.trim(),
-    proactive_daily_limit: form.elements.proactive_daily_limit.value.trim(),
-    interest_topics: form.elements.interest_topics.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
-    story_completed: form.elements.story_completed.checked,
-    tts_enabled: form.elements.tts_enabled.checked,
-    notifications_enabled: form.elements.notifications_enabled.checked,
-    news_enabled: form.elements.news_enabled.checked,
-  };
-  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}`, { method: "PUT", body: JSON.stringify(payload) });
-  await loadTestData();
+  try {
+    const payload = {
+      display_name: form.elements.display_name.value.trim(),
+      timezone: form.elements.timezone.value.trim(),
+      sleep_start: form.elements.sleep_start.value.trim(),
+      sleep_end: form.elements.sleep_end.value.trim(),
+      proactive_daily_limit: form.elements.proactive_daily_limit.value.trim(),
+      interest_topics: form.elements.interest_topics.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+      profile: parseJsonField(form.elements.profile, {}),
+      story_completed: form.elements.story_completed.checked,
+      tts_enabled: form.elements.tts_enabled.checked,
+      notifications_enabled: form.elements.notifications_enabled.checked,
+      news_enabled: form.elements.news_enabled.checked,
+    };
+    await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}`, { method: "PUT", body: JSON.stringify(payload) });
+    await loadTestData();
+  } catch (error) {
+    $("#userEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+  }
 }
 
 async function deleteUser() {
@@ -1177,17 +1214,23 @@ async function saveRelation(event) {
 async function createMemory(event) {
   event.preventDefault();
   const form = $("#memoryForm");
-  const payload = {
-    character_id: form.elements.character_id.value.trim() || "sakura",
-    layer: form.elements.layer.value.trim() || "chat",
-    content: form.elements.content.value.trim(),
-    importance: Number(form.elements.importance.value || 0.5),
-    confidence: Number(form.elements.confidence.value || 0.8),
-  };
-  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories`, { method: "POST", body: JSON.stringify(payload) });
-  state.memoryPage.page = 1;
-  await loadMemories();
-  renderMemoryEditor();
+  try {
+    const payload = {
+      character_id: form.elements.character_id.value.trim() || "sakura",
+      layer: form.elements.layer.value.trim() || "chat",
+      content: form.elements.content.value.trim(),
+      importance: Number(form.elements.importance.value || 0.5),
+      confidence: Number(form.elements.confidence.value || 0.8),
+      tags: form.elements.tags.value.split(",").map((item) => item.trim()).filter(Boolean),
+      metadata: parseJsonField(form.elements.metadata, {}),
+    };
+    await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories`, { method: "POST", body: JSON.stringify(payload) });
+    state.memoryPage.page = 1;
+    await loadMemories();
+    renderMemoryEditor();
+  } catch (error) {
+    $("#memoryEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+  }
 }
 
 async function toggleMemory(memoryId) {

@@ -187,6 +187,26 @@ def provider_presets() -> dict[str, Any]:
     return {
         "llm": _llm_presets(),
         "llm_task": _llm_presets(task=True),
+        "embedding": [
+            {
+                "provider": "openai_compatible",
+                "label": "OpenAI-compatible Embeddings",
+                "base_url": "",
+                "model": "",
+                "docs": "https://platform.openai.com/docs/api-reference/embeddings",
+                "supports_models": True,
+                "description": "用于记忆向量化的 OpenAI-compatible /embeddings 接口，可接 OpenAI、火山兼容端或本地兼容服务。",
+                "fields": [
+                    _field("label", "显示名称", "core", default="OpenAI-compatible Embeddings"),
+                    _field("base_url", "API Base URL", "core", required=True, placeholder="https://example.com/v1"),
+                    _field("model", "Embedding 模型", "core", required=True),
+                    _field("api_key", "API Key", "secret", required=True),
+                    _field("batch_size", "批量大小", "metadata", type_="number", default=16),
+                    _field("dimensions", "dimensions（可选）", "metadata", type_="number"),
+                    _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                ],
+            },
+        ],
         "tts": [
             {
                 "provider": "volc_seed_tts",
@@ -1048,6 +1068,82 @@ class OpenAICompatibleClient:
                 raw_preview=content[:120],
             )
         return content
+
+
+class OpenAIEmbeddingClient:
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.api_key = _secret(config, "api_key")
+        self.metadata = load_json(config.metadata_json, {})
+        if not self.api_key:
+            raise ProviderError("Embedding API key is not configured")
+        if not config.base_url:
+            raise ProviderError("Embedding base_url is not configured")
+        if not config.model:
+            raise ProviderError("Embedding model is not selected")
+
+    def _url(self, suffix: str) -> str:
+        return f"{self.config.base_url.rstrip('/')}/{suffix.lstrip('/')}"
+
+    def embed(self, texts: list[str], *, diagnostic: dict[str, Any] | None = None) -> list[list[float]]:
+        cleaned = [" ".join(str(text or "").split()) for text in texts]
+        if not cleaned or any(not item for item in cleaned):
+            raise ProviderError("Embedding input text is empty")
+        body: dict[str, Any] = {"model": self.config.model, "input": cleaned}
+        dimensions = self.metadata.get("dimensions")
+        if dimensions not in (None, ""):
+            body["dimensions"] = int(dimensions)
+        diag = diagnostic or {}
+        started = time.monotonic()
+        with diagnostic_span(
+            "embedding_request",
+            feature=str(diag.get("feature") or "记忆向量"),
+            stage=str(diag.get("stage") or "embed"),
+            purpose=str(diag.get("purpose") or "Embed memory text"),
+            summary=f"{len(cleaned)} texts",
+            provider_id=self.config.provider_id,
+            provider=self.config.provider,
+            model=self.config.model,
+            endpoint=self._url("embeddings"),
+            request={**body, "input": [text[:240] for text in cleaned]},
+            input=diag.get("input") or {},
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 30.0))) as client:
+                try:
+                    response = client.post(
+                        self._url("embeddings"),
+                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                        json=body,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    write_diagnostic(
+                        "embedding_error",
+                        provider_id=self.config.provider_id,
+                        model=self.config.model,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                    raise
+            payload = response.json()
+            rows = payload.get("data") or []
+            rows = sorted(rows, key=lambda item: int(item.get("index", 0))) if isinstance(rows, list) else []
+            vectors = [[float(value) for value in (row.get("embedding") or [])] for row in rows if isinstance(row, dict)]
+            if len(vectors) != len(cleaned) or any(not vector for vector in vectors):
+                raise ProviderError("Embedding response did not contain one vector per input")
+            span.add(
+                response={"vector_count": len(vectors), "dimensions": len(vectors[0]) if vectors else 0},
+            )
+            write_diagnostic(
+                "embedding_ok",
+                provider_id=self.config.provider_id,
+                model=self.config.model,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                vector_count=len(vectors),
+                dimensions=len(vectors[0]) if vectors else 0,
+            )
+            return vectors
 
 
 def _find_base64_audio(value: Any) -> str:
@@ -2340,6 +2436,11 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
             ok = bool(result.get("ok"))
             message = "LLM JSON test passed" if ok else "LLM JSON test returned ok=false"
             details: dict[str, Any] = result
+        elif config.kind == "embedding":
+            vectors = OpenAIEmbeddingClient(config).embed([test_text or "memory embedding test"])
+            ok = bool(vectors and vectors[0])
+            message = "Embedding test returned a vector" if ok else "Embedding test returned no vector"
+            details = {"dimensions": len(vectors[0]) if vectors else 0, "vector_count": len(vectors)}
         elif config.kind == "tts":
             asset = VolcSeedTtsClient(config).synthesize(session, test_text)
             ok = True

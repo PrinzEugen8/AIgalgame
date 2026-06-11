@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class ProviderConfigIn(BaseModel):
     provider_id: str | None = None
-    kind: Literal["llm", "llm_task", "tts", "search", "image", "weather", "push"]
+    kind: Literal["llm", "llm_task", "embedding", "tts", "search", "image", "weather", "push"]
     provider: str
     label: str = ""
     base_url: str = ""
@@ -72,6 +72,7 @@ class TtsVoiceProfileOut(BaseModel):
 
 class CharacterAdminIn(BaseModel):
     name: str | None = None
+    persona_card: dict[str, Any] | None = None
     persona_prompt: str | None = None
     speech_style: str | None = None
     relationship_boundary: str | None = None
@@ -83,6 +84,7 @@ class CharacterAdminOut(BaseModel):
     character_id: str
     name: str
     age_setting: str = "18+"
+    persona_card: dict[str, Any] = Field(default_factory=dict)
     persona_prompt: str
     speech_style: str
     relationship_boundary: str

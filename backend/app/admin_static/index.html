@@ -24,6 +24,7 @@
     <section class="status">
       <div><span>LLM</span><strong id="status-llm">-</strong></div>
       <div><span>任务模型</span><strong id="status-llm_task">-</strong></div>
+      <div><span>Embedding</span><strong id="status-embedding">-</strong></div>
       <div><span>TTS</span><strong id="status-tts">-</strong></div>
       <div><span>联网搜索</span><strong id="status-search">-</strong></div>
       <div><span>天气服务</span><strong id="status-weather">-</strong></div>
@@ -125,10 +126,6 @@
           <h3>日历关系事件</h3>
           <div id="calendarEventEditor" class="editor-placeholder">请选择用户。</div>
         </section>
-        <section>
-          <h3>主动消息</h3>
-          <div id="proactiveEditor" class="editor-placeholder">请选择用户。</div>
-        </section>
       </div>
     </section>
 
@@ -163,16 +160,29 @@
     </section>
 
     <section class="admin-page debug" data-page="debug" hidden>
-      <div>
-        <p class="eyebrow">验收工具</p>
-        <h2>调试触发</h2>
-      </div>
-      <div class="debug-actions">
-        <button data-debug="/api/debug/run-daily-cycle">触发日程/朋友圈</button>
-        <button data-debug="/api/debug/generate-proactive">生成主动消息</button>
-        <button data-debug="/api/debug/advance-time">模拟时间推进</button>
-      </div>
-      <pre id="debugResult">等待操作...</pre>
+      <article class="manager">
+        <header>
+          <div>
+            <p class="eyebrow">验收工具</p>
+            <h2>调试触发</h2>
+          </div>
+        </header>
+        <div class="debug-actions">
+          <button data-debug="/api/debug/run-daily-cycle">触发日程/朋友圈</button>
+          <button data-debug="/api/debug/advance-time">模拟时间推进</button>
+        </div>
+        <pre id="debugResult">等待操作...</pre>
+      </article>
+      <article class="manager" id="proactiveDebugManager">
+        <header>
+          <div>
+            <p class="eyebrow">Proactive Debug</p>
+            <h2>主动消息调试</h2>
+          </div>
+          <span class="badge" id="proactiveDebugStatus">等待加载</span>
+        </header>
+        <div id="proactiveEditor" class="editor-placeholder">请选择用户。</div>
+      </article>
     </section>
   </main>
 

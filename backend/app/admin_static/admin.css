@@ -123,7 +123,7 @@ label {
 
 .status {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 1px;
   overflow: hidden;
   margin: 18px 0;
@@ -329,12 +329,23 @@ label[hidden],
 }
 
 .compact-form label.wide,
+.compact-form .wide,
 .memory-form label.wide,
 .calendar-event-form label.wide,
 .compact-form .actions,
 .memory-form .actions,
 .calendar-event-form .actions {
   grid-column: 1 / -1;
+}
+
+.relation-attitude {
+  display: grid;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 10px;
+  background: #eef6f1;
+  color: #286241;
+  font-size: 13px;
 }
 
 .data-list {
@@ -357,6 +368,19 @@ label[hidden],
 
 .data-item small {
   color: #607083;
+}
+
+.proactive-current-user {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  color: #607083;
+  font-size: 13px;
+}
+
+.proactive-current-user strong {
+  color: #26313d;
 }
 
 .voice-item {
@@ -913,9 +937,13 @@ pre {
 }
 
 .debug {
-  margin-top: 18px;
-  padding: 18px;
-  flex-wrap: wrap;
+  display: grid;
+  gap: 18px;
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 #debugResult {

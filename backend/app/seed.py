@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from .calendar_events import ensure_calendar_events
 from .models import Character, MediaAsset, Moment, MomentInteraction, RelationState, User
+from .persona import DEFAULT_PERSONA_CARD
+from .utils import dump_json, load_json
 
 
 DEFAULT_USER_ID = "demo_user"
@@ -122,6 +124,7 @@ def ensure_seed(session: Session, user_id: str = DEFAULT_USER_ID, character_id: 
             character_id=character_id,
             name="小樱",
             persona_prompt=PERSONA,
+            persona_card_json=dump_json(DEFAULT_PERSONA_CARD),
             speech_style=SPEECH,
             relationship_boundary=BOUNDARY,
             avatar_assets_json='{"default":"asset://avatar_sakura"}',
@@ -129,6 +132,8 @@ def ensure_seed(session: Session, user_id: str = DEFAULT_USER_ID, character_id: 
             chibi_widget_assets_json='{"happy":"asset_chibi_sakura_widget","default":"asset_chibi_sakura_widget"}',
         )
         session.add(character)
+    elif not load_json(character.persona_card_json, {}):
+        character.persona_card_json = dump_json(DEFAULT_PERSONA_CARD)
     _ensure_chibi_asset(session, character)
     exists = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)

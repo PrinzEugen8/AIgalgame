@@ -58,16 +58,31 @@ def _upgrade_sqlite_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN proactive_next_check_at VARCHAR DEFAULT ''"))
             if "proactive_judgement_json" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN proactive_judgement_json TEXT DEFAULT '{}'"))
+            if "profile_json" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN profile_json TEXT DEFAULT '{}'"))
         if "moment_interactions" in table_names:
             columns = {item["name"] for item in inspector.get_columns("moment_interactions")}
             if "actor_name" not in columns:
                 conn.execute(text("ALTER TABLE moment_interactions ADD COLUMN actor_name VARCHAR DEFAULT ''"))
         if "characters" in table_names:
             columns = {item["name"] for item in inspector.get_columns("characters")}
+            if "persona_card_json" not in columns:
+                conn.execute(text("ALTER TABLE characters ADD COLUMN persona_card_json TEXT DEFAULT '{}'"))
             if "tts_voice_profile_id" not in columns:
                 conn.execute(text("ALTER TABLE characters ADD COLUMN tts_voice_profile_id VARCHAR DEFAULT ''"))
             if "key_reply_threshold" not in columns:
                 conn.execute(text("ALTER TABLE characters ADD COLUMN key_reply_threshold INTEGER DEFAULT 75"))
+        if "memories" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("memories")}
+            additions = {
+                "tags_json": "TEXT DEFAULT '[]'",
+                "metadata_json": "TEXT DEFAULT '{}'",
+                "vector_status": "VARCHAR DEFAULT 'pending'",
+                "vector_updated_at": "VARCHAR DEFAULT ''",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE memories ADD COLUMN {name} {definition}"))
         if "proactive_events" in table_names:
             columns = {item["name"] for item in inspector.get_columns("proactive_events")}
             additions = {

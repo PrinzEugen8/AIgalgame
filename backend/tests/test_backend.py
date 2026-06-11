@@ -33,7 +33,8 @@ from app.push import register_device, send_proactive_push  # noqa: E402
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
 from app.schemas import DialogueLine, EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
-from app.utils import dump_json  # noqa: E402
+from app.utils import dump_json, uid  # noqa: E402
+from app.vector_memory import safe_index_memory_vector, search_memory_vectors  # noqa: E402
 
 
 client = TestClient(app)
@@ -63,11 +64,29 @@ def _llm_json_response(payload: dict[str, object]) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
 
 
+def _disable_embedding_providers() -> None:
+    with SessionLocal() as session:
+        for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind == "embedding")).scalars():
+            config.enabled = False
+        session.commit()
+
+
 def test_health_and_bootstrap() -> None:
     assert client.get("/api/health").json()["ok"] is True
     payload = client.get("/api/bootstrap").json()
     assert payload["character"]["name"] == "小樱"
     assert "providers" not in payload
+
+
+def test_schema_has_persona_profile_and_vector_columns() -> None:
+    with SessionLocal() as session:
+        def columns(table: str) -> set[str]:
+            return {str(row[1]) for row in session.connection().exec_driver_sql(f"PRAGMA table_info({table})").all()}
+
+        assert "profile_json" in columns("users")
+        assert "persona_card_json" in columns("characters")
+        memory_columns = columns("memories")
+        assert {"tags_json", "metadata_json", "vector_status", "vector_updated_at"}.issubset(memory_columns)
 
 
 def test_admin_routes_do_not_expose_secrets() -> None:
@@ -82,6 +101,15 @@ def test_admin_routes_do_not_expose_secrets() -> None:
         assert "has_secret_fields" in serialized
     for leaked_value in ("ark-key", "openai-key", "gemini-key", "app-id"):
         assert leaked_value not in serialized
+
+
+def test_admin_static_moves_proactive_debug_out_of_user_data() -> None:
+    html = client.get("/admin").text
+    users_section = html.split('data-page="users"', 1)[1].split('data-page="providers"', 1)[0]
+    debug_section = html.split('data-page="debug"', 1)[1]
+    assert 'id="proactiveEditor"' not in users_section
+    assert 'id="proactiveEditor"' in debug_section
+    assert 'id="proactiveDebugManager"' in debug_section
 
 
 def test_runtime_logs_redact_and_reconstruct_spans() -> None:
@@ -540,8 +568,24 @@ def test_user_message_trace_records_reply_judgement() -> None:
     assert "reply_output_ready" in serialized
     assert "用户直接聊天，需要正常回复" in serialized
     assert '"references"' in serialized
-    for key in ("user_input", "schedule", "weather", "memory", "recent_dialogue", "moment_interactions", "gate", "subject_hint"):
+    for key in (
+        "user_input",
+        "schedule",
+        "character_schedule",
+        "user_schedule",
+        "weather",
+        "persona",
+        "user_profile",
+        "relation_attitude",
+        "memory",
+        "event_memory",
+        "recent_dialogue",
+        "moment_interactions",
+        "gate",
+        "subject_hint",
+    ):
         assert key in serialized
+    assert "memory_writes" in serialized
     reply_span = next(item for item in payload["items"] if item["event"] == "reply_trace")
     child_spans = [item for item in payload["items"] if item.get("parent_id") == reply_span["id"]]
     assert child_spans
@@ -555,6 +599,9 @@ def test_provider_presets() -> None:
     payload = client.get("/api/config/provider-presets").json()
     assert payload["llm"][0]["provider"] == "volc_ark"
     assert [item["provider"] for item in payload["llm_task"]] == ["volc_ark", "deepseek", "openai_compatible"]
+    embedding_fields = {item["name"] for item in payload["embedding"][0]["fields"]}
+    assert payload["embedding"][0]["provider"] == "openai_compatible"
+    assert {"base_url", "model", "api_key", "batch_size", "dimensions"}.issubset(embedding_fields)
     tts_fields = {item["name"] for item in payload["tts"][0]["fields"]}
     assert {"credential_mode", "parameter_mode", "resource_id", "speaker", "x_api_key", "access_key", "emotion_map"}.issubset(tts_fields)
     search_by_provider = {item["provider"]: item for item in payload["search"]}
@@ -569,6 +616,104 @@ def test_provider_presets() -> None:
     assert {"auth_mode", "key_id", "project_id", "private_key", "api_key", "include_warning", "include_minutely"}.issubset(weather_fields)
     assert [item["provider"] for item in payload["image"]] == ["doubao_seedream", "openai_gpt_image", "gemini_image"]
     assert "supports_web_search" not in str(payload)
+
+
+def test_embedding_provider_test_uses_openai_compatible_embeddings() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://embedding.example/v1/embeddings"
+        body = json.loads(request.content.decode())
+        assert body["model"] == "embed-test"
+        assert body["input"]
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        payload = client.post(
+            "/api/config/providers/test",
+            json={
+                "provider_id": "test_embedding_provider",
+                "kind": "embedding",
+                "provider": "openai_compatible",
+                "base_url": "https://embedding.example/v1",
+                "model": "embed-test",
+                "api_key": "embed-key",
+                "metadata": {"dimensions": 3},
+                "test_text": "用户喜欢咖啡",
+            },
+        ).json()
+        assert payload["ok"] is True
+        assert payload["details"]["dimensions"] == 3
+    finally:
+        providers.HTTP_TRANSPORT = None
+        _disable_embedding_providers()
+
+
+def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
+    suffix = uid("vec")
+    user_id = f"vector_user_{suffix}"
+
+    def vector_for(text: str) -> list[float]:
+        return [1.0, 0.0, 0.0] if "咖啡" in text else [0.0, 1.0, 0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        inputs = body["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        return httpx.Response(
+            200,
+            json={"data": [{"index": index, "embedding": vector_for(str(text))} for index, text in enumerate(inputs)]},
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"embedding_{suffix}",
+                    kind="embedding",
+                    provider="openai_compatible",
+                    base_url="https://embedding.example/v1",
+                    model="embed-test",
+                    secrets={"api_key": "embed-key"},
+                ),
+            )
+            memory = Memory(
+                memory_id=f"mem_{suffix}",
+                user_id=user_id,
+                character_id="sakura",
+                layer="event",
+                content="用户说周末想去咖啡店。",
+                tags_json=dump_json(["plan"]),
+                metadata_json=dump_json({"kind": "event"}),
+                importance=0.8,
+                confidence=0.9,
+            )
+            other = Memory(
+                memory_id=f"mem_other_{suffix}",
+                user_id=f"other_{user_id}",
+                character_id="sakura",
+                layer="event",
+                content="其他用户也喜欢咖啡。",
+                importance=0.8,
+                confidence=0.9,
+            )
+            session.add_all([memory, other])
+            session.flush()
+            assert safe_index_memory_vector(session, memory)["status"] == "ready"
+            assert safe_index_memory_vector(session, other)["status"] == "ready"
+            hits = search_memory_vectors(session, user_id=user_id, character_id="sakura", query_text="咖啡安排", layers={"event"}, limit=5)
+            assert hits
+            assert hits[0].memory_id == memory.memory_id
+            assert all(hit.memory_id != other.memory_id for hit in hits)
+            config = session.get(ProviderConfig, f"embedding_{suffix}")
+            assert config is not None
+            config.enabled = False
+            session.commit()
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def _trend_radar_payload() -> dict[str, object]:
@@ -1311,10 +1456,24 @@ def test_admin_voice_crud_and_character_voice_selection() -> None:
 
     updated = client.put(
         "/api/admin/characters/sakura",
-        json={"tts_voice_profile_id": voice_id, "key_reply_threshold": 82},
+        json={
+            "tts_voice_profile_id": voice_id,
+            "key_reply_threshold": 82,
+            "persona_card": {
+                "name": "小樱",
+                "personality": ["认真", "温柔"],
+                "relationship_attitudes": {
+                    "good": "会更主动分享日程。",
+                    "neutral": "保持自然陪伴。",
+                    "bad": "先保持距离。",
+                },
+            },
+        },
     ).json()
     assert updated["tts_voice_profile_id"] == voice_id
     assert updated["key_reply_threshold"] == 82
+    assert updated["persona_card"]["personality"] == ["认真", "温柔"]
+    assert updated["persona_card"]["relationship_attitudes"]["good"] == "会更主动分享日程。"
 
     assert client.delete(f"/api/admin/tts-voices/{voice_id}").json()["ok"] is True
     characters = client.get("/api/admin/characters").json()["items"]
@@ -4844,11 +5003,18 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
 
     updated = client.put(
         f"/api/admin/users/{user_id}",
-        json={"display_name": "测试用户改", "tts_enabled": False, "news_enabled": False, "proactive_daily_limit": "high"},
+        json={
+            "display_name": "测试用户改",
+            "tts_enabled": False,
+            "news_enabled": False,
+            "proactive_daily_limit": "high",
+            "profile": {"communication_style": "短句直接", "notes": ["喜欢明确计划"]},
+        },
     ).json()
     assert updated["display_name"] == "测试用户改"
     assert updated["tts_enabled"] is False
     assert updated["proactive_daily_limit"] == "high"
+    assert updated["profile"]["communication_style"] == "短句直接"
 
     relation = client.put(
         f"/api/admin/users/{user_id}/relation",
@@ -4856,15 +5022,28 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
     ).json()
     assert relation["affection"] == 321
     assert relation["relationship_stage"] == "测试阶段"
+    assert relation["attitude_band"] in {"good", "neutral", "bad"}
+    assert relation["attitude_text"]
 
     memory = client.post(
         f"/api/admin/users/{user_id}/memories",
-        json={"content": "用户手动添加的测试记忆", "layer": "core", "importance": 0.8, "confidence": 0.9},
+        json={
+            "content": "用户手动添加的测试记忆",
+            "layer": "core",
+            "importance": 0.8,
+            "confidence": 0.9,
+            "tags": ["manual", "test"],
+            "metadata": {"kind": "admin"},
+        },
     ).json()
     assert memory["content"] == "用户手动添加的测试记忆"
+    assert memory["tags"] == ["manual", "test"]
+    assert memory["metadata"]["kind"] == "admin"
+    assert memory["vector_status"] in {"ready", "error", "hidden", "pending"}
     memories_page = client.get(f"/api/admin/users/{user_id}/memories?q=测试记忆&page=1&page_size=5").json()
     assert memories_page["total"] == 1
     assert memories_page["items"][0]["memory_id"] == memory["memory_id"]
+    assert memories_page["items"][0]["tags"] == ["manual", "test"]
     hidden = client.put(f"/api/admin/memories/{memory['memory_id']}", json={"hidden": True}).json()
     assert hidden["hidden"] is True
     assert client.delete(f"/api/admin/memories/{memory['memory_id']}").json()["ok"] is True

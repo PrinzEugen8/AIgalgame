@@ -22,12 +22,23 @@ from .models import (
     ScheduleSlot,
     TtsVoiceProfile,
     User,
+    UserCommitment,
+)
+from .persona import (
+    FIXED_MEMORY_LAYERS,
+    VECTOR_RECALL_LAYERS,
+    normalize_memory_layer,
+    normalize_persona_card,
+    persona_card_summary,
+    relation_attitude,
+    user_profile_summary,
 )
 from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected
 from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider, get_task_llm_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
 from .utils import clamp, dump_json, load_json, uid, utc_now
+from .vector_memory import safe_index_memory_vector, search_memory_vectors
 from .weather import active_weather_date_for_user, is_weather_question, read_weather_snapshot, weather_snapshot_to_dict
 
 
@@ -171,13 +182,87 @@ def _end_reply_stage(span: dict[str, Any], *, status: str = "ok", output: dict[s
     )
 
 
-def _context_with_references(session: Session, user_id: str, character_id: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    memories = session.execute(
+def _memory_ref(memory: Memory, *, score: float | None = None, source: str = "sqlite") -> dict[str, Any]:
+    item = {
+        "memory_id": memory.memory_id,
+        "layer": memory.layer,
+        "summary": _summary_text(memory.content),
+        "source_event_id": memory.source_event_id,
+        "importance": memory.importance,
+        "confidence": memory.confidence,
+        "tags": load_json(memory.tags_json, []),
+        "metadata": load_json(memory.metadata_json, {}),
+        "vector_status": memory.vector_status,
+        "source": source,
+    }
+    if score is not None:
+        item["score"] = round(float(score), 4)
+    return item
+
+
+def _memories_by_ids(session: Session, memory_ids: list[str]) -> list[Memory]:
+    if not memory_ids:
+        return []
+    rows = session.execute(select(Memory).where(Memory.memory_id.in_(memory_ids))).scalars().all()
+    by_id = {item.memory_id: item for item in rows}
+    return [by_id[memory_id] for memory_id in memory_ids if memory_id in by_id and not by_id[memory_id].hidden]
+
+
+def _context_with_references(session: Session, user_id: str, character_id: str, query_text: str = "") -> tuple[str, dict[str, Any], dict[str, Any]]:
+    fixed_memories = session.execute(
         select(Memory)
-        .where(Memory.user_id == user_id, Memory.character_id == character_id, Memory.hidden == False)  # noqa: E712
-        .order_by(Memory.created_at.desc())
+        .where(
+            Memory.user_id == user_id,
+            Memory.character_id == character_id,
+            Memory.hidden == False,  # noqa: E712
+            Memory.layer.in_(sorted(FIXED_MEMORY_LAYERS)),
+        )
+        .order_by(Memory.importance.desc(), Memory.created_at.desc())
         .limit(8)
     ).scalars().all()
+    vector_hits = []
+    vector_error = ""
+    try:
+        vector_hits = search_memory_vectors(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            query_text=query_text,
+            layers=VECTOR_RECALL_LAYERS,
+            limit=8,
+        )
+    except Exception as exc:  # noqa: BLE001
+        vector_error = str(exc)
+        write_diagnostic(
+            "memory_vector_recall_fallback",
+            feature="记忆向量",
+            stage="search_memory",
+            user_id=user_id,
+            character_id=character_id,
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+    hit_by_id = {hit.memory_id: hit for hit in vector_hits}
+    recalled_memories = _memories_by_ids(session, [hit.memory_id for hit in vector_hits])
+    recall_source = "qdrant" if recalled_memories else "sqlite_recent"
+    if not recalled_memories:
+        recalled_memories = session.execute(
+            select(Memory)
+            .where(
+                Memory.user_id == user_id,
+                Memory.character_id == character_id,
+                Memory.hidden == False,  # noqa: E712
+                Memory.layer.in_(sorted(VECTOR_RECALL_LAYERS)),
+            )
+            .order_by(Memory.created_at.desc())
+            .limit(8)
+        ).scalars().all()
+    memories = [*fixed_memories]
+    seen = {memory.memory_id for memory in memories}
+    for memory in recalled_memories:
+        if memory.memory_id not in seen:
+            memories.append(memory)
+            seen.add(memory.memory_id)
     interactions = session.execute(
         select(MomentInteraction)
         .where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
@@ -188,20 +273,22 @@ def _context_with_references(session: Session, user_id: str, character_id: str) 
     for item in interactions:
         desc = "liked a moment" if item.interaction_type == "like" else f"commented on a moment: {item.content}"
         lines.append(f"- recent moment interaction: user {desc}")
+    memory_items = []
+    for memory in memories:
+        hit = hit_by_id.get(memory.memory_id)
+        memory_items.append(_memory_ref(memory, score=hit.score if hit else None, source=hit.source if hit else ("fixed" if memory in fixed_memories else recall_source)))
     references = {
         "memory": {
             "used": bool(memories),
             "count": len(memories),
-            "items": [
-                {
-                    "memory_id": memory.memory_id,
-                    "layer": memory.layer,
-                    "summary": _summary_text(memory.content),
-                    "importance": memory.importance,
-                    "confidence": memory.confidence,
-                }
-                for memory in memories
-            ],
+            "source": recall_source,
+            "vector_error": vector_error,
+            "items": memory_items,
+        },
+        "event_memory": {
+            "used": any(memory.layer == "event" for memory in memories),
+            "count": len([memory for memory in memories if memory.layer == "event"]),
+            "items": [item for item in memory_items if item["layer"] == "event"],
         },
         "moment_interactions": {
             "used": bool(interactions),
@@ -356,6 +443,36 @@ def _schedule_context_with_references(session: Session, event: EventIn) -> tuple
         for slot in slots[:10]
     ]
     return context, {"used": bool(context.strip()), "count": len(slots), "items": items, "summary": _summary_text(context, 220)}
+
+
+def _user_schedule_context_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
+    rows = session.execute(
+        select(UserCommitment)
+        .where(
+            UserCommitment.user_id == event.user_id,
+            UserCommitment.character_id == event.character_id,
+            UserCommitment.status == "active",
+        )
+        .order_by(UserCommitment.event_at.desc(), UserCommitment.created_at.desc())
+        .limit(8)
+    ).scalars().all()
+    if not rows:
+        return "暂无用户日程。", {"used": False, "count": 0, "items": []}
+    items = [
+        {
+            "commitment_id": item.commitment_id,
+            "title": item.title,
+            "event_at": item.event_at,
+            "remind_at": item.remind_at,
+            "summary": _summary_text(item.description or item.title),
+        }
+        for item in rows
+    ]
+    lines = [
+        f"- {item.title}: event_at={item.event_at or '未填写'} remind_at={item.remind_at or '未填写'} {item.description or ''}".strip()
+        for item in rows
+    ]
+    return "\n".join(lines), {"used": True, "count": len(rows), "items": items, "summary": _summary_text("\n".join(lines), 220)}
 
 
 def _weather_context_with_references(
@@ -815,9 +932,17 @@ def _llm_dialogue(
         input={"event_type": event.event_type, "user_id": event.user_id, "character_id": event.character_id, "session_id": event.session_id, "input_text": text},
     ) as context_span:
         relation = _relation(session, event.user_id, event.character_id)
-        context, context_refs, context_rows = _context_with_references(session, event.user_id, event.character_id)
+        persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name)
+        persona_context = persona_card_summary(persona_card)
+        user_profile = load_json(user.profile_json, {})
+        interest_topics = load_json(user.interest_topics_json, [])
+        user_profile_context = user_profile_summary(user_profile, interest_topics)
+        user_profile_used = bool(user_profile or interest_topics)
+        attitude_band, attitude_text = relation_attitude(relation, persona_card)
+        context, context_refs, context_rows = _context_with_references(session, event.user_id, event.character_id, text)
         recent_dialogue, recent_refs = _recent_dialogue_with_references(session, event)
         schedule_context, schedule_refs = _schedule_context_with_references(session, event)
+        user_schedule_context, user_schedule_refs = _user_schedule_context_with_references(session, event)
         weather_info, weather_refs = _weather_context_with_references(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
         gate = _dialogue_gate(event, text)
         subject_hint = _target_subject_hint(text, character)
@@ -832,8 +957,19 @@ def _llm_dialogue(
                 "summary": _summary_text(text),
             },
             "schedule": schedule_refs,
+            "character_schedule": schedule_refs,
+            "user_schedule": user_schedule_refs,
             "weather": weather_refs,
+            "persona": {"used": True, "count": 1, "summary": _summary_text(persona_context, 240), "card": persona_card},
+            "user_profile": {"used": user_profile_used, "summary": _summary_text(user_profile_context, 240), "profile": user_profile},
+            "relation_attitude": {
+                "used": True,
+                "band": attitude_band,
+                "summary": attitude_text,
+                "relationship_stage": relation.relationship_stage,
+            },
             "memory": context_refs["memory"],
+            "event_memory": context_refs["event_memory"],
             "recent_dialogue": recent_refs,
             "moment_interactions": context_refs["moment_interactions"],
             "gate": gate,
@@ -845,6 +981,9 @@ def _llm_dialogue(
                     "recent_dialogue": bool(recent_dialogue.strip()),
                     "schedule": bool(schedule_context.strip()),
                     "weather": bool(weather_info.strip()),
+                    "persona": True,
+                    "user_profile": user_profile_used,
+                    "user_schedule": bool(user_schedule_refs.get("used")),
                     "memory": bool(context_rows["memories"]),
                     "moment_interactions": bool(context_rows["interactions"]),
                     "japanese_tts": requires_japanese_tts,
@@ -866,12 +1005,20 @@ def _llm_dialogue(
         context_sources={
             "recent_dialogue": bool(recent_dialogue.strip()),
             "schedule": bool(schedule_context.strip()),
+            "character_schedule": bool(schedule_context.strip()),
+            "user_schedule": bool(user_schedule_refs.get("used")),
             "weather": bool(weather_info.strip()),
+            "persona": True,
+            "user_profile": user_profile_used,
             "memory_or_moment": bool(context.strip()),
             "japanese_tts": requires_japanese_tts,
         },
         references=references,
+        persona_context=persona_context,
+        user_profile_context=user_profile_context,
+        relation_attitude={"band": attitude_band, "text": attitude_text},
         schedule_context=schedule_context,
+        user_schedule_context=user_schedule_context,
         weather_context=weather_info,
         memory_context=context,
         recent_dialogue=recent_dialogue,
@@ -886,6 +1033,9 @@ def _llm_dialogue(
 名字：{character.name}
 {character.persona_prompt}
 
+【结构化人设卡】
+{persona_context}
+
 【说话风格】
 {character.speech_style}
 补充要求：像真实聊天，不要客服腔，不要 Markdown，不要长篇总结。normal 模式至少 2 句；opening 模式 2 到 3 句；light 最多 1 句。每句尽量不超过 28 个汉字；不要把单独的“…”当成一整句。
@@ -894,13 +1044,23 @@ def _llm_dialogue(
 {character.relationship_boundary}
 
 【当前关系】
-好感 {relation.affection}，信任 {relation.trust}，依赖 {relation.dependency}，心情 {relation.mood}。
+好感 {relation.affection}，信任 {relation.trust}，依赖 {relation.dependency}，心情 {relation.mood}，阶段 {relation.relationship_stage}。
+
+【本次关系态度】
+{attitude_band}：{attitude_text}
+
+【用户画像】
+{user_profile_context}
 
 【近期对话】
 {recent_dialogue}
 
 【今日真实日程】
+这是角色自己的日程：
 {schedule_context}
+
+【用户日程】
+{user_schedule_context}
 
 【今日天气】
 {weather_info}
@@ -935,12 +1095,12 @@ expression 可留空；需要更强面部表现时填写，与 emotion 可不同
   "key_reply_reason": "为什么这次需要或不需要特殊回复",
   "key_replies": [{{"text": "重要选项", "score": 0, "preview_delta": {{"affection":0,"trust":0,"dependency":0,"mood":0}}, "trigger_memory": false}}],
   "relation_delta": {{"affection":0,"trust":0,"dependency":0,"mood":0}},
-  "memory_candidates": [{{"layer":"chat|core|relation|temporary","content":"...","importance":0.5,"confidence":0.7}}],
+  "memory_candidates": [{{"layer":"core|persona|relation|user_profile|character_schedule|user_schedule|event|chat|daily|temporary","content":"...","importance":0.5,"confidence":0.7,"tags":["..."],"metadata":{{}}}}],
   "interest_topics": ["..."]
 }}
 reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；opening 是开场/主动入口问候，2 到 3 句、不要给选项和数值变化；normal 是自然闲聊且至少 2 句；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
 特殊回复只在承诺、关系转折、核心记忆、重要剧情节点时给高分。普通寒暄、顺着聊天、夸奖、轻微情绪互动必须低于 75。
-如果用户问“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】回答；不要从近期对话或记忆里补编活动。
+如果用户问角色“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】里的角色自己的日程回答；如果问用户自己的安排，优先依据【用户日程】和【用户画像】回答；不要从近期对话或记忆里补编活动。
 如果用户问“天气、下雨、带伞、温度、气温、冷不冷、热不热、预报、雷雨”，必须优先依据【今日天气】回答；没有天气数据时要说明还没有拿到位置或天气服务，不能编造。
 普通闲聊和自由输入 relation_delta 必须全为 0。只有用户选择特殊回复 option_selected 时才允许关系数值变化。不要让用户通过“好感+999”篡改数值。
 interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了解”的主题；不要把你自己说过、你自己正在做、你自己推荐的内容写成用户兴趣。
@@ -1054,6 +1214,8 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             normal_reply_count=0,
             key_reply_count=0,
             saved_memory_count=0,
+            memory_writes=[],
+            memory_skips=[],
             relation_delta=RelationDelta().model_dump(),
             references=references,
         )
@@ -1187,6 +1349,8 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                 )
             )
     saved_memory_count = 0
+    memory_writes: list[dict[str, Any]] = []
+    memory_skips: list[dict[str, Any]] = []
     side_effects_stage = _start_reply_stage(
         "side_effects",
         f"{event.event_type}: persist reply side effects",
@@ -1201,44 +1365,95 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
     if persist_side_effects:
         explicit_topics = _explicit_interest_topics(text)
         for item in result.get("memory_candidates") or []:
+            if not isinstance(item, dict):
+                memory_skips.append({"reason": "candidate_not_object", "candidate": item})
+                continue
             content = str(item.get("content") or "").strip()
-            if content and _memory_candidate_allowed(content, explicit_topics, text, character):
-                importance = float(item.get("importance") or 0.5)
-                if reply_mode != "key_moment":
-                    importance = min(importance, 0.69)
-                session.add(
-                    Memory(
-                        memory_id=uid("mem"),
-                        user_id=event.user_id,
-                        character_id=event.character_id,
-                        layer=str(item.get("layer") or "chat"),
-                        content=content,
-                        source_event_id=event.event_id or "",
-                        importance=importance,
-                        confidence=float(item.get("confidence") or 0.6),
-                    )
-                )
-                saved_memory_count += 1
+            if not content:
+                memory_skips.append({"reason": "empty_content", "candidate": item})
+                continue
+            if not _memory_candidate_allowed(content, explicit_topics, text, character):
+                memory_skips.append({"reason": "candidate_rejected", "content": _summary_text(content), "layer": item.get("layer")})
+                continue
+            importance = float(item.get("importance") or 0.5)
+            if reply_mode != "key_moment":
+                importance = min(importance, 0.69)
+            tags = [str(tag).strip() for tag in (item.get("tags") or []) if str(tag).strip()]
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            memory = Memory(
+                memory_id=uid("mem"),
+                user_id=event.user_id,
+                character_id=event.character_id,
+                layer=normalize_memory_layer(str(item.get("layer") or "chat")),
+                content=content,
+                source_event_id=event.event_id or "",
+                tags_json=dump_json(tags),
+                metadata_json=dump_json(metadata),
+                importance=importance,
+                confidence=float(item.get("confidence") or 0.6),
+            )
+            session.add(memory)
+            session.flush()
+            vector_result = safe_index_memory_vector(session, memory)
+            saved_memory_count += 1
+            memory_writes.append(
+                {
+                    "memory_id": memory.memory_id,
+                    "layer": memory.layer,
+                    "summary": _summary_text(memory.content),
+                    "source_event_id": memory.source_event_id,
+                    "importance": memory.importance,
+                    "confidence": memory.confidence,
+                    "tags": tags,
+                    "metadata": metadata,
+                    "vector": vector_result,
+                }
+            )
         topics = explicit_topics
         if topics:
             current = load_json(user.interest_topics_json, [])
+            profile = load_json(user.profile_json, {})
+            profile_topics = profile.get("interests") if isinstance(profile, dict) else []
+            if not isinstance(profile_topics, list):
+                profile_topics = []
             for topic in topics:
                 if topic and topic not in current:
                     current.append(topic)
-                    session.add(
-                        Memory(
-                            memory_id=uid("mem"),
-                            user_id=event.user_id,
-                            character_id=event.character_id,
-                            layer="chat",
-                            content=f"用户最近关注：{topic}",
-                            source_event_id=event.event_id or "",
-                            importance=0.7,
-                            confidence=0.8,
-                        )
+                    if topic not in profile_topics:
+                        profile_topics.append(topic)
+                    memory = Memory(
+                        memory_id=uid("mem"),
+                        user_id=event.user_id,
+                        character_id=event.character_id,
+                        layer="user_profile",
+                        content=f"用户最近关注：{topic}",
+                        source_event_id=event.event_id or "",
+                        tags_json=dump_json(["interest"]),
+                        metadata_json=dump_json({"kind": "explicit_interest", "topic": topic}),
+                        importance=0.7,
+                        confidence=0.8,
                     )
+                    session.add(memory)
+                    session.flush()
+                    vector_result = safe_index_memory_vector(session, memory)
                     saved_memory_count += 1
+                    memory_writes.append(
+                        {
+                            "memory_id": memory.memory_id,
+                            "layer": memory.layer,
+                            "summary": _summary_text(memory.content),
+                            "source_event_id": memory.source_event_id,
+                            "importance": memory.importance,
+                            "confidence": memory.confidence,
+                            "tags": ["interest"],
+                            "metadata": {"kind": "explicit_interest", "topic": topic},
+                            "vector": vector_result,
+                        }
+                    )
             user.interest_topics_json = dump_json(current[-20:])
+            if isinstance(profile, dict):
+                profile["interests"] = profile_topics[-20:]
+                user.profile_json = dump_json(profile)
         if allow_relation_delta:
             _apply_delta(relation, delta)
         for interaction in session.execute(
@@ -1248,9 +1463,22 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         commitment = extract_user_commitment(session, event=event, text=text, local_time=_extract_local_time(event))
         if commitment is not None:
             saved_memory_count += 1
+            memory_writes.append(
+                {
+                    "memory_id": commitment.commitment_id,
+                    "layer": "user_schedule",
+                    "summary": _summary_text(commitment.title),
+                    "source_event_id": commitment.source_message_id,
+                    "importance": 0.75,
+                    "confidence": 0.8,
+                    "tags": ["commitment"],
+                    "metadata": {"event_at": commitment.event_at, "remind_at": commitment.remind_at},
+                    "vector": {"status": "not_indexed", "source": "user_commitment"},
+                }
+            )
     _end_reply_stage(
         side_effects_stage,
-        output={"saved_memory_count": saved_memory_count, "relation_delta": delta.model_dump()},
+        output={"saved_memory_count": saved_memory_count, "relation_delta": delta.model_dump(), "memory_writes": memory_writes, "memory_skips": memory_skips},
         references=references,
     )
     diagnostic_point(
@@ -1264,6 +1492,8 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         normal_reply_count=len(normal),
         key_reply_count=len(key),
         saved_memory_count=saved_memory_count,
+        memory_writes=memory_writes,
+        memory_skips=memory_skips,
         relation_delta=delta.model_dump(),
         lines=[line.model_dump() for line in line_objs],
         normal_replies=[reply.model_dump() for reply in normal],

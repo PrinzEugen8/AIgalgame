@@ -43,6 +43,7 @@ from .models import (
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
 from .touch_reactions import consume_touch_reaction, refresh_touch_reaction_pools_background
 from .online import mark_heartbeat, mark_offline, mark_online, presence_context
+from .persona import normalize_memory_layer, normalize_persona_card, relation_attitude
 from .pipeline import handle_event
 from .proactive import consume_proactive_event, create_moment_feedback_event, create_proactive_event, ensure_news_candidate, mark_proactive_delivered, mark_proactive_dismissed, pending_proactive_response
 from .push import record_delivery_attempt, register_device
@@ -71,6 +72,7 @@ from .schedule import ensure_schedule, run_daily_cycle
 from .scheduler import start_scheduler, stop_scheduler
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
 from .utils import clamp, dump_json, load_json, uid
+from .vector_memory import delete_memory_vector, safe_index_memory_vector
 from .weather import ensure_weather_candidate, read_weather_snapshot, refresh_weather_snapshot, update_user_location, weather_snapshot_to_dict
 
 
@@ -205,7 +207,7 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     providers = [provider_to_out(item).model_dump() for item in session.execute(select(ProviderConfig)).scalars().all()]
     configured = {
         kind: any(item["kind"] == kind and item["ready"] for item in providers)
-        for kind in ("llm", "llm_task", "tts", "search", "weather", "image")
+        for kind in ("llm", "llm_task", "embedding", "tts", "search", "weather", "image")
     }
     return {"ok": True, "providers": providers, "configured": configured}
 
@@ -226,10 +228,12 @@ def _voice_to_out(voice: TtsVoiceProfile) -> TtsVoiceProfileOut:
 
 
 def _character_to_out(character: Character) -> CharacterAdminOut:
+    persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name)
     return CharacterAdminOut(
         character_id=character.character_id,
         name=character.name,
         age_setting=character.age_setting,
+        persona_card=persona_card,
         persona_prompt=character.persona_prompt,
         speech_style=character.speech_style,
         relationship_boundary=character.relationship_boundary,
@@ -247,6 +251,7 @@ def _user_to_out(user: User) -> dict[str, Any]:
         "sleep_start": user.sleep_start,
         "sleep_end": user.sleep_end,
         "interest_topics": load_json(user.interest_topics_json, []),
+        "profile": load_json(user.profile_json, {}),
         "proactive_daily_limit": user.proactive_daily_limit,
         "proactive_next_check_at": user.proactive_next_check_at,
         "proactive_judgement": load_json(user.proactive_judgement_json, {}),
@@ -260,7 +265,9 @@ def _user_to_out(user: User) -> dict[str, Any]:
     }
 
 
-def _relation_to_out(relation: RelationState) -> dict[str, Any]:
+def _relation_to_out(relation: RelationState, character: Character | None = None) -> dict[str, Any]:
+    persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name) if character is not None else {}
+    attitude_band, attitude_text = relation_attitude(relation, persona_card)
     return {
         "id": relation.id,
         "user_id": relation.user_id,
@@ -270,6 +277,8 @@ def _relation_to_out(relation: RelationState) -> dict[str, Any]:
         "dependency": relation.dependency,
         "mood": relation.mood,
         "relationship_stage": relation.relationship_stage,
+        "attitude_band": attitude_band,
+        "attitude_text": attitude_text,
         "last_interaction_at": relation.last_interaction_at,
         "updated_at": relation.updated_at,
     }
@@ -283,8 +292,12 @@ def _memory_to_out(memory: Memory) -> dict[str, Any]:
         "layer": memory.layer,
         "content": memory.content,
         "source_event_id": memory.source_event_id,
+        "tags": load_json(memory.tags_json, []),
+        "metadata": load_json(memory.metadata_json, {}),
         "importance": memory.importance,
         "confidence": memory.confidence,
+        "vector_status": memory.vector_status,
+        "vector_updated_at": memory.vector_updated_at,
         "hidden": memory.hidden,
         "created_at": memory.created_at,
     }
@@ -446,6 +459,9 @@ def _update_user_fields(user: User, payload: dict[str, Any]) -> None:
     if "interest_topics" in payload:
         topics = [str(item).strip() for item in payload.get("interest_topics") or [] if str(item).strip()]
         user.interest_topics_json = dump_json(topics[-20:])
+    if "profile" in payload:
+        profile = payload.get("profile")
+        user.profile_json = dump_json(profile if isinstance(profile, dict) else {})
     user.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
 
 
@@ -462,9 +478,14 @@ def admin_users(page: int = 1, page_size: int = 20, q: str = "", session: Sessio
     user_ids = [item.user_id for item in users]
     relation_stmt = select(RelationState).where(RelationState.user_id.in_(user_ids)).order_by(RelationState.user_id)
     relations = session.execute(relation_stmt).scalars().all() if user_ids else []
+    character_ids = {item.character_id for item in relations}
+    characters = {
+        item.character_id: item
+        for item in session.execute(select(Character).where(Character.character_id.in_(character_ids))).scalars().all()
+    } if character_ids else {}
     return {
         **_page_response([_user_to_out(item) for item in users], total, page, page_size),
-        "relations": [_relation_to_out(item) for item in relations],
+        "relations": [_relation_to_out(item, characters.get(item.character_id)) for item in relations],
     }
 
 
@@ -526,7 +547,7 @@ def admin_update_relation(user_id: str, payload: dict[str, Any], session: Sessio
         relation.relationship_stage = str(payload.get("relationship_stage") or "").strip() or relation.relationship_stage
     relation.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
     session.commit()
-    return _relation_to_out(relation)
+    return _relation_to_out(relation, session.get(Character, character_id))
 
 
 @app.get("/api/admin/users/{user_id}/memories")
@@ -552,14 +573,18 @@ def admin_create_memory(user_id: str, payload: dict[str, Any], session: Session 
         memory_id=str(payload.get("memory_id") or uid("mem")),
         user_id=user_id,
         character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID),
-        layer=str(payload.get("layer") or "chat"),
+        layer=normalize_memory_layer(str(payload.get("layer") or "chat")),
         content=content,
         source_event_id=str(payload.get("source_event_id") or "admin"),
+        tags_json=dump_json([str(item).strip() for item in (payload.get("tags") or []) if str(item).strip()]),
+        metadata_json=dump_json(payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}),
         importance=float(payload.get("importance") or 0.5),
         confidence=float(payload.get("confidence") or 0.8),
         hidden=bool(payload.get("hidden", False)),
     )
     session.add(memory)
+    session.flush()
+    safe_index_memory_vector(session, memory)
     session.commit()
     return _memory_to_out(memory)
 
@@ -571,13 +596,20 @@ def admin_update_memory(memory_id: str, payload: dict[str, Any], session: Sessio
         raise HTTPException(status_code=404, detail="memory not found")
     for field in ("layer", "content", "source_event_id"):
         if field in payload:
-            setattr(memory, field, str(payload.get(field) or "").strip())
+            value = str(payload.get(field) or "").strip()
+            setattr(memory, field, normalize_memory_layer(value) if field == "layer" else value)
+    if "tags" in payload:
+        memory.tags_json = dump_json([str(item).strip() for item in (payload.get("tags") or []) if str(item).strip()])
+    if "metadata" in payload:
+        metadata = payload.get("metadata")
+        memory.metadata_json = dump_json(metadata if isinstance(metadata, dict) else {})
     if "importance" in payload:
         memory.importance = float(payload.get("importance") or 0)
     if "confidence" in payload:
         memory.confidence = float(payload.get("confidence") or 0)
     if "hidden" in payload:
         memory.hidden = bool(payload.get("hidden"))
+    safe_index_memory_vector(session, memory)
     session.commit()
     return _memory_to_out(memory)
 
@@ -587,6 +619,7 @@ def admin_delete_memory(memory_id: str, session: Session = Depends(get_session))
     memory = session.get(Memory, memory_id)
     if memory is None:
         raise HTTPException(status_code=404, detail="memory not found")
+    delete_memory_vector(memory.memory_id)
     session.delete(memory)
     session.commit()
     return {"ok": True}
@@ -992,6 +1025,8 @@ def update_character(character_id: str, payload: CharacterAdminIn, session: Sess
         raise HTTPException(status_code=404, detail="character not found")
     if payload.name is not None:
         character.name = payload.name.strip() or character.name
+    if payload.persona_card is not None:
+        character.persona_card_json = dump_json(normalize_persona_card(payload.persona_card, name=character.name))
     if payload.persona_prompt is not None:
         character.persona_prompt = payload.persona_prompt.strip()
     if payload.speech_style is not None:
@@ -1021,6 +1056,15 @@ def bootstrap(
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
     ).scalar_one()
+    character = session.get(Character, character_id)
+    attitude_band, attitude_text = relation_attitude(
+        relation,
+        normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=character.name if character else "小樱"),
+    )
+    attitude_band, attitude_text = relation_attitude(
+        relation,
+        normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=character.name if character else "小樱"),
+    )
     return {
         "user": {
             "user_id": user_id,
@@ -1038,6 +1082,8 @@ def bootstrap(
             "dependency": relation.dependency,
             "mood": relation.mood,
             "stage": relation.relationship_stage,
+            "attitude_band": attitude_band,
+            "attitude_text": attitude_text,
         },
         "touch_reactions_ready": True,
     }
@@ -1427,6 +1473,8 @@ def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARA
             "dependency": relation.dependency,
             "mood": relation.mood,
             "stage": relation.relationship_stage,
+            "attitude_band": attitude_band,
+            "attitude_text": attitude_text,
         },
         "schedule": {
             "current_title": next_slot.activity_title if next_slot else "想和你聊天",
