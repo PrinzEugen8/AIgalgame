@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta, timezone
@@ -137,7 +137,7 @@ def create_proactive_event(
 ) -> ProactiveEvent | None:
     source_type = source_type.strip()
     text = " ".join(str(text or "").split())
-    title = " ".join(str(title or "").split()) or "小樱想和你说话"
+    title = " ".join(str(title or "").split()) or "亚托莉想和你说话"
     if source_type not in PROACTIVE_SOURCES or not text:
         return None
     if dedupe_key:
@@ -196,7 +196,7 @@ def create_schedule_proactive_event(
         character_id=character_id,
         source_type="schedule",
         source_id=source_id,
-        title=title or "小樱有一件日常想告诉你",
+        title=title or "亚托莉有一件日常想告诉你",
         text=text,
         priority=priority,
         dedupe_key=f"schedule:{user_id}:{source_id}",
@@ -227,7 +227,7 @@ def create_moment_feedback_event(
         character_id=character_id,
         source_type="moment_interaction",
         source_id=interaction_id,
-        title="小樱注意到了你的互动",
+        title="亚托莉注意到了你的互动",
         text=text,
         priority=72 if interaction_type == "comment" else 64,
         dedupe_key=dedupe_key,
@@ -250,7 +250,7 @@ def create_memory_proactive_event(
         character_id=character_id,
         source_type="memory",
         source_id=memory_id,
-        title="小樱想起了一件事",
+        title="亚托莉想起了一件事",
         text=f"我刚刚想起你之前提到过的事：{content[:160]}",
         priority=priority,
         dedupe_key=f"memory:{memory_id}",
@@ -399,7 +399,7 @@ def _ensure_trend_radar_news_candidate(
         character_id=character_id,
         source_type="news",
         source_id=str(title.get("url") or ""),
-        title="小樱看到了一条热点",
+        title="亚托莉看到了一条热点",
         text=f"我刚看到和「{topic}」有关的热点：{summary}",
         priority=priority,
         dedupe_key=str(record["dedupe_key"]),
@@ -479,7 +479,7 @@ def _ensure_ark_news_candidate(
                 character_id=character_id,
                 source_type="news",
                 source_id=str(first.get("url") or ""),
-                title="小樱看到了一条新消息",
+                title="亚托莉看到了一条新消息",
                 text=f"我刚看到和「{topic}」有关的新内容：{summary}",
                 priority=80,
                 dedupe_key=str(record["dedupe_key"]),
@@ -832,7 +832,7 @@ def _proactive_judge_context(
         },
         "character": {
             "character_id": character.character_id if character is not None else "",
-            "name": character.name if character is not None else "小樱",
+            "name": character.name if character is not None else "亚托莉",
         },
         "delivery_history": {
             "today_delivered_count": delivered_today,
@@ -1066,7 +1066,7 @@ def proactive_widget_payload(event: ProactiveEvent | None, character: Character 
     chibi_url = _character_chibi_url(character)
     if event is None:
         return {
-            "character_name": character.name if character is not None else "小樱",
+            "character_name": character.name if character is not None else "亚托莉",
             "status": "想聊天",
             "bubble": "今天也想听你说说话。",
             "unread_count": 0,
@@ -1074,7 +1074,7 @@ def proactive_widget_payload(event: ProactiveEvent | None, character: Character 
             "chibi_url": chibi_url,
         }
     return {
-        "character_name": character.name if character is not None else "小樱",
+        "character_name": character.name if character is not None else "亚托莉",
         "status": "有话想说",
         "bubble": event.text[:80],
         "unread_count": 1,

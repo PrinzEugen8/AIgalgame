@@ -152,7 +152,7 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
             .firstOrNull { it.contains(modelX, modelY) }
             ?: return null
         val cooldownUntil = cooldownUntilByHitArea[hitArea.id] ?: 0L
-        if (nowMs < cooldownUntil || state.nowSpeaking) return null
+        if (nowMs < cooldownUntil) return null
 
         val reactionConfig = chooseReaction(hitArea.id, relation, nowMs) ?: return null
         val tapMotion = chooseTapMotion(hitArea.id, nowMs)

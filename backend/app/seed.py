@@ -150,6 +150,31 @@ def migrate_sakura_to_atri(session: Session) -> None:
             atri.tts_voice_profile_id = sakura.tts_voice_profile_id
         if atri.name in {"", "小樱"}:
             atri.name = "亚托莉"
+    session.execute(
+        text(
+            """
+            UPDATE relation_states
+            SET affection = MAX(affection, COALESCE((SELECT affection FROM relation_states s WHERE s.user_id = relation_states.user_id AND s.character_id = 'sakura'), affection)),
+                trust = MAX(trust, COALESCE((SELECT trust FROM relation_states s WHERE s.user_id = relation_states.user_id AND s.character_id = 'sakura'), trust)),
+                dependency = MAX(dependency, COALESCE((SELECT dependency FROM relation_states s WHERE s.user_id = relation_states.user_id AND s.character_id = 'sakura'), dependency)),
+                mood = MAX(mood, COALESCE((SELECT mood FROM relation_states s WHERE s.user_id = relation_states.user_id AND s.character_id = 'sakura'), mood))
+            WHERE character_id = 'atri'
+            """
+        )
+    )
+    session.execute(
+        text(
+            """
+            DELETE FROM relation_states
+            WHERE character_id = 'sakura'
+              AND EXISTS (
+                SELECT 1 FROM relation_states a
+                WHERE a.user_id = relation_states.user_id
+                  AND a.character_id = 'atri'
+              )
+            """
+        )
+    )
     tables_with_character_id = (
         "relation_states",
         "memories",
@@ -165,6 +190,14 @@ def migrate_sakura_to_atri(session: Session) -> None:
     session.execute(text("UPDATE moments SET author_id = 'atri' WHERE author_id = 'sakura'"))
     session.delete(sakura)
     session.flush()
+
+
+def cleanup_legacy_character_name(session: Session) -> None:
+    session.execute(text("UPDATE moments SET author_name = '亚托莉', text = REPLACE(text, '小樱', '亚托莉') WHERE author_name = '小樱' OR text LIKE '%小樱%'"))
+    session.execute(text("UPDATE proactive_events SET title = REPLACE(title, '小樱', '亚托莉'), text = REPLACE(text, '小樱', '亚托莉'), payload_json = REPLACE(payload_json, '小樱', '亚托莉'), prepared_payload_json = REPLACE(prepared_payload_json, '小樱', '亚托莉') WHERE title LIKE '%小樱%' OR text LIKE '%小樱%' OR payload_json LIKE '%小樱%' OR prepared_payload_json LIKE '%小樱%'"))
+    session.execute(text("UPDATE opening_caches SET payload_json = REPLACE(payload_json, '小樱', '亚托莉') WHERE payload_json LIKE '%小樱%'"))
+    session.execute(text("UPDATE memories SET content = REPLACE(content, '小樱', '亚托莉') WHERE content LIKE '%小樱%'"))
+    session.execute(text("UPDATE messages SET content = REPLACE(content, '小樱', '亚托莉') WHERE content LIKE '%小樱%'"))
 
 
 def purge_appearance_characters(session: Session) -> None:
@@ -192,6 +225,7 @@ def purge_appearance_characters(session: Session) -> None:
 
 def ensure_seed(session: Session, user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID) -> str:
     migrate_sakura_to_atri(session)
+    cleanup_legacy_character_name(session)
     purge_appearance_characters(session)
     requested_character_id = str(character_id or DEFAULT_CHARACTER_ID).strip() or DEFAULT_CHARACTER_ID
     if requested_character_id != DEFAULT_CHARACTER_ID and session.get(Character, requested_character_id) is None:

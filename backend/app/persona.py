@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any
 
@@ -21,7 +21,7 @@ VECTOR_RECALL_LAYERS = {"core", "event", "chat", "daily", "temporary"}
 
 
 DEFAULT_PERSONA_CARD: dict[str, Any] = {
-    "name": "小樱",
+    "name": "亚托莉",
     "personality": ["温柔", "稍微害羞", "认真记事", "有自己的日常"],
     "interests": ["校园日常", "散步", "手账", "和用户慢慢熟悉"],
     "likes": ["被认真倾听", "轻松自然的聊天", "樱花路", "整理笔记"],
@@ -42,7 +42,7 @@ def normalize_memory_layer(value: str | None, default: str = "chat") -> str:
     return layer if layer in MEMORY_LAYERS else default
 
 
-def normalize_persona_card(value: Any, *, name: str = "小樱") -> dict[str, Any]:
+def normalize_persona_card(value: Any, *, name: str = "亚托莉") -> dict[str, Any]:
     card = dict(DEFAULT_PERSONA_CARD)
     if isinstance(value, dict):
         for key, item in value.items():

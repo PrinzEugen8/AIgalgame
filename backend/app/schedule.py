@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
@@ -139,7 +139,7 @@ def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, sl
     prompt = f"""
 你要为 Galgame 伴侣 APP 生成一条真实朋友圈动态和 AI NPC 互动。必须只输出 JSON。
 
-角色：{character.persona_prompt if character else "小樱，Galgame 式 AI 伴侣。"}
+角色：{character.persona_prompt if character else "亚托莉，Galgame 式 AI 伴侣。"}
 虚拟日程：{slot.activity_title}
 地点：{slot.location}
 经历摘要：{exp.summary}
@@ -148,7 +148,7 @@ def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, sl
 
 输出格式：
 {{
-  "text": "小樱发的朋友圈正文，中文，1到2句，不要像公告",
+  "text": "亚托莉发的朋友圈正文，中文，1到2句，不要像公告",
   "mood": "开心|平静|害羞|低落|兴奋",
   "photo_kind": "可选，只能是 scenery、object_pet、character_selfie 或空字符串",
   "photo_prompt": "可选，只写短提示：风景、物品/宠物、或角色自拍；统一动漫风；不要写成开放式任意生图指令",
@@ -223,7 +223,7 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
             experience_id=uid("exp"),
             source_schedule_slot_id=slot.slot_id,
             title=slot.activity_title,
-            summary=f"小樱在{slot.location}完成了「{slot.activity_title}」，这段虚拟经历让她想把心情告诉你。",
+            summary=f"亚托莉在{slot.location}完成了「{slot.activity_title}」，这段虚拟经历让她想把心情告诉你。",
             emotional_result="开心" if slot.salience >= 60 else "平静",
             can_trigger_photo=slot.can_generate_photo,
         )
@@ -234,7 +234,7 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
                 user_id=user_id,
                 character_id=character_id,
                 layer="daily",
-                content=f"小樱的虚拟经历：{exp.summary}",
+                content=f"亚托莉的虚拟经历：{exp.summary}",
                 source_event_id=exp.experience_id,
                 importance=0.7,
                 confidence=0.9,
@@ -245,7 +245,7 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
             user_id=user_id,
             character_id=character_id,
             source_id=exp.experience_id,
-            title="小樱有一件日常想告诉你",
+            title="亚托莉有一件日常想告诉你",
             summary=exp.summary,
             activity_title=slot.activity_title,
             priority=slot.salience,

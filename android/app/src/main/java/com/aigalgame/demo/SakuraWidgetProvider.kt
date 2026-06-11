@@ -1,4 +1,4 @@
-package com.aigalgame.demo
+﻿package com.aigalgame.demo
 
 import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
@@ -20,7 +20,7 @@ class SakuraWidgetProvider : AppWidgetProvider() {
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         appWidgetIds.forEach { id ->
-            updateWidget(context, appWidgetManager, id, "小樱", "想聊天", "今天也想听你说说话。", 0, "", null)
+            updateWidget(context, appWidgetManager, id, "亚托莉", "想聊天", "今天也想听你说说话。", 0, "", null)
         }
         enqueueRefresh(context)
     }
@@ -29,7 +29,7 @@ class SakuraWidgetProvider : AppWidgetProvider() {
         fun refreshNow(context: Context) {
             val manager = AppWidgetManager.getInstance(context)
             val ids = manager.getAppWidgetIds(ComponentName(context, SakuraWidgetProvider::class.java))
-            ids.forEach { updateWidget(context, manager, it, "小樱", "想聊天", "今天也想听你说说话。", 0, "", null) }
+            ids.forEach { updateWidget(context, manager, it, "亚托莉", "想聊天", "今天也想听你说说话。", 0, "", null) }
             enqueueRefresh(context)
         }
 
@@ -40,7 +40,7 @@ class SakuraWidgetProvider : AppWidgetProvider() {
         }
 
         fun clearUnread(context: Context) {
-            updateAll(context, "小樱", "已读", "我在这里，慢慢说就好。", 0, "")
+            updateAll(context, "亚托莉", "已读", "我在这里，慢慢说就好。", 0, "")
         }
 
         private fun updateWidget(

@@ -321,6 +321,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         return false
     }
+
+    fun canStartTouchReaction(): Boolean {
+        if (currentLine() != null) return false
+        if (live2dReactionLine != null) return false
+        if (awaitingUserReplyResponse) return false
+        return true
+    }
     fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
 
@@ -417,7 +424,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (cooldownMs > 0L) {
             touchCooldownRequest = TouchCooldownRequest(reaction.hitArea, cooldownMs)
         }
-        if (hasDialoguePriority()) return
+        if (!canStartTouchReaction()) return
         if (reaction.text.isBlank()) return
         live2dReactionLine = DialogueLine(
             id = "live2d_touch_${System.currentTimeMillis()}",
@@ -659,9 +666,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestTouchReaction(hitArea: String, motion: String, expression: String, onResult: (Live2DReaction) -> Unit) {
-        val motionOnly = hasDialoguePriority()
+        if (!canStartTouchReaction()) return
         touchTtsCache.pickLocalLine(hitArea)?.let { cached ->
-            val localUrl = if (!motionOnly && java.io.File(cached.localPath).exists()) {
+            val localUrl = if (java.io.File(cached.localPath).exists()) {
                 "file://${cached.localPath}"
             } else {
                 ""
@@ -672,19 +679,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     intensity = Live2DReactionIntensity.Soft,
                     motion = cached.motion.ifBlank { motion },
                     expression = cached.expression.ifBlank { expression },
-                    text = if (motionOnly) "" else cached.text,
+                    text = cached.text,
                     relationDelta = RelationDelta(),
                     cooldownMs = cached.cooldownMs,
                     ttsUrl = localUrl,
-                    ttsDurationMs = if (motionOnly) 0L else cached.ttsDurationMs
+                    ttsDurationMs = cached.ttsDurationMs
                 )
             )
-            if (!motionOnly) {
-                touchTtsCache.markConsumed(hitArea, cached.contentHash)
-            }
+            touchTtsCache.markConsumed(hitArea, cached.contentHash)
             return
         }
-        onResult(motionOnlyTouchReaction(hitArea, motion, expression))
+        onResult(localTouchReactionFallback(hitArea, motion, expression))
     }
 
     private fun motionOnlyTouchReaction(hitArea: String, motion: String, expression: String): Live2DReaction {
@@ -1229,6 +1234,7 @@ fun AiGalgameApp(vm: MainViewModel) {
                     remoteHitAreas = vm.live2dHitAreas,
                     remoteReactions = vm.live2dReactions,
                     touchCooldownRequest = vm.touchCooldownRequest,
+                    touchReactionsEnabled = vm.canStartTouchReaction(),
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(1f)
@@ -1535,6 +1541,7 @@ fun HomeScreen(
                 remoteHitAreas = vm.live2dHitAreas,
                 remoteReactions = vm.live2dReactions,
                 touchCooldownRequest = vm.touchCooldownRequest,
+                touchReactionsEnabled = vm.canStartTouchReaction(),
                 tapBridge = tapBridge,
                 modifier = Modifier.fillMaxSize()
             )

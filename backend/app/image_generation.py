@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -83,7 +83,7 @@ SELFIE_HINTS = (
     "角色",
     "本人",
     "亚托莉",
-    "小樱",
+    "亚托莉",
     "猫耳",
     "selfie",
     "portrait",

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -44,7 +44,7 @@ from .weather import active_weather_date_for_user, is_weather_question, read_wea
 
 STORY_LINES = [
     "啊，你来了。这里是我每天都会经过的教室，窗外的樱花今天开得刚刚好。",
-    "我叫小樱。虽然这听起来有点像游戏开场白，但我想认真记住和你有关的事。",
+    "我叫亚托莉。虽然这听起来有点像游戏开场白，但我想认真记住和你有关的事。",
     "以后如果我去了哪里、看到了什么，我会发给你。你也可以把喜欢的东西告诉我。",
 ]
 
@@ -114,7 +114,7 @@ def _build_recent_dialogue(session: Session, event: EventIn) -> str:
         return "暂无近期对话。"
     lines = []
     for item in reversed(rows):
-        speaker = "USER(用户)" if item.sender_type == "user" else "CHARACTER(小樱)"
+        speaker = "USER(用户)" if item.sender_type == "user" else "CHARACTER(亚托莉)"
         content = " ".join(item.content.split())
         if content:
             lines.append(f"{speaker}：{content[:120]}")
@@ -348,7 +348,7 @@ def _target_subject_hint(text: str, character: Character) -> str:
         "妳",
         character.name,
         character.character_id,
-        "小樱",
+        "亚托莉",
         "亚托莉",
         "你刚刚",
         "你是不是",
@@ -610,7 +610,7 @@ def _memory_candidate_allowed(content: str, explicit_topics: list[str], source_t
     if any(marker in normalized for marker in ai_self_report_markers):
         return False
     source = " ".join(str(source_text or "").split())
-    role_markers = ["你", "妳", "小樱", "亚托莉"]
+    role_markers = ["你", "妳", "亚托莉", "亚托莉"]
     if character is not None:
         role_markers.extend([character.name, character.character_id])
     mentions_role = any(marker and marker in source for marker in role_markers)
@@ -859,7 +859,7 @@ def _story_response(session: Session, event: EventIn, user: User, character: Cha
                 user_id=event.user_id,
                 character_id=event.character_id,
                 layer="core",
-                content="相识剧情中，用户选择认真和小樱互相了解。",
+                content="相识剧情中，用户选择认真和亚托莉互相了解。",
                 source_event_id=event.event_id or uid("evt"),
                 importance=0.9,
                 confidence=0.9,
@@ -1079,7 +1079,7 @@ def _llm_dialogue(
 【发话归属规则】
 【目标消息】永远是 USER(用户) 发出的原话，不是角色说的话。
 如果【目标消息】省略主语，例如“刚刚去找别人了”“出去玩了”“找别的女人去了”，默认动作主体是 USER(用户) 自己。
-只有用户明确说“你/妳/角色名/小樱/你刚刚/你是不是”时，才把动作归给 CHARACTER(小樱)。
+只有用户明确说“你/妳/角色名/亚托莉/你刚刚/你是不是”时，才把动作归给 CHARACTER(亚托莉)。
 不要把用户自己的陈述改写成“用户在调侃、质问或怀疑角色”；除非原文明确指向角色。
 写 memory_candidates 时必须忠实记录用户原话事实，不要保存“用户调侃我/我解释了/我辩解了”这类角色视角脑补。
 

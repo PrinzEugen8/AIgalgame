@@ -75,7 +75,8 @@ fun Live2DStage(
     useInternalTapLayer: Boolean = true,
     remoteHitAreas: List<Live2DHitArea> = emptyList(),
     remoteReactions: List<Live2DReactionConfig> = emptyList(),
-    touchCooldownRequest: TouchCooldownRequest? = null
+    touchCooldownRequest: TouchCooldownRequest? = null,
+    touchReactionsEnabled: Boolean = true
 ) {
     val context = LocalContext.current
     val controller = remember(character) { Live2DController(context, character) }
@@ -135,6 +136,15 @@ fun Live2DStage(
     }
 
     fun handleStageTap(normalizedX: Float, normalizedY: Float) {
+        if (!touchReactionsEnabled) {
+            controller.updateGazeFromTap(
+                normalizedX = normalizedX.coerceIn(0f, 1f),
+                normalizedY = normalizedY.coerceIn(0f, 1f),
+                placement = effectivePlacement,
+                nowMs = System.currentTimeMillis()
+            )
+            return
+        }
         val reaction = controller.handleTap(
             normalizedX = normalizedX.coerceIn(0f, 1f),
             normalizedY = normalizedY.coerceIn(0f, 1f),
@@ -145,7 +155,7 @@ fun Live2DStage(
         if (reaction != null) onReaction(reaction)
     }
 
-    DisposableEffect(tapBridge, effectivePlacement) {
+    DisposableEffect(tapBridge, effectivePlacement, touchReactionsEnabled) {
         tapBridge?.setGazeHandler { normalizedX, normalizedY ->
             controller.updateGazeFromTap(
                 normalizedX = normalizedX.coerceIn(0f, 1f),

@@ -1,4 +1,4 @@
-package com.aigalgame.demo
+﻿package com.aigalgame.demo
 
 import android.Manifest
 import android.app.Notification
@@ -111,7 +111,7 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             }
             SakuraWidgetProvider.updateAll(
                 applicationContext,
-                widget.optString("character_name", "小樱"),
+                widget.optString("character_name", "亚托莉"),
                 widget.optString("status", "想聊天"),
                 widget.optString("bubble", "今天也想听你说说话。"),
                 widget.optInt("unread_count", 0),

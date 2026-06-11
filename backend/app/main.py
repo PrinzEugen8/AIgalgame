@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ipaddress
 import logging
@@ -866,8 +866,8 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
                 character_id=character_id,
                 source_type="schedule",
                 source_id=slot.slot_id,
-                title=title or "小樱有一件日常想告诉你",
-                text=text or f"小樱今天在{slot.location}安排了「{slot.activity_title}」，想找个合适的时候告诉你。",
+                title=title or "亚托莉有一件日常想告诉你",
+                text=text or f"亚托莉今天在{slot.location}安排了「{slot.activity_title}」，想找个合适的时候告诉你。",
                 priority=priority,
                 scheduled_at=_admin_due_time(body, local_time),
                 payload={"activity_title": slot.activity_title, "location": slot.location, "activity_type": slot.activity_type, "admin_generated": True},
@@ -894,7 +894,7 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
                 "schedule": "后台测试：今天的 AI 日程里有一件事想告诉用户。",
                 "calendar_event": "后台测试：最近有一个日历事件适合问问用户安排。",
                 "appointment": "后台测试：用户之前提到的约定快到了，需要温柔提醒。",
-                "memory": "后台测试：小樱想起了一件和用户有关的小事。",
+                "memory": "后台测试：亚托莉想起了一件和用户有关的小事。",
             }[source_type]
             event = create_proactive_event(
                 session,
@@ -1863,7 +1863,7 @@ def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session
         raise HTTPException(status_code=404, detail="moment not found")
     interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="like")
     session.add(interaction)
-    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content="用户点赞了小樱的朋友圈。", source_event_id=interaction.interaction_id, importance=0.6, confidence=0.9))
+    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content="用户点赞了亚托莉的朋友圈。", source_event_id=interaction.interaction_id, importance=0.6, confidence=0.9))
     create_moment_feedback_event(
         session,
         user_id=user_id,
@@ -1885,7 +1885,7 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
         raise HTTPException(status_code=400, detail="content required")
     interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="comment", content=content)
     session.add(interaction)
-    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content=f"用户评论了小樱的朋友圈：{content}", source_event_id=interaction.interaction_id, importance=0.8, confidence=0.95))
+    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content=f"用户评论了亚托莉的朋友圈：{content}", source_event_id=interaction.interaction_id, importance=0.8, confidence=0.95))
     create_moment_feedback_event(
         session,
         user_id=user_id,
