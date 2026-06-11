@@ -670,7 +670,7 @@ function renderUserEditor() {
       <label><span>user_id</span><input name="user_id" value="${escapeHtml(user.user_id)}" disabled></label>
       <label><span>显示名</span><input name="display_name" value="${escapeHtml(user.display_name || "")}"></label>
       <label><span>时区</span><input name="timezone" value="${escapeHtml(user.timezone || "Asia/Hong_Kong")}"></label>
-      <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "low")}"></label>
+      <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "unlimited")}"></label>
       <label><span>睡眠开始</span><input name="sleep_start" value="${escapeHtml(user.sleep_start || "00:30")}"></label>
       <label><span>睡眠结束</span><input name="sleep_end" value="${escapeHtml(user.sleep_end || "08:00")}"></label>
       <label class="wide"><span>兴趣主题（一行一个）</span><textarea name="interest_topics">${escapeHtml((user.interest_topics || []).join("\n"))}</textarea></label>

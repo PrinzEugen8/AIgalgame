@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ.setdefault("AIGALGAME_DATA_DIR", os.path.abspath("backend/.test-data"))
@@ -2663,8 +2663,12 @@ def test_proactive_pending_uses_existing_weather_without_qweather_refresh() -> N
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "qweather" in str(request.url):
+            raise AssertionError(f"pending proactive must not call QWeather: {request.url}")
+        if request.url.path.endswith("/chat/completions"):
+            return _llm_json_response({"should_send": False, "selected_event_id": "", "reason": "defer weather judge"})
         calls.append(request.url.path)
-        raise AssertionError(f"pending proactive must not call QWeather: {request.url}")
+        raise AssertionError(f"unexpected request: {request.url}")
 
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
@@ -2673,7 +2677,19 @@ def test_proactive_pending_uses_existing_weather_without_qweather_refresh() -> N
             user = session.get(User, user_id)
             user.story_completed = True
             user.news_enabled = False
-            user.proactive_next_check_at = "2026-06-10T12:00:00+00:00"
+            for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind.in_(["llm_task", "llm"]))).scalars():
+                config.enabled = False
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_qweather_pending_judge_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-task",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2770,7 +2786,6 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
                 "should_send": True,
                 "selected_event_id": selected_event_id,
                 "reason": "虽然处在睡眠和短间隔上下文里，但这条候选更重要。",
-                "next_check_after_minutes": 120,
             }
         )
 
@@ -2855,13 +2870,12 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             session.refresh(user)
             judgement = json.loads(user.proactive_judgement_json)
             assert judgement["selected_event_id"] == selected_event_id
-            assert judgement["next_check_after_minutes"] == 30
-            assert user.proactive_next_check_at
+            assert "user_availability" in context
     finally:
         providers.HTTP_TRANSPORT = None
 
 
-def test_proactive_judge_can_defer_and_store_next_check() -> None:
+def test_proactive_judge_can_defer_without_next_check() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_defer_user_{suffix}"
 
@@ -2871,7 +2885,6 @@ def test_proactive_judge_can_defer_and_store_next_check() -> None:
                 "should_send": False,
                 "selected_event_id": "",
                 "reason": "现在不打扰，稍后再看。",
-                "next_check_after_minutes": 45,
             }
         )
 
@@ -2918,21 +2931,20 @@ def test_proactive_judge_can_defer_and_store_next_check() -> None:
             session.refresh(user)
             judgement = json.loads(user.proactive_judgement_json)
             assert judgement["should_send"] is False
-            assert judgement["next_check_after_minutes"] == 45
-            assert datetime.fromisoformat(user.proactive_next_check_at) == datetime.fromisoformat("2026-06-09T04:45:00+00:00")
     finally:
         providers.HTTP_TRANSPORT = None
 
 
-def test_proactive_next_check_skips_llm_until_due() -> None:
+def test_proactive_stale_next_check_does_not_block_judgement() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_next_check_user_{suffix}"
+    selected_event_id = ""
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return _llm_json_response({"should_send": True, "selected_event_id": "should_not_be_used", "reason": "", "next_check_after_minutes": 10})
+        return _llm_json_response({"should_send": True, "selected_event_id": selected_event_id, "reason": "stale next_check ignored"})
 
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
@@ -2953,18 +2965,19 @@ def test_proactive_next_check_skips_llm_until_due() -> None:
             user.story_completed = True
             user.notifications_enabled = True
             user.proactive_next_check_at = "2026-06-09T05:00:00+00:00"
-            create_proactive_event(
+            event = create_proactive_event(
                 session,
                 user_id=user_id,
                 character_id="sakura",
                 source_type="memory",
                 source_id=f"pending_skip_{suffix}",
-                title="未到判断时间",
-                text="这条不应该触发判断器。",
+                title="不再被 next_check 挡住",
+                text="这条应该重新触发判断器。",
                 priority=90,
                 dedupe_key=f"pending_skip_{suffix}",
                 scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
             )
+            selected_event_id = event.proactive_event_id
             session.commit()
             result = pending_proactive_response(
                 session,
@@ -2974,13 +2987,13 @@ def test_proactive_next_check_skips_llm_until_due() -> None:
                 generate_news=False,
                 generate_weather=False,
             )
-            assert result["event"] is None
-            assert calls == 0
+            assert result["event"]["proactive_event_id"] == selected_event_id
+            assert calls == 1
     finally:
         providers.HTTP_TRANSPORT = None
 
 
-def test_proactive_error_next_check_retries_after_short_cooldown() -> None:
+def test_proactive_error_state_does_not_block_retry() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_error_retry_{suffix}"
     selected_event_id = ""
@@ -3025,7 +3038,7 @@ def test_proactive_error_next_check_retries_after_short_cooldown() -> None:
                 source_type="memory",
                 source_id=f"pending_error_retry_{suffix}",
                 title="错误重试",
-                text="这条应该在短错误冷却后重新触发判断器。",
+                text="这条应该在错误状态后仍可重新触发判断器。",
                 priority=90,
                 dedupe_key=f"pending_error_retry_{suffix}",
                 scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
@@ -3161,7 +3174,6 @@ def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
             judgement = json.loads(user.proactive_judgement_json)
             assert judgement["status"] == "error"
             assert judgement["should_send"] is False
-            assert judgement["next_check_after_minutes"] == 5
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -3340,17 +3352,35 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
             providers.HTTP_TRANSPORT = None
 
 
-def test_proactive_daily_limit_blocks_new_judgement() -> None:
+def test_proactive_daily_limit_is_soft_and_does_not_block_judgement() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"proactive_daily_limit_{suffix}"
+    selected_event_id = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        pytest.fail(f"daily limit should skip LLM: {request.url}")
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": selected_event_id,
+                "reason": "low preference is soft only",
+            }
+        )
 
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
             ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_soft_limit_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
             user = session.get(User, user_id)
             user.story_completed = True
             user.notifications_enabled = True
@@ -3370,18 +3400,19 @@ def test_proactive_daily_limit_blocks_new_judgement() -> None:
                 )
                 delivered.status = "delivered"
                 delivered.delivered_at = f"2026-06-09T0{index}:00:00+00:00"
-            create_proactive_event(
+            pending = create_proactive_event(
                 session,
                 user_id=user_id,
                 character_id="sakura",
                 source_type="memory",
                 source_id=f"pending_limit_{suffix}",
                 title="Pending",
-                text="Should wait because daily limit is reached.",
+                text="Should still be judged even after many deliveries today.",
                 priority=95,
                 dedupe_key=f"pending_limit_{suffix}",
                 scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
             )
+            selected_event_id = pending.proactive_event_id
             session.commit()
             result = pending_proactive_response(
                 session,
@@ -3391,11 +3422,11 @@ def test_proactive_daily_limit_blocks_new_judgement() -> None:
                 generate_news=False,
                 generate_weather=False,
             )
-            assert result["event"] is None
+            assert result["event"]["proactive_event_id"] == selected_event_id
             session.refresh(user)
             judgement = json.loads(user.proactive_judgement_json)
-            assert judgement["status"] == "limited"
-            assert judgement["should_send"] is False
+            assert judgement["status"] == "decided"
+            assert judgement["should_send"] is True
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -3680,6 +3711,7 @@ def test_user_message_extracts_appointment_commitment() -> None:
                     "description": "明早 9 点要赶飞机，提前确认起床。",
                     "event_at": "2026-06-10T09:00:00+08:00",
                     "remind_at": "2026-06-10T08:00:00+08:00",
+                    "delivery_timing": "advance",
                     "confidence": 0.92,
                 }
             )
@@ -3742,6 +3774,189 @@ def test_user_message_extracts_appointment_commitment() -> None:
             proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
             assert proactive.source_type == "appointment"
             assert proactive.scheduled_at == "2026-06-10T00:00:00+00:00"
+            payload = json.loads(proactive.payload_json)
+            assert payload["delivery_timing"] == "advance"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_user_message_extracts_on_time_call_me_commitment() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"on_time_commitment_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        if "Extract a future user commitment" in prompt:
+            return _llm_json_response(
+                {
+                    "has_commitment": True,
+                    "title": "14:30叫我",
+                    "description": "14:30叫我一下",
+                    "event_at": "2026-06-09T14:30:00+08:00",
+                    "delivery_timing": "on_time",
+                    "confidence": 0.95,
+                }
+            )
+        return _llm_json_response(
+            {
+                "reply_mode": "light",
+                "pace_reason": "remember commitment",
+                "lines": [{"text": "好，14:30我会叫你。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_on_time_commitment_chat_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_on_time_commitment_task_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id=f"on_time_commitment_session_{suffix}",
+                    payload={"text": "14:30叫我一下"},
+                    client_context={"local_time": "2026-06-09T13:00:00+08:00"},
+                ),
+            )
+            commitment = session.execute(select(UserCommitment).where(UserCommitment.user_id == user_id)).scalar_one()
+            assert commitment.remind_at == commitment.event_at
+            proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
+            payload = json.loads(proactive.payload_json)
+            assert payload["delivery_timing"] == "on_time"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_appointment_on_time_fast_path_delivers_without_judge() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"on_time_fast_path_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"on_time appointment should bypass judge: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            remind_at = datetime.fromisoformat("2026-06-09T14:30:00+08:00")
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="appointment",
+                source_id=f"commit_on_time_{suffix}",
+                title="14:30叫我",
+                text="到点啦。",
+                priority=90,
+                dedupe_key=f"on_time_fast_{suffix}",
+                payload={
+                    "delivery_timing": "on_time",
+                    "event_at": remind_at.astimezone(timezone.utc).isoformat(),
+                    "remind_at": remind_at.astimezone(timezone.utc).isoformat(),
+                },
+                scheduled_at=remind_at,
+                expires_at=remind_at + timedelta(hours=2),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=remind_at,
+                generate_news=False,
+                generate_weather=False,
+                appointment_only=True,
+            )
+            assert result["event"] is not None
+            assert result["event"]["source_type"] == "appointment"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_follow_up_appointment_not_due_during_busy_window() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"follow_up_busy_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"follow_up should not judge during busy window: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            busy_start = datetime.fromisoformat("2026-06-09T16:00:00+08:00")
+            busy_end = datetime.fromisoformat("2026-06-09T18:00:00+08:00")
+            remind_at = busy_end + timedelta(minutes=10)
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="appointment",
+                source_id=f"commit_follow_up_{suffix}",
+                title="忙完了联系",
+                text="忙完了吗？",
+                priority=90,
+                dedupe_key=f"follow_up_busy_{suffix}",
+                payload={
+                    "delivery_timing": "follow_up",
+                    "busy_start": busy_start.astimezone(timezone.utc).isoformat(),
+                    "busy_end": busy_end.astimezone(timezone.utc).isoformat(),
+                    "event_at": busy_end.astimezone(timezone.utc).isoformat(),
+                    "remind_at": remind_at.astimezone(timezone.utc).isoformat(),
+                },
+                scheduled_at=remind_at,
+                expires_at=busy_end + timedelta(hours=4),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T17:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+                appointment_only=True,
+            )
+            assert result["event"] is None
     finally:
         providers.HTTP_TRANSPORT = None
 

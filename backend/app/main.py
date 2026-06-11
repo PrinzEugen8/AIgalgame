@@ -438,7 +438,7 @@ def _update_user_fields(user: User, payload: dict[str, Any]) -> None:
         if field in payload:
             setattr(user, field, str(payload.get(field) or "").strip())
     if "proactive_daily_limit" in payload:
-        user.proactive_daily_limit = str(payload.get("proactive_daily_limit") or "low").strip() or "low"
+        user.proactive_daily_limit = str(payload.get("proactive_daily_limit") or "unlimited").strip() or "unlimited"
     for field in ("notifications_enabled", "widget_bubbles_enabled", "news_enabled", "tts_enabled", "story_completed"):
         if field in payload:
             setattr(user, field, bool(payload.get(field)))
@@ -867,7 +867,7 @@ def admin_judge_proactive_now(payload: dict[str, Any] | None = None, session: Se
         generate_weather=_payload_bool(body, "generate_weather", False),
         delivery_channel=str(body.get("delivery_channel") or "admin"),
         foreground_context=foreground_context,
-        ignore_next_check=_payload_bool(body, "ignore_next_check", True),
+        appointment_only=_payload_bool(body, "appointment_only", False),
     )
     prepare_result: dict[str, Any] | None = None
     event_payload = result.get("event") or {}

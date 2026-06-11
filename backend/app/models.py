@@ -21,7 +21,7 @@ class User(Base):
     sleep_start: Mapped[str] = mapped_column(String, default="00:30")
     sleep_end: Mapped[str] = mapped_column(String, default="08:00")
     interest_topics_json: Mapped[str] = mapped_column(Text, default="[]")
-    proactive_daily_limit: Mapped[str] = mapped_column(String, default="low")
+    proactive_daily_limit: Mapped[str] = mapped_column(String, default="unlimited")
     proactive_next_check_at: Mapped[str] = mapped_column(String, default="")
     proactive_judgement_json: Mapped[str] = mapped_column(Text, default="{}")
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)

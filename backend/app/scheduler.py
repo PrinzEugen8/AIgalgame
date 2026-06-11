@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .database import SessionLocal
 from .diagnostics import write_diagnostic
-from .models import User
+from .models import ProactiveEvent, User, UserCommitment
 from .news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot
 from .online import is_online
 from .opening import has_fresh_proactive_opening_cache, prepare_due_openings
@@ -52,9 +52,16 @@ def start_scheduler() -> None:
     )
     scheduler.start()
     _scheduler = scheduler
+    try:
+        with SessionLocal() as session:
+            restored = restore_commitment_jobs(session)
+    except Exception:
+        logger.exception("restore commitment jobs failed")
+        restored = 0
     logger.info(
-        "scheduler started trend_radar_dispatch=03:00 daily_cycle=04:00 proactive_prewarm=%sm first_run=120s Asia/Hong_Kong",
+        "scheduler started trend_radar_dispatch=03:00 daily_cycle=04:00 proactive_prewarm=%sm first_run=120s restored_commitments=%s Asia/Hong_Kong",
         _prewarm_interval_minutes(),
+        restored,
     )
 
 
@@ -221,3 +228,67 @@ def _prewarm_once(session: Session, *, user_ids: set[str] | None = None) -> dict
                 )
     write_diagnostic("proactive_prewarm_scheduler_finished", feature="开场预热", stage="_prewarm_job", **result)
     return result
+
+
+def schedule_commitment_delivery(commitment_id: str, remind_at: datetime) -> None:
+    global _scheduler
+    if _scheduler is None or not _scheduler.running:
+        return
+    run_at = remind_at
+    if run_at.tzinfo is None:
+        run_at = run_at.replace(tzinfo=timezone.utc)
+    if run_at <= datetime.now(timezone.utc):
+        run_at = datetime.now(timezone.utc) + timedelta(seconds=2)
+    _scheduler.add_job(
+        _commitment_delivery_job,
+        trigger="date",
+        run_date=run_at,
+        args=[commitment_id],
+        id=f"commitment:{commitment_id}",
+        replace_existing=True,
+    )
+    write_diagnostic("commitment_job_scheduled", commitment_id=commitment_id, run_at=run_at.isoformat())
+
+
+def _commitment_delivery_job(commitment_id: str) -> None:
+    from .proactive import deliver_commitment_reminder
+
+    logger.info("commitment delivery job started commitment_id=%s", commitment_id)
+    try:
+        with SessionLocal() as session:
+            result = deliver_commitment_reminder(session, commitment_id)
+            event = result.get("event") or {}
+            event_id = str(event.get("proactive_event_id") or "") if isinstance(event, dict) else ""
+            if event_id:
+                push_result = send_selected_background_push(session, event_id)
+                write_diagnostic("commitment_push_finished", commitment_id=commitment_id, **push_result)
+    except Exception:
+        logger.exception("commitment delivery job failed commitment_id=%s", commitment_id)
+        raise
+    logger.info("commitment delivery job completed commitment_id=%s", commitment_id)
+
+
+def restore_commitment_jobs(session: Session, *, horizon_hours: int = 24) -> int:
+    now_utc = datetime.now(timezone.utc)
+    horizon = now_utc + timedelta(hours=horizon_hours)
+    restored = 0
+    commitments = session.execute(select(UserCommitment).order_by(UserCommitment.remind_at)).scalars().all()
+    for commitment in commitments:
+        remind_at = datetime.fromisoformat(str(commitment.remind_at).replace("Z", "+00:00"))
+        if remind_at.tzinfo is None:
+            remind_at = remind_at.replace(tzinfo=timezone.utc)
+        if remind_at > horizon:
+            continue
+        pending = session.execute(
+            select(ProactiveEvent).where(
+                ProactiveEvent.source_type == "appointment",
+                ProactiveEvent.source_id == commitment.commitment_id,
+                ProactiveEvent.status == "pending",
+            )
+        ).scalar_one_or_none()
+        if pending is None:
+            continue
+        schedule_commitment_delivery(commitment.commitment_id, remind_at)
+        restored += 1
+    write_diagnostic("commitment_jobs_restored", restored=restored)
+    return restored

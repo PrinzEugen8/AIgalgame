@@ -13,10 +13,16 @@ JUDGE_RULES = """
 Pick at most one candidate id.
 If not sending, selected_event_id must be "".
 Foreground: send only when idle_seconds >= 30 and input_active is false.
-Respect sleep, recent delivery, unread retention, and daily_limit.
-next_check_after_minutes: integer 1..1440.
+Respect user_availability (sleep and future school/work routines), recent delivery, and unread retention.
+proactive_frequency_preference is a soft hint only; do not mechanically cap message count.
+appointment + on_time + due: must send (user explicitly asked for this time).
+appointment + advance: send when 30-120 minutes before event_at and user is not sleeping.
+appointment + follow_up: never send during busy_start..busy_end; after busy_end send a caring check-in tone.
+appointment + on_time missed window: send as missed_reminder with apologetic tone.
+on_time appointments may reach the user even during sleep/work routines.
+news/weather/memory/schedule: prefer sending when user is available; skip if user_availability.is_unavailable unless very important.
 Output shape:
-{"should_send":false,"selected_event_id":"","reason":"short reason","next_check_after_minutes":30}
+{"should_send":false,"selected_event_id":"","reason":"short reason"}
 """
 
 

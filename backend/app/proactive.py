@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .availability import get_user_availability, is_event_in_busy_window, is_user_unavailable
 from .diagnostics import write_diagnostic
 from .models import Character, ProactiveEvent, ProviderConfig, User
 from .news import trend_radar_payload_for_news
@@ -20,13 +21,9 @@ PROACTIVE_STATUSES = {"pending", "delivered", "opened", "reflected", "expired", 
 PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather", "calendar_event", "appointment"}
 DEFAULT_EXPIRY = timedelta(days=2)
 PROACTIVE_JUDGE_CANDIDATE_LIMIT = 8
-DEFAULT_JUDGE_NEXT_CHECK_MINUTES = 30
-ERROR_JUDGE_NEXT_CHECK_MINUTES = 5
-MAX_JUDGE_NEXT_CHECK_MINUTES = 24 * 60
-MAX_SEND_NEXT_CHECK_MINUTES = 30
 JUDGE_TEXT_LIMIT = 180
-DAILY_LIMITS = {"low": 2, "normal": 4, "medium": 4, "high": 6}
-UNLIMITED_DAILY_LIMITS = {"unlimited", "none", "off"}
+ON_TIME_DELIVERY_WINDOW = timedelta(minutes=10)
+SOURCE_TYPE_RANK = {"appointment": 0, "calendar_event": 1, "schedule": 2, "weather": 3, "news": 4, "moment_interaction": 5, "memory": 6}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -106,13 +103,6 @@ def _latest_delivery(session: Session, user: User) -> datetime | None:
     times = [_event_time_local(item, user) for item in events]
     valid = [item for item in times if item is not None]
     return max(valid) if valid else None
-
-
-def _daily_limit(user: User) -> int | None:
-    policy = str(user.proactive_daily_limit or "low").strip().lower()
-    if policy in UNLIMITED_DAILY_LIMITS:
-        return None
-    return DAILY_LIMITS.get(policy, DAILY_LIMITS["low"])
 
 
 def _expire_old_pending(session: Session, user_id: str, now_utc: datetime) -> None:
@@ -527,33 +517,55 @@ def ensure_news_candidate(session: Session, *, user_id: str, character_id: str, 
     return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
 
 
+def _event_payload(event: ProactiveEvent) -> dict[str, Any]:
+    payload = load_json(event.payload_json, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _source_type_rank(source_type: str) -> int:
+    return SOURCE_TYPE_RANK.get(source_type, 9)
+
+
 def _due_pending_events(
     session: Session,
     *,
     user_id: str,
     character_id: str,
     now_utc: datetime,
+    now_local: datetime | None = None,
+    user: User | None = None,
+    appointment_only: bool = False,
     limit: int = PROACTIVE_JUDGE_CANDIDATE_LIMIT,
 ) -> list[ProactiveEvent]:
     events = session.execute(
-        select(ProactiveEvent)
-        .where(
+        select(ProactiveEvent).where(
             ProactiveEvent.user_id == user_id,
             ProactiveEvent.character_id == character_id,
             ProactiveEvent.status == "pending",
         )
-        .order_by(ProactiveEvent.priority.desc(), ProactiveEvent.created_at)
     ).scalars().all()
     due: list[ProactiveEvent] = []
     for event in events:
+        if appointment_only and event.source_type != "appointment":
+            continue
         scheduled_at = _parse_iso(event.scheduled_at) or now_utc
         if scheduled_at.tzinfo is None:
             scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-        if scheduled_at <= now_utc:
-            due.append(event)
-            if len(due) >= limit:
-                break
-    return due
+        if scheduled_at > now_utc:
+            continue
+        payload = _event_payload(event)
+        if now_local is not None and is_event_in_busy_window(payload, now_local):
+            continue
+        due.append(event)
+    due.sort(
+        key=lambda item: (
+            _source_type_rank(item.source_type),
+            -int(item.priority),
+            _parse_iso(item.scheduled_at) or now_utc,
+            item.created_at,
+        )
+    )
+    return due[:limit]
 
 
 def _unread_selected_event(session: Session, user: User, *, character_id: str) -> ProactiveEvent | None:
@@ -569,31 +581,6 @@ def _unread_selected_event(session: Session, user: User, *, character_id: str) -
         ):
             return event
     return None
-
-
-def _next_check_at(user: User) -> datetime | None:
-    value = _parse_iso(user.proactive_next_check_at)
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
-def _next_check_pending(user: User, now_utc: datetime) -> bool:
-    previous = load_json(user.proactive_judgement_json, {})
-    if isinstance(previous, dict) and previous.get("status") == "limited":
-        return False
-    next_check_at = _next_check_at(user)
-    if isinstance(previous, dict) and previous.get("status") == "error":
-        decided_at = _parse_iso(str(previous.get("decided_at") or ""))
-        if decided_at is not None:
-            if decided_at.tzinfo is None:
-                decided_at = decided_at.replace(tzinfo=timezone.utc)
-            retry_at = decided_at.astimezone(timezone.utc) + timedelta(minutes=ERROR_JUDGE_NEXT_CHECK_MINUTES)
-            if next_check_at is None or next_check_at > retry_at:
-                next_check_at = retry_at
-    return next_check_at is not None and next_check_at > now_utc
 
 
 def _event_minutes_since(value: str, now_utc: datetime) -> int | None:
@@ -627,11 +614,36 @@ def _payload_for_judge(payload: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _event_for_judge(event: ProactiveEvent, now_utc: datetime) -> dict[str, Any]:
-    payload = load_json(event.payload_json, {})
-    if not isinstance(payload, dict):
-        payload = {}
+def _appointment_timing_context(payload: dict[str, Any], now_utc: datetime, now_local: datetime) -> dict[str, Any]:
+    delivery_timing = str(payload.get("delivery_timing") or "").strip().lower()
+    event_at = _parse_iso(str(payload.get("event_at") or ""))
+    remind_at = _parse_iso(str(payload.get("remind_at") or ""))
+    busy_start = _parse_iso(str(payload.get("busy_start") or ""))
+    busy_end = _parse_iso(str(payload.get("busy_end") or ""))
+    minutes_until_event = None
+    if event_at is not None:
+        minutes_until_event = int((event_at.astimezone(timezone.utc) - now_utc).total_seconds() // 60)
+    scheduled_ref = str(payload.get("remind_at") or payload.get("event_at") or "")
+    minutes_since_scheduled = _event_minutes_since(scheduled_ref, now_utc) if scheduled_ref else None
+    missed_on_time = False
+    if delivery_timing == "on_time" and remind_at is not None:
+        missed_on_time = now_utc > remind_at.astimezone(timezone.utc) + ON_TIME_DELIVERY_WINDOW
     return {
+        "delivery_timing": delivery_timing,
+        "event_at": payload.get("event_at") or "",
+        "remind_at": payload.get("remind_at") or "",
+        "busy_start": payload.get("busy_start") or "",
+        "busy_end": payload.get("busy_end") or "",
+        "minutes_until_event": minutes_until_event,
+        "minutes_since_scheduled": minutes_since_scheduled,
+        "is_in_busy_window": is_event_in_busy_window(payload, now_local),
+        "missed_on_time": missed_on_time,
+    }
+
+
+def _event_for_judge(event: ProactiveEvent, now_utc: datetime, now_local: datetime) -> dict[str, Any]:
+    payload = _event_payload(event)
+    item = {
         "proactive_event_id": event.proactive_event_id,
         "source_type": event.source_type,
         "source_id": event.source_id,
@@ -644,6 +656,9 @@ def _event_for_judge(event: ProactiveEvent, now_utc: datetime) -> dict[str, Any]
         "age_minutes": _event_minutes_since(event.created_at, now_utc),
         "payload": _payload_for_judge(payload),
     }
+    if event.source_type == "appointment":
+        item["appointment"] = _appointment_timing_context(payload, now_utc, now_local)
+    return item
 
 
 def _judge_sleep_context(user: User, now_local: datetime) -> dict[str, Any]:
@@ -667,7 +682,6 @@ def _proactive_judge_context(
 ) -> dict[str, Any]:
     latest = _latest_delivery(session, user)
     delivered_today = _daily_delivery_count(session, user, now_local)
-    daily_limit = _daily_limit(user)
     previous = load_json(user.proactive_judgement_json, {})
     if not isinstance(previous, dict):
         previous = {}
@@ -679,7 +693,7 @@ def _proactive_judge_context(
             "display_name": user.display_name,
             "timezone": user.timezone,
             "interest_topics": load_json(user.interest_topics_json, []),
-            "proactive_daily_limit": user.proactive_daily_limit,
+            "proactive_frequency_preference": user.proactive_daily_limit,
             "notifications_enabled": user.notifications_enabled,
             "story_completed": user.story_completed,
         },
@@ -691,35 +705,22 @@ def _proactive_judge_context(
             "today_delivered_count": delivered_today,
             "latest_delivery_at": latest.isoformat() if latest is not None else "",
         },
-        "daily_limit": {
-            "policy": user.proactive_daily_limit,
-            "max": daily_limit,
-            "remaining": None if daily_limit is None else max(0, daily_limit - delivered_today),
-        },
         "delivery_channel": delivery_channel,
         "foreground_presence": foreground_context or {},
         "sleep_window": _judge_sleep_context(user, now_local),
+        "user_availability": get_user_availability(user, now_local),
         "previous_judgement": {
             "status": previous.get("status") or "",
             "should_send": previous.get("should_send"),
             "selected_event_id": previous.get("selected_event_id") or "",
             "reason": _judge_text(previous.get("reason")),
-            "next_check_at": previous.get("next_check_at") or "",
         },
-        "candidates": [_event_for_judge(event, now_utc) for event in events],
+        "candidates": [_event_for_judge(event, now_utc, now_local) for event in events],
     }
 
 
 def _judge_messages(context: dict[str, Any]) -> list[dict[str, str]]:
     return build_judge_messages(context)
-
-
-def _judge_next_check_minutes(value: Any) -> int:
-    try:
-        minutes = int(float(value))
-    except (TypeError, ValueError):
-        minutes = DEFAULT_JUDGE_NEXT_CHECK_MINUTES
-    return max(1, min(minutes, MAX_JUDGE_NEXT_CHECK_MINUTES))
 
 
 def _store_judgement(
@@ -731,26 +732,58 @@ def _store_judgement(
     should_send: bool,
     selected_event_id: str,
     reason: str,
-    next_check_after_minutes: int,
     raw: dict[str, Any] | None = None,
     error_type: str = "",
 ) -> None:
-    next_check_at = now_utc + timedelta(minutes=next_check_after_minutes)
-    user.proactive_next_check_at = _utc_iso(next_check_at)
     user.proactive_judgement_json = dump_json(
         {
             "status": status,
             "should_send": should_send,
             "selected_event_id": selected_event_id,
             "reason": reason,
-            "next_check_after_minutes": next_check_after_minutes,
-            "next_check_at": user.proactive_next_check_at,
             "candidate_ids": candidate_ids,
             "decided_at": _utc_iso(now_utc),
             "error_type": error_type,
             "raw": raw or {},
         }
     )
+
+
+def _try_appointment_fast_path(
+    events: list[ProactiveEvent],
+    *,
+    now_utc: datetime,
+) -> ProactiveEvent | None:
+    for event in events:
+        if event.source_type != "appointment":
+            continue
+        payload = _event_payload(event)
+        delivery_timing = str(payload.get("delivery_timing") or "").strip().lower()
+        remind_at = _parse_iso(str(payload.get("remind_at") or event.scheduled_at or ""))
+        if remind_at is None:
+            continue
+        if remind_at.tzinfo is None:
+            remind_at = remind_at.replace(tzinfo=timezone.utc)
+        remind_utc = remind_at.astimezone(timezone.utc)
+        if delivery_timing == "on_time":
+            if remind_utc <= now_utc <= remind_utc + ON_TIME_DELIVERY_WINDOW:
+                write_diagnostic(
+                    "proactive_appointment_fast_path",
+                    proactive_event_id=event.proactive_event_id,
+                    delivery_timing=delivery_timing,
+                    reason="on_time window",
+                )
+                return event
+            expires_at = _parse_iso(event.expires_at)
+            if expires_at is not None and now_utc > remind_utc + ON_TIME_DELIVERY_WINDOW and now_utc <= expires_at:
+                write_diagnostic(
+                    "proactive_appointment_fast_path",
+                    proactive_event_id=event.proactive_event_id,
+                    delivery_timing=delivery_timing,
+                    reason="missed_on_time",
+                )
+                return event
+    return None
 
 
 def _judge_proactive_delivery(
@@ -784,7 +817,6 @@ def _judge_proactive_delivery(
             should_send=False,
             selected_event_id="",
             reason=reason,
-            next_check_after_minutes=ERROR_JUDGE_NEXT_CHECK_MINUTES,
             error_type="missing_provider",
         )
         write_diagnostic("proactive_judge_error", user_id=user.user_id, reason=reason)
@@ -824,7 +856,6 @@ def _judge_proactive_delivery(
             should_send=False,
             selected_event_id="",
             reason=reason,
-            next_check_after_minutes=ERROR_JUDGE_NEXT_CHECK_MINUTES,
             error_type=type(exc).__name__,
         )
         write_diagnostic("proactive_judge_error", user_id=user.user_id, error_type=type(exc).__name__, message=reason)
@@ -833,9 +864,6 @@ def _judge_proactive_delivery(
     should_send = bool(result.get("should_send"))
     selected_event_id = str(result.get("selected_event_id") or "").strip()
     reason = str(result.get("reason") or "").strip()
-    next_check_after_minutes = _judge_next_check_minutes(result.get("next_check_after_minutes"))
-    if should_send:
-        next_check_after_minutes = min(next_check_after_minutes, MAX_SEND_NEXT_CHECK_MINUTES)
     selected = {event.proactive_event_id: event for event in events}.get(selected_event_id)
     if should_send and selected is None:
         error_reason = f"invalid selected_event_id: {selected_event_id}"
@@ -847,7 +875,6 @@ def _judge_proactive_delivery(
             should_send=False,
             selected_event_id=selected_event_id,
             reason=error_reason,
-            next_check_after_minutes=next_check_after_minutes,
             raw=result,
             error_type="invalid_selection",
         )
@@ -865,7 +892,6 @@ def _judge_proactive_delivery(
         should_send=should_send,
         selected_event_id=selected_event_id,
         reason=reason,
-        next_check_after_minutes=next_check_after_minutes,
         raw=result,
     )
     write_diagnostic(
@@ -874,7 +900,6 @@ def _judge_proactive_delivery(
         should_send=should_send,
         selected_event_id=selected_event_id,
         reason=reason,
-        next_check_after_minutes=next_check_after_minutes,
     )
     return selected if should_send else None
 
@@ -935,7 +960,7 @@ def pending_proactive_response(
     generate_weather: bool = True,
     delivery_channel: str = "background",
     foreground_context: dict[str, Any] | None = None,
-    ignore_next_check: bool = False,
+    appointment_only: bool = False,
 ) -> dict[str, Any]:
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
@@ -951,10 +976,11 @@ def pending_proactive_response(
         write_diagnostic("proactive_judge_skipped", user_id=user_id, character_id=character_id, reason="notifications_disabled")
         session.commit()
         return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    if generate_news:
-        ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
-    if generate_weather:
-        ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+    if not appointment_only:
+        if generate_news:
+            ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+        if generate_weather:
+            ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     _expire_old_pending(session, user_id, now_utc)
     unread_event = _unread_selected_event(session, user, character_id=character_id)
     if unread_event is not None:
@@ -964,49 +990,36 @@ def pending_proactive_response(
             character_id=character_id,
             proactive_event_id=unread_event.proactive_event_id,
             status=unread_event.status,
-            next_check_at=user.proactive_next_check_at,
         )
         session.commit()
         event_payload = proactive_event_payload(unread_event) if unread_event.status == "pending" else None
         return {"ok": True, "event": event_payload, "widget": proactive_widget_payload(unread_event, character)}
-    daily_count = _daily_delivery_count(session, user, now_local)
-    daily_limit = _daily_limit(user)
-    if daily_limit is not None and daily_count >= daily_limit:
-        _store_judgement(
-            user,
-            now_utc=now_utc,
-            status="limited",
-            candidate_ids=[],
-            should_send=False,
-            selected_event_id="",
-            reason=f"daily limit reached: {daily_count}/{daily_limit}",
-            next_check_after_minutes=60,
-        )
-        write_diagnostic(
-            "proactive_judge_skipped",
-            user_id=user_id,
-            character_id=character_id,
-            reason="daily_limit",
-            daily_count=daily_count,
-            daily_limit=daily_limit,
-        )
-        session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    if not ignore_next_check and _next_check_pending(user, now_utc):
-        write_diagnostic(
-            "proactive_judge_skipped",
-            user_id=user_id,
-            character_id=character_id,
-            reason="next_check_pending",
-            next_check_at=user.proactive_next_check_at,
-        )
-        session.commit()
-        return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
-    events = _due_pending_events(session, user_id=user_id, character_id=character_id, now_utc=now_utc)
+    events = _due_pending_events(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        now_utc=now_utc,
+        now_local=now_local,
+        user=user,
+        appointment_only=appointment_only,
+    )
     if not events:
         write_diagnostic("proactive_judge_skipped", user_id=user_id, character_id=character_id, reason="no_due_event")
         session.commit()
         return {"ok": True, "event": None, "widget": proactive_widget_payload(None, character)}
+    fast_path = _try_appointment_fast_path(events, now_utc=now_utc)
+    if fast_path is not None:
+        _store_judgement(
+            user,
+            now_utc=now_utc,
+            status="decided",
+            candidate_ids=[item.proactive_event_id for item in events],
+            should_send=True,
+            selected_event_id=fast_path.proactive_event_id,
+            reason="appointment fast path",
+        )
+        session.commit()
+        return {"ok": True, "event": proactive_event_payload(fast_path), "widget": proactive_widget_payload(fast_path, character)}
     event = _judge_proactive_delivery(
         session,
         user=user,
@@ -1019,6 +1032,35 @@ def pending_proactive_response(
     )
     session.commit()
     return {"ok": True, "event": proactive_event_payload(event), "widget": proactive_widget_payload(event, character)}
+
+
+def deliver_commitment_reminder(session: Session, commitment_id: str) -> dict[str, Any]:
+    from .models import UserCommitment
+
+    commitment = session.get(UserCommitment, commitment_id)
+    if commitment is None:
+        write_diagnostic("commitment_delivery_skipped", commitment_id=commitment_id, reason="not_found")
+        return {"ok": False, "reason": "not_found"}
+    remind_at = _parse_iso(commitment.remind_at)
+    if remind_at is not None and remind_at.astimezone(timezone.utc) > datetime.now(timezone.utc) + timedelta(seconds=30):
+        write_diagnostic("commitment_delivery_skipped", commitment_id=commitment_id, reason="not_due")
+        return {"ok": False, "reason": "not_due"}
+    result = pending_proactive_response(
+        session,
+        user_id=commitment.user_id,
+        character_id=commitment.character_id,
+        local_time=None,
+        generate_news=False,
+        generate_weather=False,
+        appointment_only=True,
+    )
+    write_diagnostic(
+        "commitment_delivery_finished",
+        commitment_id=commitment_id,
+        delivered=bool(result.get("event")),
+        proactive_event_id=(result.get("event") or {}).get("proactive_event_id") if isinstance(result.get("event"), dict) else "",
+    )
+    return result
 
 
 def mark_proactive_delivered(session: Session, event_id: str) -> ProactiveEvent | None:
