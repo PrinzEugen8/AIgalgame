@@ -219,15 +219,26 @@ final class NekoLive2DModel extends CubismUserModel {
     }
 
     private void setupTextures() {
-        for (int i = 0; i < modelSetting.getTextureCount(); i++) {
+        final int textureCount = modelSetting.getTextureCount();
+        final String[] texturePaths = new String[textureCount];
+        final Bitmap[] decoded = new Bitmap[textureCount];
+        int validCount = 0;
+        for (int i = 0; i < textureCount; i++) {
             String textureFile = modelSetting.getTextureFileName(i);
             if (textureFile == null || textureFile.isEmpty()) {
                 continue;
             }
-            int textureId = createTexture(modelHomeDirectory + textureFile);
-            ((CubismRendererAndroid) getRenderer()).bindTexture(i, textureId);
+            texturePaths[validCount] = modelHomeDirectory + textureFile;
+            decoded[validCount] = decodeTextureBitmap(texturePaths[validCount]);
+            validCount++;
         }
-        this.<CubismRendererAndroid>getRenderer().isPremultipliedAlpha(true);
+        CubismRendererAndroid renderer = (CubismRendererAndroid) getRenderer();
+        for (int i = 0; i < validCount; i++) {
+            int textureId = uploadTextureBitmap(decoded[i]);
+            decoded[i].recycle();
+            renderer.bindTexture(i, textureId);
+        }
+        renderer.isPremultipliedAlpha(true);
     }
 
     private void normalizeMultiplyAndScreenColors() {
@@ -251,19 +262,21 @@ final class NekoLive2DModel extends CubismUserModel {
         }
     }
 
-    private int createTexture(String assetPath) {
-        Bitmap bitmap;
+    private Bitmap decodeTextureBitmap(String assetPath) {
         try (InputStream input = appContext.getAssets().open(assetPath)) {
             BitmapFactory.Options options = new BitmapFactory.Options();
             options.inPremultiplied = true;
-            bitmap = BitmapFactory.decodeStream(input, null, options);
+            Bitmap bitmap = BitmapFactory.decodeStream(input, null, options);
+            if (bitmap == null) {
+                throw new IllegalStateException("Texture decode failed: " + assetPath);
+            }
+            return bitmap;
         } catch (IOException e) {
             throw new IllegalStateException("Texture not found: " + assetPath, e);
         }
-        if (bitmap == null) {
-            throw new IllegalStateException("Texture decode failed: " + assetPath);
-        }
+    }
 
+    private int uploadTextureBitmap(Bitmap bitmap) {
         int[] textureId = new int[1];
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glGenTextures(1, textureId, 0);
@@ -272,7 +285,6 @@ final class NekoLive2DModel extends CubismUserModel {
         GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR);
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-        bitmap.recycle();
         return textureId[0];
     }
 

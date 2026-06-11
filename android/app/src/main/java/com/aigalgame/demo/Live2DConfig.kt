@@ -75,10 +75,10 @@ object Live2DCharacterConfigs {
     )
 
     private val defaultHitAreas = listOf(
-        Live2DHitArea("head", "head", left = 0.36f, top = 0.06f, right = 0.64f, bottom = 0.28f),
-        Live2DHitArea("chest", "chest", left = 0.38f, top = 0.30f, right = 0.62f, bottom = 0.50f),
-        Live2DHitArea("hand", "hand", left = 0.20f, top = 0.38f, right = 0.80f, bottom = 0.68f),
-        Live2DHitArea("body", "body", left = 0.32f, top = 0.28f, right = 0.68f, bottom = 0.80f)
+        Live2DHitArea("head", "head", left = 0.38f, top = 0.05f, right = 0.62f, bottom = 0.26f),
+        Live2DHitArea("chest", "chest", left = 0.40f, top = 0.28f, right = 0.60f, bottom = 0.48f),
+        Live2DHitArea("hand", "hand", left = 0.28f, top = 0.40f, right = 0.72f, bottom = 0.66f),
+        Live2DHitArea("body", "body", left = 0.34f, top = 0.26f, right = 0.66f, bottom = 0.78f)
     )
 
     private val defaultReactions = listOf(
@@ -87,11 +87,6 @@ object Live2DCharacterConfigs {
             intensity = Live2DReactionIntensity.Soft,
             motion = "TapHead",
             expression = "happy",
-            localTextCandidates = listOf(
-                "Hey, be gentle with my head.",
-                "That is warm. I do not hate it."
-            ),
-            relationDelta = RelationDelta(affection = 1, mood = 1),
             cooldownMs = 1200L
         ),
         Live2DReactionConfig(
@@ -99,12 +94,6 @@ object Live2DCharacterConfigs {
             intensity = Live2DReactionIntensity.Flirty,
             motion = "TapChest",
             expression = "shy",
-            localTextCandidates = listOf(
-                "You are getting bold today.",
-                "That spot makes me a little embarrassed.",
-                "If you come closer, I will look right back at you."
-            ),
-            relationDelta = RelationDelta(affection = 1, dependency = 1, mood = 1),
             cooldownMs = 2200L
         ),
         Live2DReactionConfig(
@@ -112,11 +101,6 @@ object Live2DCharacterConfigs {
             intensity = Live2DReactionIntensity.Boundary,
             motion = "StepBack",
             expression = "shy",
-            localTextCandidates = listOf(
-                "Wait a second, go slower here.",
-                "I am not upset. It was just sudden."
-            ),
-            relationDelta = RelationDelta(trust = -1, mood = -1),
             cooldownMs = 2600L
         ),
         Live2DReactionConfig(
@@ -124,11 +108,6 @@ object Live2DCharacterConfigs {
             intensity = Live2DReactionIntensity.Soft,
             motion = "TapHand",
             expression = "happy",
-            localTextCandidates = listOf(
-                "Do you want to hold hands for a while?",
-                "Your hand feels warm."
-            ),
-            relationDelta = RelationDelta(affection = 1, trust = 1),
             cooldownMs = 1300L
         ),
         Live2DReactionConfig(
@@ -136,11 +115,6 @@ object Live2DCharacterConfigs {
             intensity = Live2DReactionIntensity.Soft,
             motion = "TapBody",
             expression = "thinking",
-            localTextCandidates = listOf(
-                "What is it? I am right here.",
-                "You got my attention."
-            ),
-            relationDelta = RelationDelta(mood = 1),
             cooldownMs = 1300L
         )
     )

@@ -55,7 +55,14 @@ class ApiClient(private val baseUrl: String) {
         return post("/api/devices/register", body)
     }
 
-    suspend fun heartbeat(deviceId: String, appState: String, screen: String, idleSeconds: Long, inputActive: Boolean): JSONObject {
+    suspend fun heartbeat(
+        deviceId: String,
+        appState: String,
+        screen: String,
+        idleSeconds: Long,
+        inputActive: Boolean,
+        dialogueState: String = ""
+    ): JSONObject {
         val body = JSONObject()
             .put("device_id", deviceId)
             .put("app_state", appState)
@@ -63,10 +70,17 @@ class ApiClient(private val baseUrl: String) {
             .put("idle_seconds", idleSeconds)
             .put("input_active", inputActive)
             .put("local_time", OffsetDateTime.now().toString())
+        if (dialogueState.isNotBlank()) body.put("dialogue_state", dialogueState)
         return post("/api/presence/heartbeat", body)
     }
 
-    suspend fun foregroundCheck(deviceId: String, screen: String, idleSeconds: Long, inputActive: Boolean): JSONObject {
+    suspend fun foregroundCheck(
+        deviceId: String,
+        screen: String,
+        idleSeconds: Long,
+        inputActive: Boolean,
+        dialogueState: String = ""
+    ): JSONObject {
         val body = JSONObject()
             .put("device_id", deviceId)
             .put("screen", screen)
@@ -74,8 +88,15 @@ class ApiClient(private val baseUrl: String) {
             .put("input_active", inputActive)
             .put("session_id", "android")
             .put("local_time", OffsetDateTime.now().toString())
+        if (dialogueState.isNotBlank()) body.put("dialogue_state", dialogueState)
         return post("/api/proactive/foreground-check", body)
     }
+
+    suspend fun fetchTouchReaction(hitArea: String): JSONObject {
+        return post("/api/live2d/touch", JSONObject().put("hit_area", hitArea))
+    }
+
+    suspend fun refreshTouchReactions(): JSONObject = post("/api/live2d/touch/refresh", JSONObject())
 
     suspend fun updateLocation(latitude: Double, longitude: Double, accuracyM: Float, provider: String): JSONObject {
         val body = JSONObject()

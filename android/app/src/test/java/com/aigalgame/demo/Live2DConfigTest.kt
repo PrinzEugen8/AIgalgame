@@ -79,7 +79,7 @@ class Live2DConfigTest {
         assertTrue(mainKt.contains("!vm.live2dBootReady || stageOnPrimaryScreens"))
         assertTrue(mainKt.contains("modifier = Modifier\r\n                        .fillMaxSize()\r\n                        .zIndex(1f)") ||
             mainKt.contains("modifier = Modifier\n                        .fillMaxSize()\n                        .zIndex(1f)"))
-        assertTrue(mainKt.contains("PlacementEditInputOverlay"))
+        assertTrue(mainKt.contains("StandeeGestureZone"))
         assertTrue(mainKt.contains("editable = false"))
         assertTrue(mainKt.contains("CharacterTapZone"))
         assertTrue(mainKt.contains("HomeStandeeEditBar"))
@@ -132,7 +132,7 @@ class Live2DConfigTest {
 
         assertEquals("head", config.hitAreas.first { it.contains(0.5f, 0.2f) }.id)
         assertEquals("chest", config.hitAreas.first { it.contains(0.5f, 0.4f) }.id)
-        assertEquals("hand", config.hitAreas.first { it.contains(0.2f, 0.5f) }.id)
+        assertEquals("hand", config.hitAreas.first { it.contains(0.35f, 0.5f) }.id)
         assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Flirty })
         assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Boundary })
     }
@@ -146,10 +146,21 @@ class Live2DConfigTest {
 
     @Test
     fun hitTestMapsPlacementAdjustedCoordinates() {
-        val centered = Live2DHitTest.mapScreenToModelSpace(0.5f, 0.4f, OutfitPlacement())
+        val placement = OutfitPlacement()
+        val centered = Live2DHitTest.mapScreenToModelSpace(0.5f, 0.4f, placement)
         val shifted = Live2DHitTest.mapScreenToModelSpace(0.5f, 0.4f, OutfitPlacement(scale = 1.4f, offsetX = 40f))
         assertTrue(centered.first in 0.3f..0.7f)
         assertTrue(shifted.first != centered.first || shifted.second != centered.second)
+        val roundTrip = Live2DHitTest.mapModelToScreenSpace(centered.first, centered.second, placement)
+        assertEquals(centered.first, roundTrip.first, 0.02f)
+        assertEquals(centered.second, roundTrip.second, 0.02f)
+    }
+
+    @Test
+    fun selfTestIncludesHitAreaDebugOverlay() {
+        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
+        assertTrue(stageKt.contains("HitAreaDebugOverlay"))
+        assertTrue(stageKt.contains("mapModelToScreenSpace"))
     }
 
     @Test

@@ -25,7 +25,8 @@ from app.models import CalendarEvent, Character, DeviceRegistration, Experience,
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
-from app.pipeline import _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
+from app.pipeline import _normalize_line_text, _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
+from app.touch_reactions import consume_touch_reaction, refresh_touch_reaction_pools  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
 from app.push import register_device, send_proactive_push  # noqa: E402
@@ -4030,6 +4031,8 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
             assert ready.event_type == "dialogue"
             assert ready.payload["cached"] is True
             assert ready.payload["opening_kind"] == "greeting"
+            assert ready.payload["reply_mode"] == "opening"
+            assert len(ready.payload["lines"]) >= 2
             assert ready.payload["lines"][0]["tts_audio_url"].startswith("/media/")
             session.refresh(cache)
             assert cache.status == "consumed"
@@ -4893,6 +4896,163 @@ def test_split_expression_tag_strips_inline_marker() -> None:
     text, expression = _split_expression_tag("你好呀[shy]")
     assert text == "你好呀"
     assert expression == "shy"
+
+
+def test_normalize_line_text_splits_long_sentence() -> None:
+    chunks = _normalize_line_text("这是一句非常非常非常非常非常非常非常非常长的台词，需要被拆开。")
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= 28 for chunk in chunks)
+
+
+def test_consume_prefers_proactive_over_greeting() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"opening_priority_user_{suffix}"
+    event_id = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "用户刚刚从" in body["messages"][1]["content"]:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "reply_mode": "opening",
+                                        "pace_reason": "主动入口展开。",
+                                        "lines": [
+                                            {"text": "你来了呀。", "emotion": "happy", "pose": "happy"},
+                                            {"text": "我正想跟你说件事。", "emotion": "shy", "pose": "shy"},
+                                        ],
+                                        "normal_replies": [],
+                                        "key_replies": [],
+                                        "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                                        "memory_candidates": [],
+                                        "interest_topics": [],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_opening_priority_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            greeting = prepare_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T08:00:00+08:00"),
+                allow_llm=False,
+            )
+            proactive = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="schedule",
+                title="想你了",
+                text="刚刚有点想你。",
+            )
+            assert proactive is not None
+            session.commit()
+            event_id = proactive.proactive_event_id
+            prepared = prepare_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T08:06:00+08:00"),
+                proactive_event_id=event_id,
+                allow_llm=True,
+            )
+            assert prepared["kind"] == "proactive"
+            ready = consume_ready_opening(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                session_id=f"priority_{suffix}",
+                local_time=datetime.fromisoformat("2026-06-09T08:07:00+08:00"),
+            )
+            assert ready.payload["opening_kind"] == "proactive"
+            greeting_cache = session.get(OpeningCache, greeting["cache_id"])
+            assert greeting_cache is not None
+            assert greeting_cache.status == "ready"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_touch_reaction_has_no_relation_delta() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "触摸反应" in body["messages"][0]["content"] or "触摸了你的" in body["messages"][1]["content"]:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "lines": [
+                                            {"text": "别乱摸啦。", "emotion": "shy", "expression": "shy", "motion": "TapHead"},
+                                            {"text": "不过……也不算讨厌。", "emotion": "happy", "expression": "happy", "motion": "TapHead"},
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_touch_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.commit()
+            refresh_touch_reaction_pools(session, user_id=user_id, character_id="sakura")
+            result = consume_touch_reaction(session, user_id=user_id, character_id="sakura", hit_area="head")
+            assert result["text"]
+            assert "affection" not in result
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def test_dialogue_line_supports_expression_field() -> None:

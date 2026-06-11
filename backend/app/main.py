@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,7 @@ from .models import (
     UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
+from .touch_reactions import consume_touch_reaction, refresh_touch_reaction_pools_background
 from .online import mark_heartbeat, mark_offline, mark_online, presence_context
 from .pipeline import handle_event
 from .proactive import consume_proactive_event, create_moment_feedback_event, create_proactive_event, ensure_news_candidate, mark_proactive_delivered, mark_proactive_dismissed, pending_proactive_response
@@ -1038,7 +1039,35 @@ def bootstrap(
             "mood": relation.mood,
             "stage": relation.relationship_stage,
         },
+        "touch_reactions_ready": True,
     }
+
+
+@app.post("/api/live2d/touch")
+def live2d_touch(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    hit_area = str(body.get("hit_area") or "")
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    try:
+        return consume_touch_reaction(session, user_id=user_id, character_id=character_id, hit_area=hit_area)
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/live2d/touch/refresh")
+def live2d_touch_refresh(
+    background_tasks: BackgroundTasks,
+    payload: dict[str, Any] | None = None,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    background_tasks.add_task(refresh_touch_reaction_pools_background, user_id=user_id, character_id=character_id)
+    return {"ok": True, "queued": True, "user_id": user_id, "character_id": character_id}
 
 
 @app.get("/api/config/provider-presets")
@@ -1238,6 +1267,7 @@ def proactive_foreground_check(payload: dict[str, Any] | None = None, session: S
         "idle_seconds": int(body.get("idle_seconds") or 0),
         "input_active": bool(body.get("input_active", False)),
         "local_time": str(body.get("local_time") or ""),
+        "dialogue_state": str(body.get("dialogue_state") or ""),
     }
     mark_heartbeat(user_id, device_id, heartbeat)
     local_time = _parse_client_time(str(body.get("local_time") or ""))

@@ -327,6 +327,19 @@ class TrendRadarSnapshot(Base):
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
+class TouchReactionPool(Base):
+    __tablename__ = "touch_reaction_pools"
+
+    pool_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    character_id: Mapped[str] = mapped_column(String, index=True)
+    hit_area: Mapped[str] = mapped_column(String, index=True)
+    tier: Mapped[str] = mapped_column(String, index=True)
+    lines_json: Mapped[str] = mapped_column(Text, default="[]")
+    consumed_indices_json: Mapped[str] = mapped_column(Text, default="[]")
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
 class OpeningCache(Base):
     __tablename__ = "opening_caches"
 

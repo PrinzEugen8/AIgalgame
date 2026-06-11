@@ -1,6 +1,7 @@
 package com.aigalgame.demo
 
 import android.util.Log
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
@@ -25,7 +26,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -253,9 +257,13 @@ fun Live2DStage(
 
 @Composable
 fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val controller = remember { Live2DController(context, Live2DCharacterConfigs.DefaultCharacter) }
     var status by remember { mutableStateOf<OfficialLive2DRendererStatus?>(null) }
     var error by remember { mutableStateOf("") }
-    val command = remember {
+    var hitDebug by remember { mutableStateOf("Tap model to test hit areas") }
+    val placement = remember { defaultOutfitPlacement("neko").coerceForStage() }
+    val command = remember(placement) {
         Live2DRenderCommand(
             characterId = "neko",
             emotion = "happy",
@@ -264,22 +272,36 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
             speaking = true,
             lookX = 0.25f,
             lookY = 0.05f,
-            placement = OutfitPlacement(scale = 1.08f, offsetY = -10f, bottomInset = 24f),
+            placement = placement,
             interactive = true,
             commandNonce = 1L
         )
     }
+    val hitAreas = remember { Live2DCharacterConfigs.forCharacter("neko").hitAreas }
     Box(modifier) {
         SakuraSceneBackground("classroom")
         OfficialLive2DAndroidStage(
             command = command,
             visible = true,
-            onTap = { _, _ -> },
+            onTap = { normalizedX, normalizedY ->
+                val (modelX, modelY) = Live2DHitTest.mapScreenToModelSpace(normalizedX, normalizedY, placement)
+                val hit = hitAreas.firstOrNull { it.contains(modelX, modelY) }?.id ?: "miss"
+                hitDebug = "screen(${String.format("%.2f", normalizedX)}, ${String.format("%.2f", normalizedY)}) " +
+                    "→ model(${String.format("%.2f", modelX)}, ${String.format("%.2f", modelY)}) → $hit"
+                controller.handleTap(normalizedX, normalizedY, placement, RelationState(), System.currentTimeMillis())
+            },
             onStatus = { status = it },
             onError = { error = it },
             modifier = Modifier
                 .fillMaxSize()
                 .zIndex(1f)
+        )
+        HitAreaDebugOverlay(
+            hitAreas = hitAreas,
+            placement = placement,
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(3f)
         )
         Text(
             text = status?.summary() ?: "SDK/Core loaded=false, model loaded=false, drawable count=0, GL lifecycle=booting",
@@ -290,7 +312,18 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
                 .padding(10.dp)
                 .background(Color(0x99000000))
                 .padding(8.dp)
-                .zIndex(2f)
+                .zIndex(4f)
+        )
+        Text(
+            text = hitDebug,
+            color = Color.White,
+            fontSize = 11.sp,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(10.dp)
+                .background(Color(0x99000000))
+                .padding(8.dp)
+                .zIndex(4f)
         )
         if (error.isNotBlank()) {
             CharacterStandee(
@@ -389,6 +422,97 @@ private fun Live2DLoadingLayer(modifier: Modifier = Modifier) {
             modifier = Modifier.size(28.dp),
             color = Color.White,
             strokeWidth = 2.dp
+        )
+    }
+}
+
+@Composable
+fun HitAreaDebugOverlay(
+    hitAreas: List<Live2DHitArea>,
+    placement: OutfitPlacement,
+    modifier: Modifier = Modifier
+) {
+    BoxWithConstraints(modifier) {
+        val widthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
+        val heightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
+        Canvas(Modifier.fillMaxSize()) {
+            for (area in hitAreas) {
+                val (leftX, topY) = Live2DHitTest.mapModelToScreenSpace(area.left, area.top, placement)
+                val (rightX, bottomY) = Live2DHitTest.mapModelToScreenSpace(area.right, area.bottom, placement)
+                val left = minOf(leftX, rightX) * widthPx
+                val top = minOf(topY, bottomY) * heightPx
+                val rectWidth = kotlin.math.abs(rightX - leftX) * widthPx
+                val rectHeight = kotlin.math.abs(bottomY - topY) * heightPx
+                drawRect(
+                    color = Color.Red,
+                    topLeft = Offset(left, top),
+                    size = Size(rectWidth, rectHeight),
+                    style = Stroke(width = 3f)
+                )
+            }
+        }
+        for (area in hitAreas) {
+            val (centerX, topY) = Live2DHitTest.mapModelToScreenSpace(
+                (area.left + area.right) / 2f,
+                area.top,
+                placement
+            )
+            Text(
+                text = area.label,
+                color = Color.White,
+                fontSize = 11.sp,
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            (centerX * widthPx - 24f).roundToInt(),
+                            (topY * heightPx - 18f).roundToInt()
+                        )
+                    }
+                    .background(Color(0xCCB00020), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun StandeeGestureZone(
+    headerBottomPx: Int,
+    panelTopPx: Int,
+    placement: OutfitPlacement,
+    onPlacementChange: (OutfitPlacement) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (panelTopPx <= headerBottomPx) return
+    val density = LocalDensity.current
+    val topPx = headerBottomPx.coerceAtLeast(0)
+    val heightPx = max(panelTopPx - headerBottomPx, 1)
+    var gesturePlacement by remember(placement) { mutableStateOf(placement.coerceForStage()) }
+    LaunchedEffect(placement) {
+        gesturePlacement = placement.coerceForStage()
+    }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        val dx = with(density) { panChange.x.toDp().value }
+        val dy = with(density) { panChange.y.toDp().value }
+        val next = gesturePlacement.copy(
+            scale = gesturePlacement.scale * zoomChange,
+            offsetX = gesturePlacement.offsetX + dx,
+            offsetY = gesturePlacement.offsetY + dy
+        ).coerceForStage()
+        gesturePlacement = next
+        onPlacementChange(next)
+    }
+    BoxWithConstraints(modifier) {
+        Box(
+            Modifier
+                .offset { IntOffset(0, topPx) }
+                .fillMaxWidth()
+                .height(with(density) { heightPx.toDp() })
+                .transformable(
+                    state = transformState,
+                    lockRotationOnZoomPan = true,
+                    enabled = true
+                )
         )
     }
 }

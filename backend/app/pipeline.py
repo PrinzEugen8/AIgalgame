@@ -408,11 +408,47 @@ def _weather_context_with_references(
 
 
 def _dialogue_gate(event: EventIn, text: str) -> str:
-    if event.event_type in {"app_opened", "notification_opened", "widget_opened"}:
+    if event.event_type in {"notification_opened", "widget_opened"}:
+        return "opening：用户从主动入口进入，请自然展开主动话题，至少 2 句、最多 3 句，不要 silent。"
+    if event.event_type == "app_opened":
         return "continue：用户是从入口进入前台。只有带明确主动事件时才展开；没有新信息时可以 silent。"
     if len(text.strip()) <= 2 and text.strip() in {"嗯", "好", "哦", "啊", "…", "..."}:
         return "light：用户只给了很短的接话，轻轻回应或留白即可，不要制造重大剧情。"
-    return "reply：用户正在直接对角色说话，需要围绕目标消息自然回应。"
+    return "reply：用户正在直接对角色说话，需要围绕目标消息自然回应，normal 模式至少 2 句，每句尽量不超过 28 个汉字。"
+
+
+def _normalize_line_text(text: str, *, max_chars: int = 28) -> list[str]:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+    parts = re.split(r"(?<=[。！？!?])", cleaned)
+    chunks: list[str] = []
+    buffer = ""
+    for part in parts:
+        piece = part.strip()
+        if not piece:
+            continue
+        if len(piece) > max_chars:
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            start = 0
+            while start < len(piece):
+                chunks.append(piece[start : start + max_chars])
+                start += max_chars
+            continue
+        candidate = f"{buffer}{piece}" if buffer else piece
+        if len(candidate) <= max_chars:
+            buffer = candidate
+        else:
+            if buffer:
+                chunks.append(buffer)
+            buffer = piece
+    if buffer:
+        chunks.append(buffer)
+    return [item for item in chunks if item.strip()]
 
 
 def _explicit_interest_topics(text: str) -> list[str]:
@@ -852,7 +888,7 @@ def _llm_dialogue(
 
 【说话风格】
 {character.speech_style}
-补充要求：像真实聊天，不要客服腔，不要 Markdown，不要长篇总结。台词 1 到 3 句为主；不要把单独的“…”当成一整句。
+补充要求：像真实聊天，不要客服腔，不要 Markdown，不要长篇总结。normal 模式至少 2 句；opening 模式 2 到 3 句；light 最多 1 句。每句尽量不超过 28 个汉字；不要把单独的“…”当成一整句。
 
 【边界】
 {character.relationship_boundary}
@@ -890,7 +926,7 @@ def _llm_dialogue(
 
 输出格式：
 {{
-  "reply_mode": "silent|light|normal|key_moment",
+  "reply_mode": "silent|light|opening|normal|key_moment",
   "pace_reason": "为什么这次选择这个节奏",
   "lines": [{{"text": "短中文台词", "emotion": "happy|shy|thinking|calm|sad", "pose": "idle|happy|shy|thinking", "expression": "happy|shy|thinking|calm|sad|angry|"}}],
 expression 可留空；需要更强面部表现时填写，与 emotion 可不同。也可在 text 内写 [shy] 这类标签。
@@ -902,7 +938,7 @@ expression 可留空；需要更强面部表现时填写，与 emotion 可不同
   "memory_candidates": [{{"layer":"chat|core|relation|temporary","content":"...","importance":0.5,"confidence":0.7}}],
   "interest_topics": ["..."]
 }}
-reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；normal 是自然闲聊；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
+reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；opening 是开场/主动入口问候，2 到 3 句、不要给选项和数值变化；normal 是自然闲聊且至少 2 句；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
 特殊回复只在承诺、关系转折、核心记忆、重要剧情节点时给高分。普通寒暄、顺着聊天、夸奖、轻微情绪互动必须低于 75。
 如果用户问“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】回答；不要从近期对话或记忆里补编活动。
 如果用户问“天气、下雨、带伞、温度、气温、冷不冷、热不热、预报、雷雨”，必须优先依据【今日天气】回答；没有天气数据时要说明还没有拿到位置或天气服务，不能编造。
@@ -980,8 +1016,10 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         references=references,
     )
     reply_mode = str(result.get("reply_mode") or "normal").strip().lower()
-    if reply_mode not in {"silent", "light", "normal", "key_moment"}:
+    if reply_mode not in {"silent", "light", "opening", "normal", "key_moment"}:
         reply_mode = "normal"
+    if event.event_type in {"notification_opened", "widget_opened"} and reply_mode in {"silent", "light"}:
+        reply_mode = "opening"
     pace_reason = str(result.get("pace_reason") or result.get("key_reply_reason") or "").strip()
     diagnostic_point(
         "reply_llm_judgement",
@@ -1027,7 +1065,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         dependency=clamp(raw_delta.get("dependency", 0), -3, 3),
         mood=clamp(raw_delta.get("mood", 0), -3, 3),
     )
-    if not (allow_relation_delta and event.event_type == "option_selected") or reply_mode == "light":
+    if not (allow_relation_delta and event.event_type == "option_selected") or reply_mode in {"light", "opening"}:
         delta = RelationDelta()
     _end_reply_stage(
         payload_stage,
@@ -1040,7 +1078,12 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         references=references,
     )
     line_objs: list[DialogueLine] = []
-    max_lines = 1 if reply_mode == "light" else 4
+    if reply_mode == "light":
+        max_lines = 1
+    elif reply_mode == "opening":
+        max_lines = 3
+    else:
+        max_lines = 4
     tts_stage = _start_reply_stage(
         "tts_lines",
         f"{event.event_type}: synthesize reply lines",
@@ -1055,38 +1098,48 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         if not line_expression:
             line_expression = inline_expression
         ja_candidate = str(item.get("tts_text_ja") or item.get("tts_text") or item.get("ja") or "").strip()
-        if not _has_tts_readable_text(line_text):
+        text_chunks = _normalize_line_text(line_text)
+        if not text_chunks:
             continue
-        tts_url, tts_error = _tts_for_line(
-            session,
-            user,
-            character,
-            line_text,
-            line_emotion,
-            tts_text_ja=ja_candidate,
-        )
-        if user.tts_enabled and voice is not None and not tts_url:
-            write_diagnostic(
-                "tts_line_missing_audio",
-                character_id=character.character_id,
-                voice_id=voice.voice_id,
-                tts_language=voice.language,
-                source_text=line_text,
-                tts_error=tts_error,
+        for chunk_index, chunk_text in enumerate(text_chunks):
+            if len(line_objs) >= max_lines:
+                break
+            line_text = chunk_text
+            chunk_ja = ja_candidate if chunk_index == 0 else ""
+            if not _has_tts_readable_text(line_text):
+                continue
+            tts_url, tts_error = _tts_for_line(
+                session,
+                user,
+                character,
+                line_text,
+                line_emotion,
+                tts_text_ja=chunk_ja,
             )
-            raise ProviderError(tts_error or "语音生成失败")
-        line_objs.append(
-            DialogueLine(
-                line_id=uid("line"),
-                text=line_text,
-                emotion=line_emotion,
-                pose=str(item.get("pose") or "idle"),
-                expression=line_expression,
-                tts_audio_url=tts_url,
-                tts_error=tts_error,
+            if user.tts_enabled and voice is not None and not tts_url:
+                write_diagnostic(
+                    "tts_line_missing_audio",
+                    character_id=character.character_id,
+                    voice_id=voice.voice_id,
+                    tts_language=voice.language,
+                    source_text=line_text,
+                    tts_error=tts_error,
+                )
+                raise ProviderError(tts_error or "语音生成失败")
+            line_objs.append(
+                DialogueLine(
+                    line_id=uid("line"),
+                    text=line_text,
+                    emotion=line_emotion,
+                    pose=str(item.get("pose") or "idle"),
+                    expression=line_expression,
+                    tts_audio_url=tts_url,
+                    tts_error=tts_error,
+                )
             )
-        )
         if reply_mode == "light" and len(line_objs) >= 1:
+            break
+        if len(line_objs) >= max_lines:
             break
     _end_reply_stage(
         tts_stage,
@@ -1096,7 +1149,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
     if not line_objs:
         raise ProviderError("LLM returned no dialogue lines")
     normal = []
-    if reply_mode != "light":
+    if reply_mode not in {"light", "opening"}:
         for item in (result.get("normal_replies") or [])[:2]:
             reply_text = str(item.get("text") or "").strip()
             if reply_text:

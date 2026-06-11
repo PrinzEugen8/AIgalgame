@@ -12,7 +12,7 @@ JUDGE_SYSTEM_PROMPT = (
 JUDGE_RULES = """
 Pick at most one candidate id.
 If not sending, selected_event_id must be "".
-Foreground: send only when idle_seconds >= 30 and input_active is false.
+Foreground: send only when input_active is false and (idle_seconds >= 30, or dialogue_state is reply_waiting and idle_seconds >= 5).
 Respect user_availability (sleep and future school/work routines), recent delivery, and unread retention.
 proactive_frequency_preference is a soft hint only; do not mechanically cap message count.
 appointment + on_time + due: must send (user explicitly asked for this time).

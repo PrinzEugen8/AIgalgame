@@ -130,8 +130,8 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
             intensity = reactionConfig.intensity,
             motion = tapMotion.ifBlank { reactionConfig.motion },
             expression = reactionConfig.expression,
-            text = chooseText(reactionConfig.localTextCandidates, nowMs),
-            relationDelta = reactionConfig.relationDelta
+            text = "",
+            relationDelta = RelationDelta()
         )
         lookResetAtMs = nowMs + 2500L
         state = state.copy(
@@ -211,10 +211,6 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         return candidates.last().motion
     }
 
-    private fun chooseText(candidates: List<String>, nowMs: Long): String {
-        if (candidates.isEmpty()) return ""
-        return candidates[(nowMs % candidates.size).toInt()]
-    }
 }
 
 private fun Context.assetExists(path: String): Boolean {

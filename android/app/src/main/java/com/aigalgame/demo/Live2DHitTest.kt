@@ -25,4 +25,21 @@ object Live2DHitTest {
         y = CharacterCenterY + (y - CharacterCenterY) / max(scale, 0.25f)
         return x.coerceIn(0f, 1f) to y.coerceIn(0f, 1f)
     }
+
+    fun mapModelToScreenSpace(
+        modelX: Float,
+        modelY: Float,
+        placement: OutfitPlacement
+    ): Pair<Float, Float> {
+        val scale = placement.scale.coerceIn(0.25f, 4f)
+        val offsetXNorm = placement.offsetX / HorizontalRange * 0.14f
+        val offsetYNorm = placement.offsetY / VerticalRange * 0.11f
+        val bottomLift = placement.bottomInset / BottomInsetRange * 0.07f
+
+        var x = CharacterCenterX + (modelX - CharacterCenterX) * max(scale, 0.25f)
+        var y = CharacterCenterY + (modelY - CharacterCenterY) * max(scale, 0.25f)
+        x += offsetXNorm
+        y = y + offsetYNorm - bottomLift
+        return x.coerceIn(0f, 1f) to y.coerceIn(0f, 1f)
+    }
 }

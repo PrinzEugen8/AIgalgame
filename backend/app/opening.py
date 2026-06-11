@@ -199,9 +199,13 @@ def _payload_from_prepared_event(event: ProactiveEvent) -> DialoguePayload | Non
 def _instant_greeting_payload(local_time: datetime | None) -> DialoguePayload:
     slot = _slot(local_time)
     choices = GREETING_LINES[slot]
-    index = ((local_time or datetime.now()).day + (local_time or datetime.now()).hour) % len(choices)
-    text, _, emotion = choices[index]
-    return DialoguePayload(lines=[DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion)], relation_delta=RelationDelta())
+    basis = local_time or datetime.now()
+    index = (basis.day + basis.hour) % len(choices)
+    lines: list[DialogueLine] = []
+    for offset in range(2):
+        text, _, emotion = choices[(index + offset) % len(choices)]
+        lines.append(DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion))
+    return DialoguePayload(lines=lines, relation_delta=RelationDelta(), reply_mode="opening", pace_reason="即时预制欢迎问候。")
 
 
 def _greeting_payload(
@@ -216,19 +220,24 @@ def _greeting_payload(
     choices = GREETING_LINES[slot]
     basis = local_time or datetime.now()
     index = (basis.day + basis.hour) % len(choices)
-    text, tts_text_ja, emotion = choices[index]
-    tts_url = ""
-    tts_error = ""
-    if synthesize_tts:
-        try:
-            tts_url, tts_error = _tts_for_line(session, user, character, text, emotion, tts_text_ja=tts_text_ja)
-        except Exception as exc:  # noqa: BLE001
-            tts_error = str(exc)
-            write_diagnostic("opening_greeting_tts_error", character_id=character.character_id, message=str(exc))
+    line_objs: list[DialogueLine] = []
+    for offset in range(3):
+        text, tts_text_ja, emotion = choices[(index + offset) % len(choices)]
+        tts_url = ""
+        tts_error = ""
+        if synthesize_tts:
+            try:
+                tts_url, tts_error = _tts_for_line(session, user, character, text, emotion, tts_text_ja=tts_text_ja)
+            except Exception as exc:  # noqa: BLE001
+                tts_error = str(exc)
+                write_diagnostic("opening_greeting_tts_error", character_id=character.character_id, message=str(exc))
+        line_objs.append(
+            DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion, tts_audio_url=tts_url, tts_error=tts_error)
+        )
     return DialoguePayload(
-        lines=[DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion, tts_audio_url=tts_url, tts_error=tts_error)],
+        lines=line_objs,
         relation_delta=RelationDelta(),
-        reply_mode="light",
+        reply_mode="opening",
         pace_reason="打开应用时没有可用主动事件，使用预制欢迎问候。",
     )
 

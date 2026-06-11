@@ -41,6 +41,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
@@ -205,6 +206,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var bootstrapInFlight = false
     private var appOpenedBaseUrl = ""
     private var dialogueEventInFlight = false
+    private var awaitingUserReplyResponse = false
+    private var pendingOpenAfterBoot = false
     private var placementDraftCharacter = ""
     private var pendingProactiveEventId = ""
     private var lastLocationUploadedAt = 0L
@@ -292,7 +295,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             live2dBootStatus.drawableCount > 0
 
     fun updateLive2DBootStatus(status: OfficialLive2DRendererStatus) {
+        val wasReady = live2dBootReady
         live2dBootStatus = status
+        if (!wasReady && live2dBootReady && pendingOpenAfterBoot) {
+            pendingOpenAfterBoot = false
+            openApp(force = true)
+        }
     }
 
     fun retryLive2DBoot() {
@@ -320,25 +328,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun checkForegroundProactive(inputActive: Boolean = false) {
         val client = api ?: return
-        if (!storyCompleted || screen != AppScreen.Home || dialogueEventInFlight || foregroundCheckInFlight) return
+        if (!storyCompleted || screen != AppScreen.Home || foregroundCheckInFlight) return
+        if (dialogueEventInFlight && awaitingUserReplyResponse) return
+        val inReplyWaiting = currentLine() == null && lines.isNotEmpty()
         val idle = idleSeconds()
-        if (idle < 30L) return
+        val idleThreshold = if (inReplyWaiting) 5L else 30L
+        if (idle < idleThreshold) return
         foregroundCheckInFlight = true
         viewModelScope.launch {
             try {
                 val deviceId = androidDeviceId(getApplication())
-                client.heartbeat(deviceId, "foreground", screen.name.lowercase(Locale.US), idle, inputActive)
-                val result = client.foregroundCheck(deviceId, screen.name.lowercase(Locale.US), idle, inputActive)
+                val dialogueState = if (inReplyWaiting) "reply_waiting" else "dialogue"
+                client.heartbeat(deviceId, "foreground", screen.name.lowercase(Locale.US), idle, inputActive, dialogueState)
+                val result = client.foregroundCheck(deviceId, screen.name.lowercase(Locale.US), idle, inputActive, dialogueState)
                 if (result.optString("event_type") == "dialogue") {
-                    applyEvent(result)
+                    applyIncomingDialogue(result)
                     SakuraWidgetProvider.clearUnread(getApplication())
-                    recordUserActivity()
                 }
             } catch (_: Exception) {
             } finally {
                 foregroundCheckInFlight = false
             }
         }
+    }
+
+    fun applyIncomingDialogue(event: org.json.JSONObject) {
+        live2dReactionLine = null
+        normalReplies.clear()
+        keyReplies.clear()
+        applyEvent(event)
+        recordUserActivity()
     }
 
     fun sendBackgroundHeartbeat() {
@@ -356,15 +375,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyLive2DReaction(reaction: Live2DReaction) {
-        val delta = reaction.relationDelta
-        if (delta != RelationDelta()) {
-            relation = relation.copy(
-                affection = relation.affection + delta.affection,
-                trust = relation.trust + delta.trust,
-                dependency = relation.dependency + delta.dependency,
-                mood = relation.mood + delta.mood
-            )
-        }
         if (reaction.text.isNotBlank()) {
             live2dReactionLine = DialogueLine(
                 id = "live2d_touch_${System.currentTimeMillis()}",
@@ -434,6 +444,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 storyCompleted = boot.optObject("user").optBoolean("story_completed", storyCompleted)
                 bootstrappedBaseUrl = urlKey
                 syncLocation()
+                if (storyCompleted) {
+                    viewModelScope.launch {
+                        try {
+                            client.refreshTouchReactions()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
                 if (openAfterBootstrap && lines.isEmpty()) {
                     openApp()
                 }
@@ -455,14 +473,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val eventId = pendingProactiveEventId
         if (eventId.isBlank()) return
         pendingProactiveEventId = ""
-        launchDialogueEvent {
+        val inReplyWaiting = currentLine() == null && lines.isNotEmpty()
+        val run: suspend () -> Unit = {
             SakuraWidgetProvider.clearUnread(getApplication())
             try {
                 client.consumeProactive(eventId)
             } catch (_: Exception) {
             }
-            applyEvent(client.openingReady(eventId))
+            applyIncomingDialogue(client.openingReady(eventId))
             appOpenedBaseUrl = baseUrl
+        }
+        if (inReplyWaiting || (dialogueEventInFlight && !awaitingUserReplyResponse)) {
+            viewModelScope.launch {
+                try {
+                    run()
+                } catch (e: Exception) {
+                    errorMessage = e.message ?: e.javaClass.simpleName
+                }
+            }
+        } else {
+            launchDialogueEvent { run() }
         }
     }
 
@@ -470,6 +500,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         val urlKey = baseUrl
         if (!force && appOpenedBaseUrl == urlKey) return
+        if (!live2dBootReady) {
+            pendingOpenAfterBoot = true
+            return
+        }
+        pendingOpenAfterBoot = false
         launchDialogueEvent {
             if (storyCompleted) {
                 applyEvent(client.openingReady())
@@ -505,7 +540,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectReply(option: ReplyOption) {
         recordUserActivity()
         val client = api ?: return
-        launchDialogueEvent {
+        launchDialogueEvent(awaitingReply = true) {
             val type = if (option.type == "key") "option_selected" else "user_message"
             applyEvent(client.postEvent(type, text = option.text, replyId = option.id, storyIndex = storyIndex))
         }
@@ -515,9 +550,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (text.isBlank()) return
         recordUserActivity()
         val client = api ?: return
-        launchDialogueEvent {
+        launchDialogueEvent(awaitingReply = true) {
             applyEvent(client.postEvent("user_message", text = text.trim()))
         }
+    }
+
+    fun requestTouchReaction(hitArea: String, motion: String, expression: String, onResult: (Live2DReaction) -> Unit) {
+        val client = api ?: run {
+            onResult(localTouchReactionFallback(hitArea, motion, expression))
+            return
+        }
+        viewModelScope.launch {
+            try {
+                val result = client.fetchTouchReaction(hitArea)
+                val text = result.optString("text").ifBlank { localTouchReactionFallback(hitArea, motion, expression).text }
+                val emotion = result.optString("emotion", expressionToEmotion(expression))
+                val expr = result.optString("expression", expression).ifBlank { expression }
+                val mot = result.optString("motion", motion).ifBlank { motion }
+                onResult(
+                    Live2DReaction(
+                        hitArea = hitArea,
+                        intensity = Live2DReactionIntensity.Soft,
+                        motion = mot,
+                        expression = expr,
+                        text = text,
+                        relationDelta = RelationDelta()
+                    )
+                )
+            } catch (_: Exception) {
+                onResult(localTouchReactionFallback(hitArea, motion, expression))
+            }
+        }
+    }
+
+    private fun localTouchReactionFallback(hitArea: String, motion: String, expression: String): Live2DReaction {
+        val lines = mapOf(
+            "head" to listOf("轻点我的头？……也不是不行啦。", "头发会乱的，不过你开心就好。"),
+            "chest" to listOf("你、你靠太近了……", "心跳有点快，别一直盯着看。"),
+            "hand" to listOf("想牵手吗？……可以哦。", "手心有点热，是你吗。"),
+            "body" to listOf("怎么啦，想引起我注意？", "我就在这里，别急。")
+        )
+        val candidates = lines[hitArea] ?: listOf("嗯？")
+        val text = candidates[(System.currentTimeMillis() % candidates.size).toInt()]
+        return Live2DReaction(
+            hitArea = hitArea,
+            intensity = Live2DReactionIntensity.Soft,
+            motion = motion,
+            expression = expression,
+            text = text,
+            relationDelta = RelationDelta()
+        )
     }
 
     fun loadMoments() {
@@ -872,14 +954,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun launchDialogueEvent(block: suspend () -> Unit) {
+    private fun launchDialogueEvent(awaitingReply: Boolean = false, block: suspend () -> Unit) {
         if (dialogueEventInFlight) return
         dialogueEventInFlight = true
+        awaitingUserReplyResponse = awaitingReply
         launchBusy {
             try {
                 block()
             } finally {
                 dialogueEventInFlight = false
+                awaitingUserReplyResponse = false
             }
         }
     }
@@ -946,7 +1030,11 @@ fun AiGalgameApp(vm: MainViewModel) {
                     line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
                     editable = false,
                     onPlacementChange = { vm.updatePlacementDraft(it) },
-                    onReaction = { vm.applyLive2DReaction(it) },
+                    onReaction = { partial ->
+                        vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
+                            vm.applyLive2DReaction(it)
+                        }
+                    },
                     relation = vm.relation,
                     stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
                     showCharacter = stageShowsCharacter,
@@ -1009,15 +1097,6 @@ fun AiGalgameApp(vm: MainViewModel) {
                             }
                         }
                     }
-                    if (vm.screen == AppScreen.Home && vm.standeeEditMode) {
-                        PlacementEditInputOverlay(
-                            placement = vm.visiblePlacement(),
-                            onPlacementChange = { vm.updatePlacementDraft(it) },
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .zIndex(8f)
-                        )
-                    }
                 }
             }
         }
@@ -1033,9 +1112,9 @@ fun AudioLinePlayer(vm: MainViewModel) {
             .build()
     }
     val line = vm.currentLine()
-    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled) {
+    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dBootReady) {
         val url = line?.ttsUrl.orEmpty()
-        if (vm.ttsEnabled && url.isNotBlank()) {
+        if (vm.live2dBootReady && vm.ttsEnabled && url.isNotBlank()) {
             try {
                 player.stop()
                 player.clearMediaItems()
@@ -1132,6 +1211,7 @@ fun Live2DBootLoadingScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Text("Live2D 加载中", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
+            Text("模型就绪后会开始说话", color = Color(0xFF79545B), fontSize = 14.sp, textAlign = TextAlign.Center)
             LinearProgressIndicator(Modifier.fillMaxWidth())
             Text(
                 text = "状态：${status.bootState} / ${status.phase} / ${status.loadElapsedMs}ms",
@@ -1215,7 +1295,11 @@ fun HomeScreen(
                 line = lastLine,
                 editable = vm.standeeEditMode,
                 onPlacementChange = { vm.updatePlacementDraft(it) },
-                onReaction = { vm.applyLive2DReaction(it) },
+                onReaction = { partial ->
+                    vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
+                        vm.applyLive2DReaction(it)
+                    }
+                },
                 relation = vm.relation,
                 modifier = Modifier.fillMaxSize()
             )
@@ -1238,6 +1322,7 @@ fun HomeScreen(
                 modifier = Modifier
                     .align(Alignment.End)
                     .padding(top = 8.dp)
+                    .zIndex(10f)
             )
         }
 
@@ -1263,20 +1348,31 @@ fun HomeScreen(
                 }
         )
 
-        CharacterTapZone(
-            enabled = tapBridge != null &&
-                vm.live2dBootReady &&
-                vm.selectedCharacter == "neko" &&
-                !vm.standeeEditMode,
-            headerBottomPx = headerBottomPx,
-            panelTopPx = panelTopPx,
-            onTap = { normalizedX, normalizedY ->
-                tapBridge?.dispatch(normalizedX, normalizedY)
-            },
-            modifier = Modifier
-                .fillMaxSize()
-                .zIndex(3f)
-        )
+        if (vm.standeeEditMode) {
+            StandeeGestureZone(
+                headerBottomPx = headerBottomPx,
+                panelTopPx = panelTopPx,
+                placement = vm.visiblePlacement(),
+                onPlacementChange = { vm.updatePlacementDraft(it) },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(3f)
+            )
+        } else {
+            CharacterTapZone(
+                enabled = tapBridge != null &&
+                    vm.live2dBootReady &&
+                    vm.selectedCharacter == "neko",
+                headerBottomPx = headerBottomPx,
+                panelTopPx = panelTopPx,
+                onTap = { normalizedX, normalizedY ->
+                    tapBridge?.dispatch(normalizedX, normalizedY)
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(3f)
+            )
+        }
 
         if (historyExpanded) {
             DialogueHistoryOverlay(
@@ -1288,37 +1384,6 @@ fun HomeScreen(
             )
         }
     }
-}
-
-@Composable
-fun PlacementEditInputOverlay(
-    placement: OutfitPlacement,
-    onPlacementChange: (OutfitPlacement) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val density = LocalDensity.current
-    var gesturePlacement by remember { mutableStateOf(placement.coerceForStage()) }
-    LaunchedEffect(placement) {
-        gesturePlacement = placement.coerceForStage()
-    }
-    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
-        val dx = with(density) { panChange.x.toDp().value }
-        val dy = with(density) { panChange.y.toDp().value }
-        val next = gesturePlacement.copy(
-            scale = gesturePlacement.scale * zoomChange,
-            offsetX = gesturePlacement.offsetX + dx,
-            offsetY = gesturePlacement.offsetY + dy
-        ).coerceForStage()
-        gesturePlacement = next
-        onPlacementChange(next)
-    }
-    Box(
-        modifier.transformable(
-            state = transformState,
-            lockRotationOnZoomPan = true,
-            enabled = true
-        )
-    )
 }
 
 @Composable
@@ -1490,10 +1555,11 @@ fun DialogueBox(
     onAdvance: () -> Unit,
     onShowHistory: () -> Unit
 ) {
+    val scrollState = rememberScrollState()
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .height(164.dp)
+            .heightIn(min = 164.dp, max = 220.dp)
             .pointerInput(history.size) {
                 detectVerticalDragGestures { _, dragAmount ->
                     if (dragAmount < -10f && history.isNotEmpty()) onShowHistory()
@@ -1514,11 +1580,12 @@ fun DialogueBox(
                 fontSize = 21.sp,
                 lineHeight = 29.sp,
                 fontWeight = FontWeight.Bold,
-                maxLines = 3,
+                maxLines = 5,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
-                    .weight(1f)
+                    .weight(1f, fill = false)
                     .padding(top = 8.dp)
+                    .verticalScroll(scrollState)
             )
             if (line.ttsError.isNotBlank()) {
                 Text(line.ttsError, color = Color(0xFF9A5A62), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
