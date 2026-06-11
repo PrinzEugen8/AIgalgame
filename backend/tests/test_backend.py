@@ -36,7 +36,7 @@ from app.touch_reactions import (  # noqa: E402
     refresh_touch_reaction_pools,
     touch_pool_coverage_admin,
 )
-from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
+from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, ensure_proactive_event_image, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
 from app.push import register_device, send_proactive_push  # noqa: E402
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
@@ -4903,6 +4903,29 @@ def test_safe_image_request_policy_builds_supported_kinds_without_content_gate()
         assert "用户给的自拍短提示" in direct_prompt.prompt
 
 
+def test_proactive_image_requires_explicit_generation_flag() -> None:
+    with SessionLocal() as session:
+        ensure_seed(session, user_id="proactive_no_image_user", character_id="atri")
+        event = create_proactive_event(
+            session,
+            user_id="proactive_no_image_user",
+            character_id="atri",
+            source_type="memory",
+            source_id="memory_no_image",
+            title="小樱想起了一件事",
+            text="我刚刚想起你之前提到过的事。",
+            priority=58,
+            dedupe_key="memory:no-image",
+            payload={"memory": "普通聊天提醒，不需要 CG"},
+        )
+        assert event is not None
+        character = session.get(Character, "atri")
+        assert ensure_proactive_event_image(session, event, character=character) == ""
+        payload = json.loads(event.payload_json)
+        assert not payload.get("media_asset_id")
+        assert not payload.get("proactive_media_asset_id")
+
+
 def test_character_selfie_uses_reference_image_and_records_asset() -> None:
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"s" * 100
 
@@ -5103,6 +5126,7 @@ def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
 
 def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"m" * 100
+    chat_requests: list[dict[str, object]] = []
     image_requests: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5111,23 +5135,41 @@ def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
         body = json.loads(request.content.decode())
         url = str(request.url)
         if url == "https://ark.cn-beijing.volces.com/api/v3/chat/completions":
-            content = json.dumps(
-                {
+            chat_requests.append(body)
+            if len(chat_requests) == 1:
+                payload = {
                     "text": "窗边的茶还冒着热气，所以顺手拍了一张。",
                     "mood": "平静",
                     "photo_kind": "character_selfie",
                     "photo_prompt": "窗边喝茶的日常自拍",
                     "likes": ["图书委员澪"],
                     "comments": [{"actor_name": "同行同学", "content": "这张很像你的气氛。"}],
-                },
-                ensure_ascii=False,
-            )
+                }
+            else:
+                payload = {
+                    "lines": [
+                        {
+                            "line_id": "line_proactive_selfie",
+                            "text": "刚才窗边那件事，我想当面和你讲。",
+                            "emotion": "happy",
+                            "pose": "happy",
+                        }
+                    ],
+                    "relation_delta": {},
+                    "reply_mode": "proactive",
+                    "pace_reason": "主动事件预热。",
+                }
+            content = json.dumps(payload, ensure_ascii=False)
             return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
         if url == "https://ark.cn-beijing.volces.com/api/v3/images/generations":
             image_requests.append(body)
-            assert body["image"][0].startswith("data:image/png;base64,")
-            assert "same fictional adult anime catgirl" in body["prompt"]
-            assert "窗边喝茶" in body["prompt"]
+            if "image" in body:
+                assert body["image"][0].startswith("data:image/png;base64,")
+                assert "same fictional adult anime catgirl" in body["prompt"]
+            if len(image_requests) == 1:
+                assert "窗边喝茶" in body["prompt"]
+            else:
+                assert "主动聊天" in body["prompt"] or "Galgame CG" in body["prompt"]
             return httpx.Response(200, json={"data": [{"url": f"https://image.example/selfie-{len(image_requests)}.png"}]})
         raise AssertionError(url)
 
@@ -5135,6 +5177,12 @@ def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
     try:
         with SessionLocal() as session:
             ensure_seed(session, user_id="moment_selfie_user", character_id="atri")
+            user = session.get(User, "moment_selfie_user")
+            assert user is not None
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.tts_enabled = False
+            session.query(OpeningCache).filter(OpeningCache.user_id == "moment_selfie_user").delete(synchronize_session=False)
             session.query(MediaAsset).filter(MediaAsset.source_event_id.like("selfie:moment_selfie_user:atri:%")).delete(synchronize_session=False)
             session.query(MomentInteraction).filter(
                 MomentInteraction.moment_id.in_(
@@ -5207,11 +5255,26 @@ def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
             proactive = session.query(ProactiveEvent).filter(
                 ProactiveEvent.user_id == "moment_selfie_user",
                 ProactiveEvent.source_type == "schedule",
+                ProactiveEvent.source_id == moment.source_experience_id,
             ).order_by(ProactiveEvent.created_at.desc()).first()
             assert proactive is not None
             proactive_payload = json.loads(proactive.payload_json)
-            assert proactive_payload["moment_id"] == moment.moment_id
-            assert proactive_payload["moment_media_asset_id"] == moment.media_asset_id
+            assert proactive_payload["generate_image"] is True
+            assert proactive_payload["image_prompt"]
+            assert not proactive_payload.get("moment_id")
+            assert not proactive_payload.get("moment_media_asset_id")
+            assert not proactive_payload.get("proactive_media_asset_id")
+            assert len(image_requests) == 1
+            prepared = prepare_opening(
+                session,
+                user_id="moment_selfie_user",
+                character_id="atri",
+                local_time=datetime.fromisoformat("2026-06-09T18:00:00+08:00"),
+                proactive_event_id=proactive.proactive_event_id,
+            )
+            assert prepared["prepared"] is True
+            assert prepared["kind"] == "proactive"
+            proactive_payload = json.loads(proactive.payload_json)
             assert proactive_payload["proactive_media_asset_id"]
             assert proactive_payload["media_asset_id"] == proactive_payload["proactive_media_asset_id"]
             assert proactive_payload["proactive_media_asset_id"] != moment.media_asset_id

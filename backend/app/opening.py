@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .diagnostics import diagnostic_span, write_diagnostic
 from .models import Character, OpeningCache, ProactiveEvent, User
 from .pipeline import _event, _llm_dialogue, _no_reply, _proactive_target_text, _save_dialogue_lines, _tts_for_line
-from .proactive import consume_proactive_event, pending_proactive_response, proactive_media_asset_id
+from .proactive import consume_proactive_event, ensure_proactive_event_image, pending_proactive_response
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta
 from .utils import dump_json, load_json, uid, utc_now
 
@@ -302,6 +302,7 @@ def _prepare_proactive_payload(session: Session, user: User, character: Characte
         session_id="opening_prepare",
         payload={"proactive_event_id": proactive.proactive_event_id},
     )
+    media_asset_id = ensure_proactive_event_image(session, proactive, character=character)
     payload = _llm_dialogue(
         session,
         event,
@@ -311,7 +312,6 @@ def _prepare_proactive_payload(session: Session, user: User, character: Characte
         allow_relation_delta=False,
         persist_side_effects=False,
     )
-    media_asset_id = proactive_media_asset_id(proactive)
     if media_asset_id and not payload.media_asset_id:
         payload.media_asset_id = media_asset_id
     return payload
@@ -352,7 +352,7 @@ def _prepare_opening_inner(
                 proactive.prepared_payload_json = dump_json(payload.model_dump())
                 proactive.prepared_at = utc_now()
                 proactive.prepare_error = ""
-            media_asset_id = proactive_media_asset_id(proactive)
+            media_asset_id = ensure_proactive_event_image(session, proactive, character=character)
             if media_asset_id and not payload.media_asset_id:
                 payload.media_asset_id = media_asset_id
             cache = _store_opening_cache(
@@ -491,6 +491,9 @@ def _prepare_due_openings_inner(
                     event.prepared_payload_json = dump_json(payload.model_dump())
                     event.prepared_at = utc_now()
                     event.prepare_error = ""
+                media_asset_id = ensure_proactive_event_image(session, event, character=character)
+                if media_asset_id and not payload.media_asset_id:
+                    payload.media_asset_id = media_asset_id
                 cache = _store_opening_cache(
                     session,
                     user_id=user.user_id,

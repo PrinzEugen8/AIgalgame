@@ -33,7 +33,7 @@ from .persona import (
     relation_attitude,
     user_profile_summary,
 )
-from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected, proactive_media_asset_id
+from .proactive import consume_proactive_event, ensure_proactive_event_image, mark_proactive_opened, mark_proactive_reflected
 from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider, get_task_llm_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
@@ -1608,6 +1608,7 @@ def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
                 "input_text": target_text,
             },
         ) as reply_span:
+            media_asset_id = ensure_proactive_event_image(session, proactive, character=character)
             if proactive.prepared_payload_json and proactive.prepared_payload_json != "{}":
                 with diagnostic_span(
                     "reply_stage",
@@ -1624,7 +1625,6 @@ def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
                 except ProviderError:
                     consume_proactive_event(session, proactive.proactive_event_id)
                     raise
-            media_asset_id = proactive_media_asset_id(proactive)
             if media_asset_id and not payload.media_asset_id:
                 payload.media_asset_id = media_asset_id
             if not payload.lines:

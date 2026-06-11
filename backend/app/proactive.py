@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .availability import get_user_availability, is_event_in_busy_window, is_user_unavailable
 from .diagnostics import write_diagnostic
+from .image_generation import ImageRequestBlocked, generate_safe_image, infer_image_kind, normalize_image_kind
 from .models import Character, ProactiveEvent, ProviderConfig, User
 from .news import trend_radar_payload_for_news
 from .proactive_rules import build_judge_messages
@@ -24,6 +26,8 @@ PROACTIVE_JUDGE_CANDIDATE_LIMIT = 8
 JUDGE_TEXT_LIMIT = 180
 ON_TIME_DELIVERY_WINDOW = timedelta(minutes=10)
 SOURCE_TYPE_RANK = {"appointment": 0, "calendar_event": 1, "schedule": 2, "weather": 3, "news": 4, "moment_interaction": 5, "memory": 6}
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -175,8 +179,17 @@ def create_schedule_proactive_event(
     summary: str,
     activity_title: str,
     priority: int,
+    can_generate_image: bool = False,
 ) -> ProactiveEvent | None:
     text = f"{summary} 我想等你有空的时候讲给你听。"
+    payload: dict[str, Any] = {"activity_title": activity_title, "summary": summary}
+    if can_generate_image:
+        payload.update(
+            {
+                "generate_image": True,
+                "image_prompt": "，".join(item for item in (activity_title, summary) if str(item or "").strip()),
+            }
+        )
     return create_proactive_event(
         session,
         user_id=user_id,
@@ -187,7 +200,7 @@ def create_schedule_proactive_event(
         text=text,
         priority=priority,
         dedupe_key=f"schedule:{user_id}:{source_id}",
-        payload={"activity_title": activity_title, "summary": summary},
+        payload=payload,
     )
 
 
@@ -527,6 +540,119 @@ def proactive_media_asset_id(event: ProactiveEvent | None) -> str:
         return ""
     payload = _event_payload(event)
     return str(payload.get("proactive_media_asset_id") or payload.get("media_asset_id") or "").strip()
+
+
+def _payload_text(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if isinstance(value, str):
+        return " ".join(value.split())
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _payload_truthy(payload: dict[str, Any], key: str) -> bool:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _proactive_image_prompt(event: ProactiveEvent, payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("image_prompt", "proactive_image_prompt", "cg_prompt", "photo_prompt"):
+        text = _payload_text(payload, key)
+        if text and text not in parts:
+            parts.append(text)
+    if not parts and not _payload_truthy(payload, "generate_image"):
+        return ""
+    if not parts:
+        for key in ("summary", "topic", "memory", "content"):
+            text = _payload_text(payload, key)
+            if text and text not in parts:
+                parts.append(text)
+    for text in (event.title, event.text):
+        normalized = " ".join(str(text or "").split())
+        if normalized and normalized not in parts:
+            parts.append(normalized)
+    if event.source_type == "weather":
+        parts.insert(0, "天气相关的日常风景 CG")
+    elif event.source_type == "news":
+        parts.insert(0, "角色看到消息时的日常物品或场景 CG")
+    elif event.source_type in {"schedule", "memory", "moment_interaction"}:
+        parts.insert(0, "角色主动聊天时展示的日常 Galgame CG")
+    return "，".join(parts)[:240]
+
+
+def _proactive_image_kind(payload: dict[str, Any], prompt: str):
+    for key in ("image_kind", "proactive_image_kind", "cg_kind", "photo_kind"):
+        value = _payload_text(payload, key)
+        if not value:
+            continue
+        try:
+            return normalize_image_kind(value)
+        except ImageRequestBlocked:
+            write_diagnostic("proactive_image_kind_ignored", image_kind=value)
+    return infer_image_kind(prompt)
+
+
+def ensure_proactive_event_image(session: Session, event: ProactiveEvent | None, *, character: Character | None = None) -> str:
+    if event is None:
+        return ""
+    existing = proactive_media_asset_id(event)
+    if existing:
+        return existing
+    payload = _event_payload(event)
+    prompt = _proactive_image_prompt(event, payload)
+    if not prompt:
+        return ""
+    config = get_enabled_provider(session, "image")
+    if config is None:
+        write_diagnostic("proactive_image_skipped", proactive_event_id=event.proactive_event_id, reason="image_provider_not_configured")
+        return ""
+    if character is None:
+        character = session.get(Character, event.character_id)
+    try:
+        kind = _proactive_image_kind(payload, prompt)
+        asset = generate_safe_image(
+            session,
+            config=config,
+            kind=kind,
+            scene_hint=prompt,
+            character=character,
+            user_id=event.user_id,
+            character_id=event.character_id,
+            source_id=f"proactive:{event.proactive_event_id}",
+            mood=_payload_text(payload, "mood"),
+            cooldown_seconds=0,
+        )
+    except ImageRequestBlocked as exc:
+        logger.info("proactive image skipped event_id=%s reason=%s", event.proactive_event_id, exc)
+        write_diagnostic("proactive_image_skipped", proactive_event_id=event.proactive_event_id, reason=str(exc))
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("proactive image generation failed event_id=%s", event.proactive_event_id)
+        write_diagnostic("proactive_image_error", proactive_event_id=event.proactive_event_id, error=str(exc))
+        return ""
+    payload.update(
+        {
+            "image_prompt": prompt,
+            "image_kind": kind,
+            "proactive_media_asset_id": asset.asset_id,
+            "media_asset_id": asset.asset_id,
+            "has_media": True,
+        }
+    )
+    event.payload_json = dump_json(payload)
+    event.updated_at = utc_now()
+    write_diagnostic("proactive_image_created", proactive_event_id=event.proactive_event_id, media_asset_id=asset.asset_id, image_kind=kind)
+    return asset.asset_id
 
 
 def _source_type_rank(source_type: str) -> int:
