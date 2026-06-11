@@ -29,12 +29,25 @@ class ApiClient(private val baseUrl: String) {
     private val client = backendHttpClient()
 
     fun absoluteUrl(path: String): String {
-        if (path.startsWith("http://") || path.startsWith("https://")) return path
+        if (
+            path.startsWith("http://") ||
+            path.startsWith("https://") ||
+            path.startsWith("file://") ||
+            path.startsWith("content://")
+        ) {
+            return path
+        }
         return baseUrl.trimEnd('/') + path
     }
 
     suspend fun health(): JSONObject = get("/api/health")
-    suspend fun bootstrap(): JSONObject = get("/api/bootstrap")
+    suspend fun bootstrap(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
+        return get("/api/bootstrap?character_id=$characterId&appearance_id=$appearanceId")
+    }
+
+    suspend fun fetchLive2dConfig(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
+        return get("/api/live2d/config?character_id=$characterId&appearance_id=$appearanceId")
+    }
     suspend fun homeState(): JSONObject = get("/api/state/home")
     suspend fun moments(): JSONObject = get("/api/moments")
     suspend fun calendar(month: String = ""): JSONObject {
@@ -92,11 +105,43 @@ class ApiClient(private val baseUrl: String) {
         return post("/api/proactive/foreground-check", body)
     }
 
-    suspend fun fetchTouchReaction(hitArea: String): JSONObject {
-        return post("/api/live2d/touch", JSONObject().put("hit_area", hitArea))
+    suspend fun fetchTouchReaction(
+        hitArea: String,
+        characterId: String = "atri",
+        appearanceId: String = "neko",
+    ): JSONObject {
+        return post(
+            "/api/live2d/touch",
+            JSONObject()
+                .put("hit_area", hitArea)
+                .put("character_id", characterId)
+                .put("appearance_id", appearanceId)
+        )
     }
 
-    suspend fun refreshTouchReactions(): JSONObject = post("/api/live2d/touch/refresh", JSONObject())
+    suspend fun refreshTouchReactions(
+        sync: Boolean = false,
+        hitArea: String = "",
+        force: Boolean = false,
+        ttsOnly: Boolean = false,
+        characterId: String = "atri",
+        appearanceId: String = "neko",
+    ): JSONObject {
+        return post(
+            "/api/live2d/touch/refresh",
+            JSONObject()
+                .put("sync", sync)
+                .put("hit_area", hitArea)
+                .put("force", force)
+                .put("tts_only", ttsOnly)
+                .put("character_id", characterId)
+                .put("appearance_id", appearanceId)
+        )
+    }
+
+    suspend fun fetchTouchBundle(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
+        return get("/api/live2d/touch/bundle?character_id=$characterId&appearance_id=$appearanceId")
+    }
 
     suspend fun updateLocation(latitude: Double, longitude: Double, accuracyM: Float, provider: String): JSONObject {
         val body = JSONObject()

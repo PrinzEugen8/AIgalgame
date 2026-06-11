@@ -19,6 +19,12 @@ from .config import settings
 from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, ensure_calendar_proactive_candidates, update_calendar_event
 from .database import get_session, init_db
 from .diagnostics import runtime_logs, tail_diagnostics, write_diagnostic
+from .image_generation import (
+    MANUAL_IMAGE_COOLDOWN_SECONDS,
+    ImageRequestBlocked,
+    generate_safe_image,
+    normalize_image_kind,
+)
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
@@ -41,7 +47,29 @@ from .models import (
     UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
-from .touch_reactions import consume_touch_reaction, refresh_touch_reaction_pools_background
+from .live2d_config import (
+    DEFAULT_LIVE2D_APPEARANCE_ID,
+    LIVE2D_MODELS_DIR,
+    area_to_dict,
+    create_hit_area,
+    delete_hit_area,
+    ensure_default_hit_areas,
+    list_hit_areas,
+    live2d_bootstrap_payload,
+    preview_config_for_character,
+    reference_image_path,
+    reorder_hit_areas,
+    update_hit_area,
+)
+from .touch_reactions import (
+    consume_touch_reaction,
+    list_touch_pool_admin,
+    refresh_touch_reaction_pools,
+    refresh_touch_reaction_pools_background,
+    touch_pool_coverage_admin,
+    touch_pool_version,
+    touch_reaction_bundle,
+)
 from .online import mark_heartbeat, mark_offline, mark_online, presence_context
 from .persona import normalize_memory_layer, normalize_persona_card, relation_attitude
 from .pipeline import handle_event
@@ -81,6 +109,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Galgame Android Demo Backend")
 ADMIN_DIR = Path(__file__).resolve().parent / "admin_static"
+
+if LIVE2D_MODELS_DIR.is_dir():
+    app.mount(
+        "/admin/assets/live2d-models",
+        StaticFiles(directory=str(LIVE2D_MODELS_DIR)),
+        name="admin_live2d_models",
+    )
 
 app.mount("/admin/assets", StaticFiles(directory=ADMIN_DIR), name="admin_assets")
 
@@ -634,7 +669,7 @@ def admin_calendar_events(
     q: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     ensure_calendar_events(session, user_id=user_id, character_id=character_id)
     stmt = select(CalendarEvent).where(CalendarEvent.user_id.in_(["", user_id]), CalendarEvent.character_id.in_(["", character_id]))
     query = q.strip()
@@ -739,6 +774,7 @@ def admin_prewarm_proactive(payload: dict[str, Any] | None = None, session: Sess
     body = payload or {}
     user_id = str(body.get("user_id") or "")
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = ensure_seed(session, user_id=user_id or DEFAULT_USER_ID, character_id=character_id)
     return prepare_due_openings(
         session,
         user_id=user_id,
@@ -755,7 +791,7 @@ def admin_ai_schedule_today(
     local_time: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     day = _parse_client_time(local_time) or datetime.now()
     slots = ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     return {"ok": True, "items": [_schedule_slot_to_out(item) for item in sorted(slots, key=lambda slot: slot.start_at)]}
@@ -794,7 +830,7 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
     source_type = str(body.get("source_type") or "memory").strip()
     if source_type not in {"news", "weather", "schedule", "calendar_event", "moment_interaction", "appointment", "memory"}:
         raise HTTPException(status_code=400, detail="unsupported proactive source_type")
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     local_time = _parse_client_time(str(body.get("local_time") or ""))
     title = str(body.get("title") or "").strip()
     text = str(body.get("text") or "").strip()
@@ -884,7 +920,7 @@ def admin_judge_proactive_now(payload: dict[str, Any] | None = None, session: Se
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     local_time = _parse_client_time(str(body.get("local_time") or ""))
     foreground_context = {
         "app_state": str(body.get("app_state") or "admin"),
@@ -1019,7 +1055,7 @@ def update_default_character(payload: CharacterAdminIn, session: Session = Depen
 
 @app.put("/api/admin/characters/{character_id}", response_model=CharacterAdminOut)
 def update_character(character_id: str, payload: CharacterAdminIn, session: Session = Depends(get_session)) -> CharacterAdminOut:
-    ensure_seed(session, character_id=character_id)
+    ensure_seed(session)
     character = session.get(Character, character_id)
     if character is None:
         raise HTTPException(status_code=404, detail="character not found")
@@ -1048,22 +1084,25 @@ def update_character(character_id: str, payload: CharacterAdminIn, session: Sess
 def bootstrap(
     user_id: str = DEFAULT_USER_ID,
     character_id: str = DEFAULT_CHARACTER_ID,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
     ).scalar_one()
     character = session.get(Character, character_id)
-    attitude_band, attitude_text = relation_attitude(
-        relation,
-        normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=character.name if character else "小樱"),
-    )
-    attitude_band, attitude_text = relation_attitude(
-        relation,
-        normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=character.name if character else "小樱"),
+    display_name = character.name if character and character.name else character_id
+    persona_card = normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=display_name)
+    attitude_band, attitude_text = relation_attitude(relation, persona_card)
+    live2d = live2d_bootstrap_payload(session, appearance_id=appearance_id)
+    live2d["touch_pool_version"] = touch_pool_version(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        appearance_id=appearance_id,
     )
     return {
         "user": {
@@ -1073,7 +1112,7 @@ def bootstrap(
         },
         "character": {
             "character_id": character_id,
-            "name": character.name if character else "小樱",
+            "name": display_name,
             "age_setting": character.age_setting if character else "18+",
         },
         "relation": {
@@ -1085,8 +1124,48 @@ def bootstrap(
             "attitude_band": attitude_band,
             "attitude_text": attitude_text,
         },
+        "live2d": live2d,
         "touch_reactions_ready": True,
     }
+
+
+@app.get("/api/live2d/config")
+def live2d_config(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    live2d = live2d_bootstrap_payload(session, appearance_id=appearance_id)
+    live2d["touch_pool_version"] = touch_pool_version(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        appearance_id=appearance_id,
+    )
+    return {"ok": True, **live2d}
+
+
+@app.get("/api/live2d/touch/bundle")
+def live2d_touch_bundle(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    ensure_default_hit_areas(session, appearance_id=appearance_id)
+    session.commit()
+    try:
+        return touch_reaction_bundle(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            appearance_id=appearance_id,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/live2d/touch")
@@ -1094,12 +1173,25 @@ def live2d_touch(payload: dict[str, Any] | None = None, session: Session = Depen
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
     hit_area = str(body.get("hit_area") or "")
     ensure_seed(session, user_id=user_id, character_id=character_id)
     try:
-        return consume_touch_reaction(session, user_id=user_id, character_id=character_id, hit_area=hit_area)
+        return consume_touch_reaction(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            appearance_id=appearance_id,
+            hit_area=hit_area,
+        )
     except ProviderError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        message = str(exc)
+        if message == "touch_pool_missing":
+            raise HTTPException(
+                status_code=404,
+                detail={"ok": False, "pool_missing": True, "message": "touch reaction pool not prefetched"},
+            ) from exc
+        raise HTTPException(status_code=503, detail=message) from exc
 
 
 @app.post("/api/live2d/touch/refresh")
@@ -1111,9 +1203,191 @@ def live2d_touch_refresh(
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    hit_area = str(body.get("hit_area") or "")
+    force = bool(body.get("force"))
+    tts_only = bool(body.get("tts_only"))
+    if body.get("sync"):
+        try:
+            return refresh_touch_reaction_pools(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                appearance_id=appearance_id,
+                hit_area=hit_area,
+                tier=str(body.get("tier") or ""),
+                tiers=body.get("tiers") if isinstance(body.get("tiers"), list) else None,
+                force=force,
+                tts_only=tts_only,
+            )
+        except ProviderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     background_tasks.add_task(refresh_touch_reaction_pools_background, user_id=user_id, character_id=character_id)
-    return {"ok": True, "queued": True, "user_id": user_id, "character_id": character_id}
+    return {
+        "ok": True,
+        "queued": True,
+        "user_id": user_id,
+        "character_id": character_id,
+        "appearance_id": appearance_id,
+    }
+
+
+@app.get("/api/admin/live2d/hit-areas")
+def admin_list_live2d_hit_areas(
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    resolved = appearance_id or character_id or DEFAULT_LIVE2D_APPEARANCE_ID
+    ensure_default_hit_areas(session, appearance_id=resolved)
+    session.commit()
+    rows = list_hit_areas(session, appearance_id=resolved)
+    return {"ok": True, "items": [area_to_dict(row) for row in rows], "appearance_id": resolved, "character_id": resolved}
+
+
+@app.get("/api/admin/live2d/preview-config")
+def admin_live2d_preview_config(
+    appearance_id: str = "",
+    character_id: str = "",
+) -> dict[str, Any]:
+    from .live2d_config import _resolve_appearance_id
+
+    resolved = _resolve_appearance_id(appearance_id=appearance_id, character_id=character_id)
+    return {"ok": True, **preview_config_for_character(resolved)}
+
+
+@app.get("/api/admin/live2d/hit-areas/reference-image")
+def admin_live2d_reference_image(
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    character_id: str = "",
+) -> FileResponse:
+    resolved = appearance_id or character_id or DEFAULT_LIVE2D_APPEARANCE_ID
+    path = reference_image_path(resolved)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="reference image not found")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.post("/api/admin/live2d/hit-areas")
+def admin_create_live2d_hit_area(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    try:
+        row = create_hit_area(session, payload)
+        return {"ok": True, "item": area_to_dict(row)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/admin/live2d/hit-areas/{area_id}")
+def admin_update_live2d_hit_area(
+    area_id: str,
+    payload: dict[str, Any],
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    resolved = appearance_id or character_id or DEFAULT_LIVE2D_APPEARANCE_ID
+    try:
+        row = update_hit_area(session, appearance_id=resolved, area_id=area_id, payload=payload)
+        return {"ok": True, "item": area_to_dict(row)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/admin/live2d/hit-areas/{area_id}")
+def admin_delete_live2d_hit_area(
+    area_id: str,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    resolved = appearance_id or character_id or DEFAULT_LIVE2D_APPEARANCE_ID
+    try:
+        delete_hit_area(session, appearance_id=resolved, area_id=area_id)
+        return {"ok": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/live2d/hit-areas/reorder")
+def admin_reorder_live2d_hit_areas(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    appearance_id = str(payload.get("appearance_id") or payload.get("character_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
+    ordered = payload.get("ordered_area_ids") or []
+    if not isinstance(ordered, list):
+        raise HTTPException(status_code=400, detail="ordered_area_ids must be a list")
+    rows = reorder_hit_areas(session, appearance_id=appearance_id, ordered_area_ids=[str(item) for item in ordered])
+    return {"ok": True, "items": [area_to_dict(row) for row in rows]}
+
+
+@app.get("/api/admin/live2d/touch-pools/coverage")
+def admin_touch_pool_coverage(
+    character_id: str = DEFAULT_CHARACTER_ID,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    user_id: str = DEFAULT_USER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    ensure_default_hit_areas(session, appearance_id=appearance_id)
+    session.commit()
+    try:
+        return touch_pool_coverage_admin(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            appearance_id=appearance_id,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/live2d/touch-pools")
+def admin_list_touch_pools(
+    hit_area: str,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
+    user_id: str = DEFAULT_USER_ID,
+    tier: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    ensure_default_hit_areas(session, appearance_id=appearance_id)
+    session.commit()
+    try:
+        return list_touch_pool_admin(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            appearance_id=appearance_id,
+            hit_area=hit_area,
+            tier=tier,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/live2d/touch-pools/refresh")
+def admin_refresh_touch_pool(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(payload.get("character_id") or DEFAULT_CHARACTER_ID)
+    appearance_id = str(payload.get("appearance_id") or payload.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
+    hit_area = str(payload.get("hit_area") or "")
+    force = bool(payload.get("force"))
+    tts_only = bool(payload.get("tts_only"))
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    try:
+        return refresh_touch_reaction_pools(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            appearance_id=appearance_id,
+            hit_area=hit_area,
+            tier=str(payload.get("tier") or ""),
+            tiers=payload.get("tiers") if isinstance(payload.get("tiers"), list) else None,
+            force=force,
+            tts_only=tts_only,
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/config/provider-presets")
@@ -1146,6 +1420,8 @@ def provider_models(provider_id: str, session: Session = Depends(get_session)) -
 @app.post("/api/events")
 def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
+        character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+        event = event.model_copy(update={"character_id": character_id})
         result = handle_event(session, event)
         write_diagnostic("event_ok", event_type=event.event_type, session_id=event.session_id, result_type=result.event_type)
         return result.model_dump()
@@ -1242,10 +1518,10 @@ def weather_refresh(
     character_id: str = DEFAULT_CHARACTER_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     body = payload or {}
     effective_user_id = str(body.get("user_id") or user_id)
-    effective_character_id = str(body.get("character_id") or character_id)
+    effective_character_id = ensure_seed(session, user_id=effective_user_id, character_id=str(body.get("character_id") or character_id))
     local_time = _parse_client_time(str(body.get("local_time") or ""))
     snapshot = refresh_weather_snapshot(session, user_id=effective_user_id, local_time=local_time, force=True)
     event = ensure_weather_candidate(session, user_id=effective_user_id, character_id=effective_character_id, local_time=local_time) if snapshot is not None else None
@@ -1265,7 +1541,7 @@ def proactive_pending(
     local_time: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     return pending_proactive_response(
         session,
         user_id=user_id,
@@ -1277,9 +1553,9 @@ def proactive_pending(
 @app.post("/api/devices/register")
 def devices_register(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
     user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
-    ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    character_id = ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
     try:
-        registration = register_device(session, {**payload, "user_id": user_id})
+        registration = register_device(session, {**payload, "user_id": user_id, "character_id": character_id})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "device": _device_registration_to_out(registration)}
@@ -1306,7 +1582,7 @@ def proactive_foreground_check(payload: dict[str, Any] | None = None, session: S
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
     device_id = str(body.get("device_id") or "android")
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     heartbeat = {
         "app_state": "foreground",
         "screen": str(body.get("screen") or ""),
@@ -1389,12 +1665,13 @@ def opening_prepare(
     character_id: str = DEFAULT_CHARACTER_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     body = payload or {}
+    body_character_id = ensure_seed(session, user_id=str(body.get("user_id") or user_id), character_id=str(body.get("character_id") or character_id))
     return prepare_opening(
         session,
         user_id=str(body.get("user_id") or user_id),
-        character_id=str(body.get("character_id") or character_id),
+        character_id=body_character_id,
         local_time=_parse_client_time(str(body.get("local_time") or "")),
         proactive_event_id=str(body.get("proactive_event_id") or ""),
         allow_llm=bool(body.get("allow_llm", True)),
@@ -1410,7 +1687,7 @@ def opening_ready(
     proactive_event_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     result = consume_ready_opening(
         session,
         user_id=user_id,
@@ -1435,6 +1712,8 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
             event = EventIn(**payload, user_id=payload.get("user_id") or user_id)
             with next(get_session()) as session:
                 try:
+                    character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+                    event = event.model_copy(update={"character_id": character_id})
                     result = handle_event(session, event)
                     await websocket.send_json(result.model_dump())
                 except ProviderError as exc:
@@ -1454,7 +1733,7 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
 
 @app.get("/api/state/home")
 def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=datetime.now())
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
@@ -1465,8 +1744,12 @@ def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARA
     unread = session.execute(
         select(MomentInteraction).where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
     ).scalars().all()
+    character = session.get(Character, character_id)
+    display_name = character.name if character and character.name else character_id
+    persona_card = normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=display_name)
+    attitude_band, attitude_text = relation_attitude(relation, persona_card)
     return {
-        "character": {"name": "小樱", "pose": "happy" if relation.mood >= 0 else "sad"},
+        "character": {"name": display_name, "pose": "happy" if relation.mood >= 0 else "sad"},
         "relation": {
             "affection": relation.affection,
             "trust": relation.trust,
@@ -1526,6 +1809,54 @@ def moments(session: Session = Depends(get_session)) -> dict[str, Any]:
     return {"items": items}
 
 
+@app.post("/api/images/generate")
+def generate_image(
+    payload: dict[str, Any],
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    image_config = get_enabled_provider(session, "image")
+    if image_config is None:
+        raise HTTPException(status_code=400, detail="image provider is not configured")
+    try:
+        kind = normalize_image_kind(str(payload.get("kind") or payload.get("image_kind") or ""))
+    except ImageRequestBlocked as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scene_hint = str(payload.get("scene_hint") or payload.get("prompt") or "").strip()
+    if not scene_hint:
+        raise HTTPException(status_code=400, detail="scene_hint is required")
+    character = session.get(Character, character_id)
+    source_id = str(payload.get("source_id") or uid("manual_image"))
+    try:
+        asset = generate_safe_image(
+            session,
+            config=image_config,
+            kind=kind,
+            scene_hint=scene_hint,
+            character=character,
+            user_id=user_id,
+            character_id=character_id,
+            source_id=source_id,
+            mood=str(payload.get("mood") or ""),
+            cooldown_seconds=MANUAL_IMAGE_COOLDOWN_SECONDS,
+        )
+    except ImageRequestBlocked as exc:
+        status_code = 429 if "cooling down" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    session.commit()
+    return {
+        "ok": True,
+        "kind": kind,
+        "asset_id": asset.asset_id,
+        "url": asset.url,
+        "asset_type": asset.asset_type,
+    }
+
+
 @app.post("/api/moments/{moment_id}/like")
 def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     if session.get(Moment, moment_id) is None:
@@ -1570,6 +1901,7 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
 
 @app.get("/api/calendar")
 def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     day = datetime.now()
     prefix = month or day.strftime("%Y-%m")
     items = calendar_items(session, user_id=user_id, character_id=character_id, month=prefix)
@@ -1610,7 +1942,7 @@ def widget_state(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_
     mood = home["relation"]["mood"]
     status = "开心" if mood >= 20 else "想聊天" if mood >= 0 else "有点低落"
     bubble = "今天也想听你说说话。" if status == "想聊天" else "刚刚有新的小事想告诉你。"
-    return {"character_name": "小樱", "status": status, "bubble": bubble, "unread_count": home["unread_count"], "open_target": "home"}
+    return {"character_name": home["character"]["name"], "status": status, "bubble": bubble, "unread_count": home["unread_count"], "open_target": "home"}
 
 
 @app.get("/media/{asset_id}")
@@ -1626,6 +1958,7 @@ def get_media(asset_id: str, session: Session = Depends(get_session)) -> FileRes
 
 @app.post("/api/debug/run-daily-cycle")
 def debug_daily(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     result = run_daily_cycle(session, user_id=user_id, character_id=character_id, day=datetime.now())
     logger.info("debug daily cycle user_id=%s character_id=%s result=%s", user_id, character_id, result)
     return {"ok": True, **result}

@@ -34,6 +34,7 @@
     <nav class="admin-nav" aria-label="管理台分页">
       <button type="button" class="active" data-page-target="users">用户数据</button>
       <button type="button" data-page-target="character">角色与音色</button>
+      <button type="button" data-page-target="live2d">Live2D 触摸</button>
       <button type="button" data-page-target="providers">在线服务</button>
       <button type="button" data-page-target="runtime-logs">运行日志</button>
       <button type="button" data-page-target="debug">调试与日志</button>
@@ -129,6 +130,78 @@
       </div>
     </section>
 
+    <section class="admin-page manager" data-page="live2d" hidden id="live2dManager">
+      <header>
+        <div>
+          <p class="eyebrow">Live2D Touch</p>
+          <h2>触摸区域与语音</h2>
+        </div>
+        <span class="badge" id="live2dStatus">等待加载</span>
+      </header>
+      <div class="live2d-toolbar">
+        <label><span>外观</span><select id="live2dAppearanceId"><option value="neko">NEKO Live2D</option><option value="atri">亚托莉 立绘</option><option value="murasame">美月 立绘</option></select></label>
+        <button type="button" id="live2dAddArea">新增部位</button>
+        <button type="button" class="secondary" id="live2dRefreshAreas">刷新</button>
+      </div>
+      <div class="live2d-placement-bar">
+        <label><span>scale</span><input id="live2dPlacementScale" type="number" min="0.25" max="4" step="0.01" value="1.1"></label>
+        <label><span>offsetX</span><input id="live2dPlacementOffsetX" type="number" step="1" value="0"></label>
+        <label><span>offsetY</span><input id="live2dPlacementOffsetY" type="number" step="1" value="-10"></label>
+        <label><span>bottomInset</span><input id="live2dPlacementBottomInset" type="number" min="0" step="1" value="30"></label>
+        <button type="button" class="secondary" id="live2dPlacementReset">重置为手机默认</button>
+        <button type="button" class="secondary" id="live2dPlacementShifted">模拟拖动后</button>
+      </div>
+      <div class="live2d-grid">
+        <aside class="live2d-area-list" id="live2dAreaList"></aside>
+        <div class="live2d-preview-wrap">
+          <div class="live2d-stage" aria-label="Live2D 触摸区域预览">
+            <canvas id="live2dPreviewGl" class="live2d-layer" width="480" height="720"></canvas>
+            <canvas id="live2dPreviewBg" class="live2d-layer" width="480" height="720"></canvas>
+            <canvas id="live2dPreviewOverlay" class="live2d-layer live2d-overlay" width="480" height="720"></canvas>
+          </div>
+          <p class="live2d-preview-hint">坐标为 model space（非屏幕像素）：<strong>0–1 即角色参考框的宽高</strong>，全身请用 left/top=0、right/bottom=1 或点「全身覆盖」。手脚外延可扩至 -0.5–1.5。</p>
+          <form class="live2d-area-form" id="live2dAreaForm">
+            <label><span>area_id</span><input name="area_id" readonly></label>
+            <label><span>显示名</span><input name="label"></label>
+            <label><span>left</span><input name="left" type="number" min="-0.5" max="1.5" step="0.01" title="model space，0–1 为角色参考框"></label>
+            <label><span>top</span><input name="top" type="number" min="-0.5" max="1.5" step="0.01" title="model space，0–1 为角色参考框"></label>
+            <label><span>right</span><input name="right" type="number" min="-0.5" max="1.5" step="0.01" title="model space，0–1 为角色参考框"></label>
+            <label><span>bottom</span><input name="bottom" type="number" min="-0.5" max="1.5" step="0.01" title="model space，0–1 为角色参考框"></label>
+            <label><span>priority</span><input name="priority" type="number" step="1"></label>
+            <label><span>base_cooldown_ms</span><input name="base_cooldown_ms" type="number" step="100"></label>
+            <label class="inline-check"><input type="checkbox" name="enabled" checked><span>启用</span></label>
+            <label class="inline-check"><input type="checkbox" name="flirt_hint"><span>高好感暧昧提示</span></label>
+            <div class="actions live2d-area-actions">
+              <button type="button" class="secondary" id="live2dAreaFullBody">全身覆盖 (0–1)</button>
+              <button type="button" class="secondary" id="live2dAreaShrink">缩小区域</button>
+              <button type="button" class="secondary" id="live2dAreaGrow">放大区域</button>
+              <button type="submit">保存区域</button>
+              <button type="button" class="secondary" data-action="delete-area">删除</button>
+            </div>
+          </form>
+        </div>
+      </div>
+      <section class="live2d-voice-panel">
+        <header>
+          <h3>触摸语音池</h3>
+          <div class="actions live2d-pool-toolbar">
+            <label><span>档位</span><select id="live2dTouchTier"><option value="">当前好感</option><option value="low">low</option><option value="mid">mid</option><option value="high">high</option><option value="all">全部（分栏）</option></select></label>
+            <button type="button" class="secondary" id="live2dReloadPool">刷新列表</button>
+            <button type="button" id="live2dRegeneratePool">重生当前档</button>
+            <button type="button" class="secondary" id="live2dRegeneratePoolAllTiers">重生全部档</button>
+            <button type="button" class="secondary" id="live2dRegeneratePoolAllAreas">重生全部位×全部档</button>
+          </div>
+        </header>
+        <div class="live2d-coverage-panel" id="live2dTouchCoveragePanel">
+          <p class="live2d-pool-meta" id="live2dTouchCoverageMeta">客户端同步覆盖：加载中…</p>
+          <div id="live2dTouchCoverageGrid" class="live2d-coverage-grid"></div>
+        </div>
+        <p class="live2d-pool-meta" id="live2dTouchPoolMeta">请选择左侧部位。</p>
+        <div id="live2dTouchPoolList" class="live2d-pool-list">请选择左侧部位。</div>
+      </section>
+      <pre id="live2dResult">等待 Live2D 操作...</pre>
+    </section>
+
     <section class="admin-page" data-page="providers" hidden>
       <div class="grid" id="providerGrid" aria-label="在线服务配置"></div>
     </section>
@@ -186,6 +259,11 @@
     </section>
   </main>
 
+  <script src="/admin/assets/live2d_hit_test.js"></script>
+  <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pixi.js@7.4.2/dist/pixi.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+  <script src="/admin/assets/live2d_preview.js"></script>
   <script src="/admin/assets/admin.js"></script>
 </body>
 </html>

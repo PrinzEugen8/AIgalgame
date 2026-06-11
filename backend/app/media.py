@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 from sqlalchemy import select
@@ -21,6 +22,7 @@ def save_media(
     prompt: str = "",
     source_event_id: str = "",
     ai_generated: bool = False,
+    reference_image_ids: list[str] | None = None,
 ) -> MediaAsset:
     if cache_key:
         existing = session.execute(select(MediaAsset).where(MediaAsset.local_cache_key == cache_key)).scalar_one_or_none()
@@ -41,13 +43,23 @@ def save_media(
         prompt=prompt,
         source_event_id=source_event_id,
         ai_generated=ai_generated,
+        reference_image_ids_json=json.dumps(reference_image_ids or [], ensure_ascii=False, separators=(",", ":")),
     )
     session.add(asset)
     session.commit()
     return asset
 
 
-def media_from_base64(session: Session, *, asset_type: str, b64: str, extension: str, prompt: str) -> MediaAsset:
+def media_from_base64(
+    session: Session,
+    *,
+    asset_type: str,
+    b64: str,
+    extension: str,
+    prompt: str,
+    source_event_id: str = "",
+    reference_image_ids: list[str] | None = None,
+) -> MediaAsset:
     return save_media(
         session,
         asset_type=asset_type,
@@ -55,6 +67,7 @@ def media_from_base64(session: Session, *, asset_type: str, b64: str, extension:
         extension=extension,
         cache_key=stable_hash(asset_type, prompt, b64[:64]),
         prompt=prompt,
+        source_event_id=source_event_id,
         ai_generated=True,
+        reference_image_ids=reference_image_ids,
     )
-

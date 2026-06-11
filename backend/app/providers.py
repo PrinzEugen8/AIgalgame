@@ -9,6 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -31,7 +32,8 @@ class ProviderError(RuntimeError):
 HTTP_TRANSPORT: httpx.BaseTransport | None = None
 JSON_RESPONSE_FORMAT = {"type": "json_object"}
 JSON_MIN_MAX_TOKENS = 256
-JSON_RETRY_MAX_TOKENS = 4096
+JSON_RETRY_MAX_TOKENS = 8192
+TEXT_RETRY_MAX_TOKENS = 4096
 JSON_OUTPUT_INSTRUCTION = (
     "JSON Output mode is required. Return exactly one valid json object matching the user's requested schema. "
     "Use double-quoted keys and strings. Do not include markdown, code fences, comments, or extra text. "
@@ -432,7 +434,7 @@ def provider_presets() -> dict[str, Any]:
                     _field("base_url", "Images API Base URL", "core", default="https://ark.cn-beijing.volces.com/api/v3", required=True),
                     _field("model", "Seedream 模型", "core", default="doubao-seedream-5-0-260128", required=True),
                     _field("api_key", "Ark API Key", "secret", required=True),
-                    _field("size", "尺寸", "metadata", default="1024x1024"),
+                    _field("size", "尺寸", "metadata", default="1920x1920"),
                     _field("output_format", "输出格式", "metadata", type_="select", default="png", options=["png", "jpeg", "webp"]),
                     _field("response_format", "响应格式", "metadata", type_="select", default="url", options=["url", "b64_json"]),
                     _field("watermark", "水印", "metadata", type_="checkbox", default=False),
@@ -1012,6 +1014,17 @@ class OpenAICompatibleClient:
         if isinstance(extra_body, dict):
             body.update({key: value for key, value in extra_body.items() if key != "response_format"})
         started = time.monotonic()
+        try:
+            requested_max_tokens = int(body.get("max_tokens") or max_tokens)
+        except (TypeError, ValueError):
+            requested_max_tokens = max_tokens
+            body["max_tokens"] = requested_max_tokens
+        retry_max_tokens = max(requested_max_tokens * 4, 1024)
+        try:
+            retry_cap = int(self.metadata.get("text_retry_max_tokens") or TEXT_RETRY_MAX_TOKENS)
+        except (TypeError, ValueError):
+            retry_cap = TEXT_RETRY_MAX_TOKENS
+        retry_max_tokens = min(max(retry_max_tokens, requested_max_tokens), max(retry_cap, requested_max_tokens))
         diag = diagnostic or {}
         feature = str(diag.get("feature") or "LLM")
         stage = str(diag.get("stage") or "chat_text")
@@ -1031,32 +1044,53 @@ class OpenAICompatibleClient:
             input=diag.get("input") or {},
             references=diag.get("references") or {},
         ) as span:
+            attempts: list[dict[str, Any]] = []
+            content = ""
+            finish_reason = ""
+            response_payload: dict[str, Any] = {}
             with _client(float(self.metadata.get("timeout", 30.0))) as client:
-                try:
-                    response = client.post(
-                        self._url("chat/completions"),
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=body,
-                    )
-                    response.raise_for_status()
-                except Exception as exc:
+                for attempt in range(1, 3):
+                    request_body = dict(body)
+                    if attempt == 2:
+                        request_body["max_tokens"] = retry_max_tokens
+                    try:
+                        response = client.post(
+                            self._url("chat/completions"),
+                            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                            json=request_body,
+                        )
+                        response.raise_for_status()
+                    except Exception as exc:
+                        write_diagnostic(
+                            "llm_text_error",
+                            provider_id=self.config.provider_id,
+                            model=self.config.model,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                        raise
+                    response_payload = response.json()
+                    choice = response_payload["choices"][0]
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    content = str(choice["message"].get("content") or "").strip()
+                    attempts.append({"attempt": attempt, "max_tokens": request_body.get("max_tokens"), "finish_reason": finish_reason, "chars": len(content)})
+                    if content or finish_reason != "length" or attempt == 2:
+                        break
                     write_diagnostic(
-                        "llm_text_error",
+                        "llm_text_retry",
                         provider_id=self.config.provider_id,
                         model=self.config.model,
-                        elapsed_ms=int((time.monotonic() - started) * 1000),
-                        error_type=type(exc).__name__,
-                        message=str(exc),
+                        reason="empty_content_length",
+                        requested_max_tokens=requested_max_tokens,
+                        retry_max_tokens=retry_max_tokens,
                     )
-                    raise
-            response_payload = response.json()
-            choice = response_payload["choices"][0]
-            content = str(choice["message"]["content"] or "").strip()
             span.add(
                 response_text=content,
                 raw_response=response_payload,
-                finish_reason=choice.get("finish_reason", ""),
+                finish_reason=finish_reason,
                 chars=len(content),
+                attempts=attempts,
             )
             write_diagnostic(
                 "llm_text_ok",
@@ -1064,7 +1098,8 @@ class OpenAICompatibleClient:
                 model=self.config.model,
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 chars=len(content),
-                finish_reason=choice.get("finish_reason", ""),
+                finish_reason=finish_reason,
+                attempts=attempts,
                 raw_preview=content[:120],
             )
         return content
@@ -2288,6 +2323,22 @@ def _image_extension_from_response(response: httpx.Response, fallback: str) -> s
     return fallback.lstrip(".") or "png"
 
 
+def _image_data_url(path: Path) -> str:
+    if not path.exists():
+        raise ProviderError(f"Reference image not found: {path}")
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _image_inputs(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
 class ImageProvider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
@@ -2296,7 +2347,16 @@ class ImageProvider:
         if not self.api_key:
             raise ProviderError("Image provider API key is not configured")
 
-    def generate(self, session: Session, prompt: str) -> MediaAsset:
+    def generate(
+        self,
+        session: Session,
+        prompt: str,
+        *,
+        asset_type: str = "experience_cg",
+        source_event_id: str = "",
+        reference_image_path: Path | str | None = None,
+        reference_image_ids: list[str] | None = None,
+    ) -> MediaAsset:
         with diagnostic_span(
             "image_request",
             feature="图片生成",
@@ -2306,47 +2366,90 @@ class ImageProvider:
             provider_id=self.config.provider_id,
             provider=self.config.provider,
             model=self.config.model,
-            request={"prompt": prompt, "metadata": self.metadata},
+            request={
+                "prompt": prompt,
+                "metadata": self.metadata,
+                "asset_type": asset_type,
+                "source_event_id": source_event_id,
+                "reference_image_ids": reference_image_ids or [],
+                "has_reference_image": reference_image_path is not None,
+            },
         ) as span:
             if self.config.provider == "doubao_seedream":
-                asset = self._generate_doubao_seedream(session, prompt)
+                asset = self._generate_doubao_seedream(
+                    session,
+                    prompt,
+                    asset_type=asset_type,
+                    source_event_id=source_event_id,
+                    reference_image_path=Path(reference_image_path) if reference_image_path is not None else None,
+                    reference_image_ids=reference_image_ids or [],
+                )
             elif self.config.provider == "openai_gpt_image":
+                if reference_image_path is not None:
+                    raise ProviderError("OpenAI image generation reference images are not implemented in this backend")
                 asset = self._generate_openai_image(session, prompt)
             elif self.config.provider == "gemini_image":
+                if reference_image_path is not None:
+                    raise ProviderError("Gemini image generation reference images are not implemented in this backend")
                 asset = self._generate_gemini_image(session, prompt)
             else:
                 raise ProviderError(f"Unsupported image provider: {self.config.provider}")
             span.add(response={"asset_id": asset.asset_id, "url": asset.url, "asset_type": asset.asset_type})
             return asset
 
-    def _save_downloaded_url(self, session: Session, client: httpx.Client, url: str, prompt: str, fallback_ext: str) -> MediaAsset:
+    def _save_downloaded_url(
+        self,
+        session: Session,
+        client: httpx.Client,
+        url: str,
+        prompt: str,
+        fallback_ext: str,
+        *,
+        asset_type: str,
+        source_event_id: str = "",
+        reference_image_ids: list[str] | None = None,
+    ) -> MediaAsset:
         image_response = client.get(url)
         image_response.raise_for_status()
         extension = _image_extension_from_response(image_response, fallback_ext)
         return save_media(
             session,
-            asset_type="experience_cg",
+            asset_type=asset_type,
             content=image_response.content,
             extension=extension,
             cache_key=stable_hash("image_url", url),
             prompt=prompt,
+            source_event_id=source_event_id,
             ai_generated=True,
+            reference_image_ids=reference_image_ids,
         )
 
-    def _generate_doubao_seedream(self, session: Session, prompt: str) -> MediaAsset:
+    def _generate_doubao_seedream(
+        self,
+        session: Session,
+        prompt: str,
+        *,
+        asset_type: str,
+        source_event_id: str,
+        reference_image_path: Path | None,
+        reference_image_ids: list[str],
+    ) -> MediaAsset:
         base = self.config.base_url or "https://ark.cn-beijing.volces.com/api/v3"
         body: dict[str, Any] = {
             "model": self.config.model or "doubao-seedream-5-0-260128",
             "prompt": prompt,
-            "size": self.metadata.get("size") or "1024x1024",
+            "size": self.metadata.get("size") or "1920x1920",
             "response_format": self.metadata.get("response_format") or "url",
             "watermark": _as_bool(self.metadata.get("watermark"), False),
         }
         output_format = str(self.metadata.get("output_format") or "png")
         if output_format:
             body["output_format"] = output_format
-        if self.metadata.get("image"):
-            body["image"] = self.metadata["image"]
+        image_inputs = _image_inputs(self.metadata.get("image"))
+        if reference_image_path is not None:
+            image_inputs.append(_image_data_url(reference_image_path))
+        if image_inputs:
+            body["image"] = image_inputs
         with _client(float(self.metadata.get("timeout", 120.0))) as client:
             response = client.post(
                 f"{base.rstrip('/')}/images/generations",
@@ -2357,9 +2460,26 @@ class ImageProvider:
             data = response.json()
             item = (data.get("data") or [{}])[0]
             if item.get("b64_json"):
-                return media_from_base64(session, asset_type="experience_cg", b64=item["b64_json"], extension=output_format, prompt=prompt)
+                return media_from_base64(
+                    session,
+                    asset_type=asset_type,
+                    b64=item["b64_json"],
+                    extension=output_format,
+                    prompt=prompt,
+                    source_event_id=source_event_id,
+                    reference_image_ids=reference_image_ids,
+                )
             if item.get("url"):
-                return self._save_downloaded_url(session, client, str(item["url"]), prompt, output_format)
+                return self._save_downloaded_url(
+                    session,
+                    client,
+                    str(item["url"]),
+                    prompt,
+                    output_format,
+                    asset_type=asset_type,
+                    source_event_id=source_event_id,
+                    reference_image_ids=reference_image_ids,
+                )
         raise ProviderError("Doubao Seedream did not return image url or b64_json")
 
     def _generate_openai_image(self, session: Session, prompt: str) -> MediaAsset:
@@ -2386,7 +2506,14 @@ class ImageProvider:
             if item.get("b64_json"):
                 return media_from_base64(session, asset_type="experience_cg", b64=item["b64_json"], extension=output_format, prompt=prompt)
             if item.get("url"):
-                return self._save_downloaded_url(session, client, str(item["url"]), prompt, output_format)
+                return self._save_downloaded_url(
+                    session,
+                    client,
+                    str(item["url"]),
+                    prompt,
+                    output_format,
+                    asset_type="experience_cg",
+                )
         raise ProviderError("OpenAI image response did not contain b64_json or url")
 
     def _generate_gemini_image(self, session: Session, prompt: str) -> MediaAsset:

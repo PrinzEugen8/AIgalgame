@@ -1,5 +1,7 @@
 package com.aigalgame.demo
 
+import org.json.JSONObject
+
 data class DialogueLine(
     val id: String,
     val text: String,
@@ -130,7 +132,8 @@ data class Live2DHitArea(
     val left: Float,
     val top: Float,
     val right: Float,
-    val bottom: Float
+    val bottom: Float,
+    val priority: Int = 0
 ) {
     fun contains(x: Float, y: Float): Boolean {
         return x in left..right && y in top..bottom
@@ -159,12 +162,21 @@ data class Live2DReaction(
     val motion: String,
     val expression: String,
     val text: String,
-    val relationDelta: RelationDelta
+    val relationDelta: RelationDelta,
+    val cooldownMs: Long = 0L,
+    val ttsUrl: String = "",
+    val ttsDurationMs: Long = 0L
 )
 
 data class Live2DSpeechState(
     val active: Boolean = false,
     val mouthOpen: Float = 0f
+)
+
+data class TouchCooldownRequest(
+    val hitArea: String,
+    val cooldownMs: Long,
+    val token: Long = System.currentTimeMillis()
 )
 
 private const val OutfitPlacementMinScale = 0.25f
@@ -211,4 +223,51 @@ enum class AppScreen {
     Moments,
     Calendar,
     Journal
+}
+
+fun JSONObject.parseLive2dHitAreas(): List<Live2DHitArea> {
+    val areas = optJSONArray("hit_areas") ?: return emptyList()
+    return buildList {
+        for (index in 0 until areas.length()) {
+            val item = areas.optJSONObject(index) ?: continue
+            add(
+                Live2DHitArea(
+                    id = item.optString("id", item.optString("area_id")),
+                    label = item.optString("label"),
+                    left = item.optDouble("left").toFloat(),
+                    top = item.optDouble("top").toFloat(),
+                    right = item.optDouble("right").toFloat(),
+                    bottom = item.optDouble("bottom").toFloat(),
+                    priority = item.optInt("priority"),
+                )
+            )
+        }
+    }
+}
+
+fun JSONObject.parseLive2dReactions(): List<Live2DReactionConfig> {
+    val areas = optJSONArray("hit_areas") ?: return emptyList()
+    return buildList {
+        for (index in 0 until areas.length()) {
+            val item = areas.optJSONObject(index) ?: continue
+            val hitArea = item.optString("id", item.optString("area_id"))
+            val reactions = item.optJSONArray("reactions") ?: continue
+            for (reactionIndex in 0 until reactions.length()) {
+                val reaction = reactions.optJSONObject(reactionIndex) ?: continue
+                add(
+                    Live2DReactionConfig(
+                        hitArea = hitArea,
+                        intensity = when (reaction.optString("intensity")) {
+                            "flirty" -> Live2DReactionIntensity.Flirty
+                            "boundary" -> Live2DReactionIntensity.Boundary
+                            else -> Live2DReactionIntensity.Soft
+                        },
+                        motion = reaction.optString("motion"),
+                        expression = reaction.optString("expression"),
+                        cooldownMs = reaction.optLong("cooldown_ms", item.optLong("base_cooldown_ms", 1400L)),
+                    )
+                )
+            }
+        }
+    }
 }

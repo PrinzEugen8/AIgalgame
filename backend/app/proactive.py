@@ -522,6 +522,13 @@ def _event_payload(event: ProactiveEvent) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def proactive_media_asset_id(event: ProactiveEvent | None) -> str:
+    if event is None:
+        return ""
+    payload = _event_payload(event)
+    return str(payload.get("proactive_media_asset_id") or payload.get("media_asset_id") or "").strip()
+
+
 def _source_type_rank(source_type: str) -> int:
     return SOURCE_TYPE_RANK.get(source_type, 9)
 

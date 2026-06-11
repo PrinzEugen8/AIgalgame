@@ -87,7 +87,7 @@ def _upgrade_sqlite_schema() -> None:
             columns = {item["name"] for item in inspector.get_columns("proactive_events")}
             additions = {
                 "user_id": "VARCHAR DEFAULT 'demo_user'",
-                "character_id": "VARCHAR DEFAULT 'sakura'",
+                "character_id": "VARCHAR DEFAULT 'atri'",
                 "source_type": "VARCHAR DEFAULT ''",
                 "source_id": "VARCHAR DEFAULT ''",
                 "title": "VARCHAR DEFAULT ''",
@@ -110,6 +110,10 @@ def _upgrade_sqlite_schema() -> None:
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE proactive_events ADD COLUMN {name} {definition}"))
+        if "touch_reaction_pools" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("touch_reaction_pools")}
+            if "voice_profile_id" not in columns:
+                conn.execute(text("ALTER TABLE touch_reaction_pools ADD COLUMN voice_profile_id VARCHAR DEFAULT ''"))
         if "trend_radar_snapshots" in table_names:
             columns = {item["name"] for item in inspector.get_columns("trend_radar_snapshots")}
             additions = {

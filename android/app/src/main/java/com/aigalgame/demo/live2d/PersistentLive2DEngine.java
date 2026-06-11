@@ -225,7 +225,7 @@ public final class PersistentLive2DEngine {
     }
 
     private static final class RenderThread extends Thread {
-        private static final long IDLE_FRAME_MS = 34L;
+        private static final long IDLE_FRAME_MS = 24L;
         private static final long FAST_FRAME_MS = 17L;
         private static final long PAUSED_FRAME_MS = 160L;
 

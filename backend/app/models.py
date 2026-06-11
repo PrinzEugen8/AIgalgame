@@ -38,7 +38,7 @@ class Character(Base):
     __tablename__ = "characters"
 
     character_id: Mapped[str] = mapped_column(String, primary_key=True)
-    name: Mapped[str] = mapped_column(String, default="小樱")
+    name: Mapped[str] = mapped_column(String, default="亚托莉")
     age_setting: Mapped[str] = mapped_column(String, default="18+")
     persona_prompt: Mapped[str] = mapped_column(Text)
     persona_card_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -168,8 +168,8 @@ class Moment(Base):
 
     moment_id: Mapped[str] = mapped_column(String, primary_key=True)
     author_type: Mapped[str] = mapped_column(String, default="heroine")
-    author_id: Mapped[str] = mapped_column(String, default="sakura")
-    author_name: Mapped[str] = mapped_column(String, default="小樱")
+    author_id: Mapped[str] = mapped_column(String, default="atri")
+    author_name: Mapped[str] = mapped_column(String, default="亚托莉")
     text: Mapped[str] = mapped_column(Text)
     media_asset_id: Mapped[str] = mapped_column(String, default="")
     source_experience_id: Mapped[str] = mapped_column(String, default="")
@@ -333,6 +333,28 @@ class TrendRadarSnapshot(Base):
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
+class Live2DHitAreaConfig(Base):
+    __tablename__ = "live2d_hit_area_configs"
+
+    area_id: Mapped[str] = mapped_column(String, primary_key=True)
+    character_id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+    label: Mapped[str] = mapped_column(String, default="")
+    left: Mapped[float] = mapped_column(Float, default=0.0)
+    top: Mapped[float] = mapped_column(Float, default=0.0)
+    right: Mapped[float] = mapped_column(Float, default=1.0)
+    bottom: Mapped[float] = mapped_column(Float, default=1.0)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    default_motion: Mapped[str] = mapped_column(String, default="idle")
+    default_expression: Mapped[str] = mapped_column(String, default="calm")
+    base_cooldown_ms: Mapped[int] = mapped_column(Integer, default=1400)
+    tap_motions_json: Mapped[str] = mapped_column(Text, default="[]")
+    reactions_json: Mapped[str] = mapped_column(Text, default="[]")
+    flirt_hint: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
 class TouchReactionPool(Base):
     __tablename__ = "touch_reaction_pools"
 
@@ -341,6 +363,7 @@ class TouchReactionPool(Base):
     character_id: Mapped[str] = mapped_column(String, index=True)
     hit_area: Mapped[str] = mapped_column(String, index=True)
     tier: Mapped[str] = mapped_column(String, index=True)
+    voice_profile_id: Mapped[str] = mapped_column(String, default="", index=True)
     lines_json: Mapped[str] = mapped_column(Text, default="[]")
     consumed_indices_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)

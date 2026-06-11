@@ -8,10 +8,11 @@ from sqlalchemy.orm import Session
 
 from .calendar_events import ensure_calendar_proactive_candidates
 from .diagnostics import diagnostic_span, write_diagnostic
+from .image_generation import ImageRequestBlocked, generate_safe_image, infer_image_kind, normalize_image_kind
 from .models import Character, Experience, Memory, Moment, MomentInteraction, ScheduleSlot
 from .proactive import create_schedule_proactive_event
-from .providers import ImageProvider, OpenAICompatibleClient, get_enabled_provider, get_task_llm_provider
-from .utils import uid
+from .providers import OpenAICompatibleClient, get_enabled_provider, get_task_llm_provider
+from .utils import dump_json, load_json, uid
 from .weather import ensure_weather_candidate, refresh_weather_snapshot
 
 
@@ -149,7 +150,9 @@ def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, sl
 {{
   "text": "小樱发的朋友圈正文，中文，1到2句，不要像公告",
   "mood": "开心|平静|害羞|低落|兴奋",
-  "photo_prompt": "可选，给图片生成模型的简短中文或英文提示词",
+  "photo_kind": "可选，只能是 scenery、object_pet、character_selfie 或空字符串",
+  "photo_prompt": "可选，只写短提示：风景、物品/宠物、或角色自拍；统一动漫风；不要写成开放式任意生图指令",
+  "proactive_photo_prompt": "可选，主动事件聊天里展示的 CG 短提示；可以和 photo_prompt 不同",
   "likes": ["AI NPC 名称1", "AI NPC 名称2"],
   "comments": [
     {{"actor_name": "AI NPC 名称", "content": "自然短评论"}}
@@ -199,6 +202,7 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
     weather_event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=day) if weather_snapshot is not None else None
     calendar_events = ensure_calendar_proactive_candidates(session, user_id=user_id, character_id=character_id, local_time=day)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
+    character = session.get(Character, character_id)
     slots = session.execute(
         select(ScheduleSlot).where(
             ScheduleSlot.user_id == user_id,
@@ -255,17 +259,64 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
             created_experiences += 1
             continue
         media_asset_id = ""
-        photo_prompt = str(payload.get("photo_prompt") or "").strip()
+        proactive_media_asset_id = ""
+        fallback_photo_prompt = "，".join(
+            item
+            for item in (slot.activity_title, slot.location, exp.summary)
+            if str(item or "").strip()
+        )
+        photo_prompt = str(payload.get("photo_prompt") or "").strip() or fallback_photo_prompt
+        proactive_photo_prompt = str(payload.get("proactive_photo_prompt") or "").strip() or photo_prompt
         if slot.can_generate_photo and photo_prompt:
             image_config = get_enabled_provider(session, "image")
             if image_config is not None:
                 try:
-                    image = ImageProvider(image_config).generate(session, photo_prompt)
+                    requested_kind = str(payload.get("photo_kind") or "").strip()
+                    image_kind = normalize_image_kind(requested_kind) if requested_kind else infer_image_kind(photo_prompt)
+                    image = generate_safe_image(
+                        session,
+                        config=image_config,
+                        kind=image_kind,
+                        scene_hint=photo_prompt,
+                        character=character,
+                        user_id=user_id,
+                        character_id=character_id,
+                        source_id=f"{slot.slot_id}:moment",
+                        mood=str(payload.get("mood") or exp.emotional_result),
+                        cooldown_seconds=0,
+                    )
                     media_asset_id = image.asset_id
+                except ImageRequestBlocked as exc:
+                    logger.info("daily cycle image skipped slot_id=%s reason=%s", slot.slot_id, exc)
+                    write_diagnostic("moment_image_skipped", slot_id=slot.slot_id, activity=slot.activity_title, reason=str(exc))
                 except Exception:
                     logger.exception("daily cycle image generation failed slot_id=%s", slot.slot_id)
                     write_diagnostic("moment_image_error", slot_id=slot.slot_id, activity=slot.activity_title)
                     media_asset_id = ""
+                if proactive is not None and proactive.source_id == exp.experience_id and proactive_photo_prompt:
+                    try:
+                        requested_kind = str(payload.get("proactive_photo_kind") or payload.get("photo_kind") or "").strip()
+                        proactive_image_kind = normalize_image_kind(requested_kind) if requested_kind else infer_image_kind(proactive_photo_prompt)
+                        proactive_image = generate_safe_image(
+                            session,
+                            config=image_config,
+                            kind=proactive_image_kind,
+                            scene_hint=proactive_photo_prompt,
+                            character=character,
+                            user_id=user_id,
+                            character_id=character_id,
+                            source_id=f"{slot.slot_id}:proactive",
+                            mood=str(payload.get("mood") or exp.emotional_result),
+                            cooldown_seconds=0,
+                        )
+                        proactive_media_asset_id = proactive_image.asset_id
+                    except ImageRequestBlocked as exc:
+                        logger.info("daily cycle proactive image skipped slot_id=%s reason=%s", slot.slot_id, exc)
+                        write_diagnostic("proactive_image_skipped", slot_id=slot.slot_id, activity=slot.activity_title, reason=str(exc))
+                    except Exception:
+                        logger.exception("daily cycle proactive image generation failed slot_id=%s", slot.slot_id)
+                        write_diagnostic("proactive_image_error", slot_id=slot.slot_id, activity=slot.activity_title)
+                        proactive_media_asset_id = ""
         moment = Moment(
             moment_id=uid("moment"),
             text=str(payload.get("text") or "").strip(),
@@ -274,6 +325,20 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
             mood_snapshot=str(payload.get("mood") or exp.emotional_result),
         )
         session.add(moment)
+        if proactive is not None and proactive.source_id == exp.experience_id:
+            proactive_payload = load_json(proactive.payload_json, {})
+            if not isinstance(proactive_payload, dict):
+                proactive_payload = {}
+            proactive_payload.update(
+                {
+                    "moment_id": moment.moment_id,
+                    "moment_media_asset_id": media_asset_id,
+                    "proactive_media_asset_id": proactive_media_asset_id,
+                    "media_asset_id": proactive_media_asset_id,
+                    "has_media": bool(proactive_media_asset_id),
+                }
+            )
+            proactive.payload_json = dump_json(proactive_payload)
         for index, name in enumerate((payload.get("likes") or [])[:8]):
             actor_name = _npc_name(name, index)
             session.add(

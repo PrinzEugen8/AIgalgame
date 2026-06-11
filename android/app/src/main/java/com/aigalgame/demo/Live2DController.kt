@@ -50,6 +50,10 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
     private val cooldownUntilByHitArea = mutableMapOf<String, Long>()
     private var commandNonce = 0L
     private var lookResetAtMs = 0L
+    private var remoteHitAreas: List<Live2DHitArea>? = null
+    private var remoteReactions: List<Live2DReactionConfig>? = null
+    private var lastMotionKey: String = "idle"
+    private var lastExpressionKey: String = "calm"
 
     var state by mutableStateOf(Live2DRenderState())
         private set
@@ -86,6 +90,11 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         )
     }
 
+    fun applyRemoteConfig(hitAreas: List<Live2DHitArea>, reactions: List<Live2DReactionConfig>) {
+        remoteHitAreas = hitAreas
+        remoteReactions = reactions
+    }
+
     fun applyLine(line: DialogueLine?) {
         if (line == null) {
             applyEmotionPose("calm", "idle", explicitMotion = "", explicitExpression = "")
@@ -110,6 +119,25 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         )
     }
 
+    fun updateGazeFromTap(
+        normalizedX: Float,
+        normalizedY: Float,
+        placement: OutfitPlacement,
+        nowMs: Long
+    ) {
+        val (modelX, modelY) = Live2DHitTest.mapScreenToModelSpace(normalizedX, normalizedY, placement)
+        lookResetAtMs = nowMs + 2500L
+        state = state.copy(
+            lookX = ((modelX - 0.5f) * 2f).coerceIn(-1f, 1f),
+            lookY = ((0.5f - modelY) * 2f).coerceIn(-1f, 1f)
+        )
+    }
+
+    fun applyTouchCooldown(hitArea: String, cooldownMs: Long, nowMs: Long) {
+        if (cooldownMs <= 0L) return
+        cooldownUntilByHitArea[hitArea] = nowMs + cooldownMs
+    }
+
     fun handleTap(
         normalizedX: Float,
         normalizedY: Float,
@@ -117,13 +145,16 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         relation: RelationState,
         nowMs: Long
     ): Live2DReaction? {
+        updateGazeFromTap(normalizedX, normalizedY, placement, nowMs)
         val (modelX, modelY) = Live2DHitTest.mapScreenToModelSpace(normalizedX, normalizedY, placement)
-        val hitArea = config.hitAreas.firstOrNull { it.contains(modelX, modelY) } ?: return null
+        val hitArea = activeHitAreas()
+            .sortedByDescending { it.priority }
+            .firstOrNull { it.contains(modelX, modelY) }
+            ?: return null
         val cooldownUntil = cooldownUntilByHitArea[hitArea.id] ?: 0L
-        if (nowMs < cooldownUntil) return null
+        if (nowMs < cooldownUntil || state.nowSpeaking) return null
 
         val reactionConfig = chooseReaction(hitArea.id, relation, nowMs) ?: return null
-        cooldownUntilByHitArea[hitArea.id] = nowMs + max(0L, reactionConfig.cooldownMs)
         val tapMotion = chooseTapMotion(hitArea.id, nowMs)
         val reaction = Live2DReaction(
             hitArea = hitArea.id,
@@ -131,14 +162,13 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
             motion = tapMotion.ifBlank { reactionConfig.motion },
             expression = reactionConfig.expression,
             text = "",
-            relationDelta = RelationDelta()
+            relationDelta = RelationDelta(),
+            cooldownMs = reactionConfig.cooldownMs
         )
-        lookResetAtMs = nowMs + 2500L
+        applyTouchCooldown(hitArea.id, reactionConfig.cooldownMs, nowMs)
         state = state.copy(
             motion = reaction.motion.ifBlank { state.motion },
             expression = reaction.expression.ifBlank { state.expression },
-            lookX = ((modelX - 0.5f) * 2f).coerceIn(-1f, 1f),
-            lookY = ((0.5f - modelY) * 2f).coerceIn(-1f, 1f),
             lastHitArea = hitArea.id,
             commandNonce = nextCommandNonce(nowMs)
         )
@@ -152,11 +182,15 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         val decayedX = state.lookX * 0.9f
         val decayedY = state.lookY * 0.9f
         if (abs(decayedX) < 0.02f && abs(decayedY) < 0.02f) {
-            state = state.copy(lookX = 0f, lookY = 0f, commandNonce = nextCommandNonce(nowMs))
+            state = state.copy(lookX = 0f, lookY = 0f)
         } else {
-            state = state.copy(lookX = decayedX, lookY = decayedY, commandNonce = nextCommandNonce(nowMs))
+            state = state.copy(lookX = decayedX, lookY = decayedY)
         }
     }
+
+    private fun activeHitAreas(): List<Live2DHitArea> = remoteHitAreas ?: config.hitAreas
+
+    private fun activeReactions(): List<Live2DReactionConfig> = remoteReactions ?: config.reactions
 
     private fun applyEmotionPose(
         emotion: String,
@@ -170,10 +204,14 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         val nextMotion = explicitMotion.ifBlank {
             mappedPoseMotion.ifBlank { emotionBinding?.motion.orEmpty().ifBlank { "idle" } }
         }
+        val motionChanged = nextMotion != lastMotionKey
+        val expressionChanged = nextExpression != lastExpressionKey
+        lastMotionKey = nextMotion
+        lastExpressionKey = nextExpression
         state = state.copy(
             expression = nextExpression,
             motion = nextMotion,
-            commandNonce = nextCommandNonce()
+            commandNonce = if (motionChanged || expressionChanged) nextCommandNonce() else state.commandNonce
         )
     }
 
@@ -183,10 +221,10 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
     }
 
     private fun chooseReaction(hitArea: String, relation: RelationState, nowMs: Long): Live2DReactionConfig? {
-        val candidates = config.reactions.filter { it.hitArea == hitArea }
+        val candidates = activeReactions().filter { it.hitArea == hitArea }
         if (candidates.isEmpty()) return null
         if (hitArea == "chest") {
-            val desired = if (relation.affection >= 60 && relation.trust >= 35) {
+            val desired = if (relation.affection >= 70 && relation.trust >= 35) {
                 Live2DReactionIntensity.Flirty
             } else {
                 Live2DReactionIntensity.Boundary
@@ -210,7 +248,6 @@ class Live2DController(context: Context, initialCharacter: String = Live2DCharac
         }
         return candidates.last().motion
     }
-
 }
 
 private fun Context.assetExists(path: String): Boolean {

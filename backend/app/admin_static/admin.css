@@ -950,6 +950,226 @@ pre {
   width: 100%;
 }
 
+.live2d-toolbar,
+.live2d-area-form {
+  display: grid;
+  gap: 12px;
+}
+
+.live2d-toolbar {
+  grid-template-columns: minmax(180px, 240px) auto auto;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.live2d-placement-bar {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) auto auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.live2d-stage {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  aspect-ratio: 480 / 720;
+}
+
+.live2d-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 16px;
+}
+
+.live2d-overlay {
+  border: 1px solid rgba(68, 84, 106, 0.22);
+  background: transparent;
+  touch-action: none;
+  cursor: default;
+}
+
+#live2dPreviewGl,
+#live2dPreviewBg {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #111;
+}
+
+.live2d-grid {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.live2d-area-list {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+
+.live2d-area-item {
+  border: 1px solid rgba(68, 84, 106, 0.22);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: #eef2f7;
+  color: #344252;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  display: grid;
+  gap: 4px;
+}
+
+.live2d-area-item strong {
+  color: #26313d;
+  font-size: 14px;
+}
+
+.live2d-area-item small {
+  color: #607083;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.live2d-area-item:hover {
+  border-color: rgba(217, 95, 118, 0.45);
+  background: #f7f9fc;
+}
+
+.live2d-area-item.active {
+  border-color: #d95f76;
+  background: #fff1f4;
+  box-shadow: inset 0 0 0 1px rgba(217, 95, 118, 0.18);
+}
+
+.live2d-area-item.active strong {
+  color: #bd4f66;
+}
+
+.live2d-preview-hint {
+  margin: 0;
+  color: #607083;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.live2d-area-actions {
+  grid-column: 1 / -1;
+}
+
+.live2d-preview-wrap {
+  display: grid;
+  gap: 12px;
+}
+
+
+.live2d-area-form {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.live2d-voice-panel {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 16px;
+}
+
+.live2d-pool-toolbar {
+  flex-wrap: wrap;
+  align-items: end;
+}
+
+.live2d-pool-meta {
+  margin: 0 0 10px;
+  color: #607083;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.live2d-coverage-panel {
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid rgba(68, 84, 106, 0.14);
+  border-radius: 12px;
+  background: #f7f9fc;
+}
+
+.live2d-coverage-grid {
+  overflow-x: auto;
+}
+
+.live2d-coverage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.live2d-coverage-table th,
+.live2d-coverage-table td {
+  border: 1px solid rgba(68, 84, 106, 0.16);
+  padding: 6px 10px;
+  text-align: center;
+}
+
+.live2d-coverage-table th:first-child,
+.live2d-coverage-table td:first-child {
+  text-align: left;
+}
+
+.live2d-coverage-table .coverage-ok {
+  background: #e8f7ee;
+  color: #1f6b42;
+  font-weight: 600;
+}
+
+.live2d-coverage-table .coverage-miss {
+  background: #fff1f0;
+  color: #9a3b3b;
+}
+
+.live2d-pool-list {
+  display: grid;
+  gap: 10px;
+}
+
+.live2d-pool-tier-group {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(68, 84, 106, 0.14);
+  border-radius: 12px;
+  background: #f7f9fc;
+}
+
+.live2d-pool-tier-group h4 {
+  margin: 0;
+  font-size: 14px;
+  color: #344252;
+}
+
+.live2d-pool-ja {
+  display: block;
+  color: #607083;
+  margin-top: -4px;
+  margin-bottom: 8px;
+}
+
+.live2d-pool-item {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.live2d-pool-item header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
 @media (max-width: 860px) {
   .hero,
   .grid,
@@ -963,7 +1183,11 @@ pre {
   .table-toolbar,
   .runtime-toolbar,
   .runtime-trace-summary,
-  .runtime-detail-grid {
+  .runtime-detail-grid,
+  .live2d-grid,
+  .live2d-area-form,
+  .live2d-toolbar,
+  .live2d-placement-bar {
     grid-template-columns: 1fr;
   }
 

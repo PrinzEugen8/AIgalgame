@@ -20,13 +20,22 @@ from app import providers, schedule as schedule_module, scheduler as scheduler_m
 from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.diagnostics import diagnostic_path, diagnostic_span, runtime_logs, write_diagnostic  # noqa: E402
+from app.image_generation import build_safe_image_request, generate_safe_image  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import CalendarEvent, Character, DeviceRegistration, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveDeliveryAttempt, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TrendRadarSnapshot, TtsVoiceProfile, User, UserCommitment, UserLocation, WeatherSnapshot  # noqa: E402
+from app.models import CalendarEvent, Character, DeviceRegistration, Experience, MediaAsset, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveDeliveryAttempt, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TouchReactionPool, TrendRadarSnapshot, TtsVoiceProfile, User, UserCommitment, UserLocation, WeatherSnapshot  # noqa: E402
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _normalize_line_text, _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
-from app.touch_reactions import consume_touch_reaction, refresh_touch_reaction_pools  # noqa: E402
+from app.opening import _instant_greeting_payload  # noqa: E402
+from app.touch_reactions import (  # noqa: E402
+    _touch_prompt,
+    _tier_style_guidance,
+    consume_touch_reaction,
+    list_touch_pool_admin,
+    refresh_touch_reaction_pools,
+    touch_pool_coverage_admin,
+)
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
 from app.push import register_device, send_proactive_push  # noqa: E402
@@ -74,8 +83,25 @@ def _disable_embedding_providers() -> None:
 def test_health_and_bootstrap() -> None:
     assert client.get("/api/health").json()["ok"] is True
     payload = client.get("/api/bootstrap").json()
-    assert payload["character"]["name"] == "小樱"
+    assert payload["character"]["character_id"] == "atri"
+    assert payload["character"]["name"] == "亚托莉"
+    assert payload["live2d"]["appearance_id"] == "neko"
+    assert payload["live2d"]["touch_pool_version"]
     assert "providers" not in payload
+    with SessionLocal() as session:
+        assert session.get(Character, "atri") is not None
+        assert session.get(Character, "sakura") is None
+
+
+def test_appearance_id_does_not_create_character() -> None:
+    payload = client.get("/api/bootstrap", params={"character_id": "neko", "appearance_id": "neko"}).json()
+    assert payload["character"]["character_id"] == "atri"
+    assert client.put("/api/admin/characters/neko", json={"name": "亚托莉"}).status_code == 404
+    with SessionLocal() as session:
+        ensure_seed(session, character_id="neko")
+        assert session.get(Character, "atri") is not None
+        assert session.get(Character, "neko") is None
+        assert session.get(Character, "murasame") is None
 
 
 def test_schema_has_persona_profile_and_vector_columns() -> None:
@@ -221,8 +247,8 @@ def test_prewarm_once_skips_online_and_fresh_cache() -> None:
     cache_user_id = f"prewarm_cache_{suffix}"
     clear_online_state()
     with SessionLocal() as session:
-        ensure_seed(session, user_id=online_user_id, character_id="sakura")
-        ensure_seed(session, user_id=cache_user_id, character_id="sakura")
+        ensure_seed(session, user_id=online_user_id, character_id="atri")
+        ensure_seed(session, user_id=cache_user_id, character_id="atri")
         for user_id in (online_user_id, cache_user_id):
             user = session.get(User, user_id)
             user.story_completed = True
@@ -231,7 +257,7 @@ def test_prewarm_once_skips_online_and_fresh_cache() -> None:
             OpeningCache(
                 cache_id=f"opening_cache_{suffix}",
                 user_id=cache_user_id,
-                character_id="sakura",
+                character_id="atri",
                 kind="proactive",
                 payload_json=dump_json({"lines": [], "relation_delta": {}}),
                 status="ready",
@@ -288,7 +314,7 @@ def test_prewarm_once_does_not_skip_judge_for_greeting_cache() -> None:
     try:
         clear_online_state()
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -308,7 +334,7 @@ def test_prewarm_once_does_not_skip_judge_for_greeting_cache() -> None:
                 OpeningCache(
                     cache_id=f"greeting_cache_{suffix}",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     kind="greeting",
                     payload_json=dump_json({"lines": [], "relation_delta": {}}),
                     status="ready",
@@ -318,10 +344,10 @@ def test_prewarm_once_does_not_skip_judge_for_greeting_cache() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"prewarm_greeting_memory_{suffix}",
-                title="小樱有话想说",
+                title="亚托莉有话想说",
                 text="主动想告诉用户：普通开场缓存不应该挡住这个候选。",
                 priority=90,
                 scheduled_at=datetime.fromisoformat("2026-06-09T11:50:00+08:00"),
@@ -354,7 +380,7 @@ def test_prewarm_once_offline_without_cache_runs_weather_enabled(monkeypatch: py
     monkeypatch.setattr(scheduler_module, "prepare_due_openings", fake_prepare_due_openings)
     clear_online_state()
     with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
+        ensure_seed(session, user_id=user_id, character_id="atri")
         user = session.get(User, user_id)
         user.story_completed = True
         user.notifications_enabled = True
@@ -502,6 +528,51 @@ def test_llm_json_retries_empty_content_from_json_output_mode() -> None:
     assert "<empty content>" in retry_prompt
 
 
+def test_llm_text_retries_empty_content_from_length_finish() -> None:
+    bodies: list[dict[str, object]] = []
+    ja_text = "\u8a71\u3057\u3066\u307f\u3066\u3002"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                json={"choices": [{"finish_reason": "length", "message": {"content": "", "reasoning_content": "thinking"}}]},
+            )
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": ja_text}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_deepseek_text_length_retry",
+                    kind="llm_task",
+                    provider="deepseek",
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-reasoner",
+                    secrets={"api_key": "deepseek-key"},
+                ),
+            )
+            result = providers.OpenAICompatibleClient(config).chat_text(
+                [
+                    {"role": "system", "content": "Output only Japanese."},
+                    {"role": "user", "content": "Chinese line: \u8bf4\u5427\u3002"},
+                ],
+                max_tokens=180,
+            )
+            assert result == ja_text
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    assert len(bodies) == 2
+    assert "response_format" not in bodies[0]
+    assert bodies[0]["max_tokens"] == 180
+    assert bodies[1]["max_tokens"] == 1024
+
+
 def test_user_message_trace_records_reply_judgement() -> None:
     _clear_diagnostics()
 
@@ -526,7 +597,7 @@ def test_user_message_trace_records_reply_judgement() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="trace_reply_user", character_id="sakura")
+            ensure_seed(session, user_id="trace_reply_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -548,7 +619,7 @@ def test_user_message_trace_records_reply_judgement() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="trace_reply_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="trace_reply_session",
                     payload={"text": "今天想测试日志"},
                     client_context={"local_time": "2026-06-10T10:15:00+08:00"},
@@ -668,7 +739,7 @@ def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -683,7 +754,7 @@ def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
             memory = Memory(
                 memory_id=f"mem_{suffix}",
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 layer="event",
                 content="用户说周末想去咖啡店。",
                 tags_json=dump_json(["plan"]),
@@ -694,7 +765,7 @@ def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
             other = Memory(
                 memory_id=f"mem_other_{suffix}",
                 user_id=f"other_{user_id}",
-                character_id="sakura",
+                character_id="atri",
                 layer="event",
                 content="其他用户也喜欢咖啡。",
                 importance=0.8,
@@ -704,7 +775,7 @@ def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
             session.flush()
             assert safe_index_memory_vector(session, memory)["status"] == "ready"
             assert safe_index_memory_vector(session, other)["status"] == "ready"
-            hits = search_memory_vectors(session, user_id=user_id, character_id="sakura", query_text="咖啡安排", layers={"event"}, limit=5)
+            hits = search_memory_vectors(session, user_id=user_id, character_id="atri", query_text="咖啡安排", layers={"event"}, limit=5)
             assert hits
             assert hits[0].memory_id == memory.memory_id
             assert all(hit.memory_id != other.memory_id for hit in hits)
@@ -1127,7 +1198,7 @@ def test_news_candidate_uses_trend_radar_snapshot_without_http() -> None:
     try:
         with SessionLocal() as session:
             user_id = f"trend_snapshot_user_{suffix}"
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
             user.news_enabled = True
@@ -1157,7 +1228,7 @@ def test_news_candidate_uses_trend_radar_snapshot_without_http() -> None:
             event = ensure_news_candidate(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-10T12:15:00+08:00"),
             )
             assert event is not None
@@ -1416,8 +1487,8 @@ def test_volc_tts_request_and_chunked_audio_parse() -> None:
 
 def test_initial_moments_are_seeded_with_npc_interactions() -> None:
     with SessionLocal() as session:
-        ensure_seed(session, user_id="seed_moment_user", character_id="sakura")
-        seed_ids = {"seed_moment_sakura_morning", "seed_moment_sakura_walk", "seed_moment_sakura_evening"}
+        ensure_seed(session, user_id="seed_moment_user", character_id="atri")
+        seed_ids = {"seed_moment_atri_morning", "seed_moment_atri_walk", "seed_moment_atri_evening"}
         moments = session.query(Moment).filter(Moment.moment_id.in_(seed_ids)).all()
         assert len(moments) == 3
         interactions = session.query(MomentInteraction).filter(MomentInteraction.moment_id.in_(seed_ids)).all()
@@ -1455,12 +1526,12 @@ def test_admin_voice_crud_and_character_voice_selection() -> None:
     assert created["voice_id"] == voice_id
 
     updated = client.put(
-        "/api/admin/characters/sakura",
+        "/api/admin/characters/atri",
         json={
             "tts_voice_profile_id": voice_id,
             "key_reply_threshold": 82,
             "persona_card": {
-                "name": "小樱",
+                "name": "亚托莉",
                 "personality": ["认真", "温柔"],
                 "relationship_attitudes": {
                     "good": "会更主动分享日程。",
@@ -1477,8 +1548,8 @@ def test_admin_voice_crud_and_character_voice_selection() -> None:
 
     assert client.delete(f"/api/admin/tts-voices/{voice_id}").json()["ok"] is True
     characters = client.get("/api/admin/characters").json()["items"]
-    sakura = next(item for item in characters if item["character_id"] == "sakura")
-    assert sakura["tts_voice_profile_id"] == ""
+    atri = next(item for item in characters if item["character_id"] == "atri")
+    assert atri["tts_voice_profile_id"] == ""
 
 
 def test_tts_voice_profile_uses_own_resource_and_speaker_and_skips_unreadable_text() -> None:
@@ -1497,7 +1568,7 @@ def test_tts_voice_profile_uses_own_resource_and_speaker_and_skips_unreadable_te
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="tts_profile_user", character_id="sakura")
+            ensure_seed(session, user_id="tts_profile_user", character_id="atri")
             config = upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -1532,7 +1603,7 @@ def test_tts_voice_profile_uses_own_resource_and_speaker_and_skips_unreadable_te
                 )
             )
             user = session.get(User, "tts_profile_user")
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.tts_enabled = True
             character.tts_voice_type = "wrong-legacy-speaker"
             character.tts_voice_profile_id = "voice_profile_zh"
@@ -1572,7 +1643,7 @@ def test_japanese_voice_generates_extra_japanese_tts_text_only() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="tts_profile_ja_user", character_id="sakura")
+            ensure_seed(session, user_id="tts_profile_ja_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -1606,7 +1677,7 @@ def test_japanese_voice_generates_extra_japanese_tts_text_only() -> None:
                 )
             )
             user = session.get(User, "tts_profile_ja_user")
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.tts_enabled = True
             character.tts_voice_profile_id = "voice_profile_ja"
             session.commit()
@@ -1636,7 +1707,7 @@ def test_japanese_voice_rejects_chinese_translation_and_does_not_call_tts() -> N
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="tts_profile_ja_reject_user", character_id="sakura")
+            ensure_seed(session, user_id="tts_profile_ja_reject_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -1670,7 +1741,7 @@ def test_japanese_voice_rejects_chinese_translation_and_does_not_call_tts() -> N
                 )
             )
             user = session.get(User, "tts_profile_ja_reject_user")
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.tts_enabled = True
             character.tts_voice_profile_id = "voice_profile_ja_reject"
             session.commit()
@@ -1724,6 +1795,8 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
                 )
                 return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": ja_text}}]})
+        if "embeddings" in url:
+            return httpx.Response(200, json={"data": [{"embedding": [0.1, 0.2, 0.3]}]})
         tts_bodies.append(body)
         assert request.headers["X-Api-Resource-Id"] == resource_id
         return httpx.Response(200, content=f'data: {{"data":"{audio}"}}\n'.encode())
@@ -1731,7 +1804,7 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -1765,7 +1838,7 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
                 )
             )
             user = session.get(User, user_id)
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.story_completed = True
             user.tts_enabled = True
             character.tts_voice_profile_id = f"voice_ja_retry_{suffix}"
@@ -1773,7 +1846,7 @@ def test_japanese_voice_pipeline_retries_missing_tts_text_ja() -> None:
 
             result = handle_event(
                 session,
-                EventIn(event_type="user_message", user_id=user_id, character_id="sakura", session_id=session_id, payload={"text": "我回来了"}),
+                EventIn(event_type="user_message", user_id=user_id, character_id="atri", session_id=session_id, payload={"text": "我回来了"}),
             )
             assert result.payload["lines"][0]["text"] == cn_text
             assert len(llm_bodies) == 2
@@ -1819,7 +1892,7 @@ def test_japanese_voice_pipeline_failure_does_not_save_chinese_only_line() -> No
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -1854,7 +1927,7 @@ def test_japanese_voice_pipeline_failure_does_not_save_chinese_only_line() -> No
                 )
             )
             user = session.get(User, user_id)
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.story_completed = True
             user.tts_enabled = True
             character.tts_voice_profile_id = voice_id
@@ -1863,7 +1936,7 @@ def test_japanese_voice_pipeline_failure_does_not_save_chinese_only_line() -> No
             with pytest.raises(ProviderError, match="日文配音文本生成失败"):
                 handle_event(
                     session,
-                    EventIn(event_type="user_message", user_id=user_id, character_id="sakura", session_id=session_id, payload={"text": "我回来了"}),
+                    EventIn(event_type="user_message", user_id=user_id, character_id="atri", session_id=session_id, payload={"text": "我回来了"}),
                 )
             session.rollback()
             saved = session.execute(
@@ -2035,7 +2108,7 @@ def test_special_replies_are_gated_by_character_threshold() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="threshold_user", character_id="sakura")
+            ensure_seed(session, user_id="threshold_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2048,7 +2121,7 @@ def test_special_replies_are_gated_by_character_threshold() -> None:
                 ),
             )
             user = session.get(User, "threshold_user")
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.story_completed = True
             user.tts_enabled = False
             character.key_reply_threshold = 75
@@ -2058,7 +2131,7 @@ def test_special_replies_are_gated_by_character_threshold() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="threshold_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="threshold_session",
                     payload={"text": "今天有点累。"},
                 ),
@@ -2089,7 +2162,7 @@ def test_normal_reply_option_does_not_apply_relation_delta() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="normal_reply_user", character_id="sakura")
+            ensure_seed(session, user_id="normal_reply_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2103,7 +2176,7 @@ def test_normal_reply_option_does_not_apply_relation_delta() -> None:
             )
             user = session.get(User, "normal_reply_user")
             relation = session.execute(
-                select(RelationState).where(RelationState.user_id == "normal_reply_user", RelationState.character_id == "sakura")
+                select(RelationState).where(RelationState.user_id == "normal_reply_user", RelationState.character_id == "atri")
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
@@ -2115,7 +2188,7 @@ def test_normal_reply_option_does_not_apply_relation_delta() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="normal_reply_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="normal_reply_session",
                     payload={"text": "好。", "reply_id": "normal_reply_1"},
                 ),
@@ -2147,7 +2220,7 @@ def test_free_user_message_does_not_apply_relation_delta() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="free_delta_user", character_id="sakura")
+            ensure_seed(session, user_id="free_delta_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2161,7 +2234,7 @@ def test_free_user_message_does_not_apply_relation_delta() -> None:
             )
             user = session.get(User, "free_delta_user")
             relation = session.execute(
-                select(RelationState).where(RelationState.user_id == "free_delta_user", RelationState.character_id == "sakura")
+                select(RelationState).where(RelationState.user_id == "free_delta_user", RelationState.character_id == "atri")
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
@@ -2177,7 +2250,7 @@ def test_free_user_message_does_not_apply_relation_delta() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="free_delta_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="free_delta_session",
                     payload={"text": "今天在做什么？"},
                     client_context={"local_time": "2026-06-10T10:15:00+08:00"},
@@ -2210,7 +2283,7 @@ def test_option_selected_can_apply_relation_delta() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="option_delta_user", character_id="sakura")
+            ensure_seed(session, user_id="option_delta_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2224,7 +2297,7 @@ def test_option_selected_can_apply_relation_delta() -> None:
             )
             user = session.get(User, "option_delta_user")
             relation = session.execute(
-                select(RelationState).where(RelationState.user_id == "option_delta_user", RelationState.character_id == "sakura")
+                select(RelationState).where(RelationState.user_id == "option_delta_user", RelationState.character_id == "atri")
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
@@ -2240,7 +2313,7 @@ def test_option_selected_can_apply_relation_delta() -> None:
                 EventIn(
                     event_type="option_selected",
                     user_id="option_delta_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="option_delta_session",
                     payload={"reply_text": "那我们周末约会吧。"},
                 ),
@@ -2284,7 +2357,7 @@ def test_schedule_question_prompt_includes_actual_slot_context() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="schedule_prompt_user", character_id="sakura")
+            ensure_seed(session, user_id="schedule_prompt_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2305,7 +2378,7 @@ def test_schedule_question_prompt_includes_actual_slot_context() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="schedule_prompt_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="schedule_prompt_session",
                     payload={"text": "刚刚的日程安排是什么？"},
                     client_context={"local_time": "2026-06-10T10:15:00+08:00"},
@@ -2345,7 +2418,7 @@ def test_weather_question_prompt_includes_weather_context() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2388,7 +2461,7 @@ def test_weather_question_prompt_includes_weather_context() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id=f"weather_prompt_session_{suffix}",
                     payload={"text": "今天天气怎么样？晚上会下雨吗？"},
                     client_context={"local_time": "2026-06-10T12:00:00+08:00"},
@@ -2422,7 +2495,7 @@ def test_memory_interest_requires_explicit_user_interest() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2444,7 +2517,7 @@ def test_memory_interest_requires_explicit_user_interest() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="interest_filter_session",
                     payload={"text": "刚刚的日程安排是什么？"},
                     client_context={"local_time": "2026-06-10T10:15:00+08:00"},
@@ -2458,7 +2531,7 @@ def test_memory_interest_requires_explicit_user_interest() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="interest_filter_session",
                     payload={"text": "我最近关注像素解谜。"},
                     client_context={"local_time": "2026-06-10T10:15:00+08:00"},
@@ -2501,7 +2574,7 @@ def test_subject_hint_prevents_ambiguous_user_message_from_role_memory() -> None
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2523,7 +2596,7 @@ def test_subject_hint_prevents_ambiguous_user_message_from_role_memory() -> None
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id=f"subject_hint_session_{suffix}",
                     payload={"text": "刚刚找别的女人去了"},
                 ),
@@ -2560,7 +2633,7 @@ def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="light_reply_user", character_id="sakura")
+            ensure_seed(session, user_id="light_reply_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2574,7 +2647,7 @@ def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
             )
             user = session.get(User, "light_reply_user")
             relation = session.execute(
-                select(RelationState).where(RelationState.user_id == "light_reply_user", RelationState.character_id == "sakura")
+                select(RelationState).where(RelationState.user_id == "light_reply_user", RelationState.character_id == "atri")
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
@@ -2586,7 +2659,7 @@ def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id="light_reply_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="light_reply_session",
                     payload={"text": "嗯"},
                 ),
@@ -2608,7 +2681,7 @@ def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
 
 def test_app_opened_without_proactive_event_returns_no_reply() -> None:
     with SessionLocal() as session:
-        ensure_seed(session, user_id="no_reply_user", character_id="sakura")
+        ensure_seed(session, user_id="no_reply_user", character_id="atri")
         user = session.get(User, "no_reply_user")
         user.story_completed = True
         session.add(
@@ -2616,9 +2689,9 @@ def test_app_opened_without_proactive_event_returns_no_reply() -> None:
                 message_id=f"msg_no_reply_{str(datetime.now(timezone.utc).timestamp()).replace('.', '')}",
                 session_id="no_reply_session",
                 user_id="no_reply_user",
-                character_id="sakura",
+                character_id="atri",
                 sender_type="heroine",
-                sender_id="sakura",
+                sender_id="atri",
                 content="旧问候不应该被重复回放。",
                 source="app_opened",
             )
@@ -2629,7 +2702,7 @@ def test_app_opened_without_proactive_event_returns_no_reply() -> None:
             EventIn(
                 event_type="app_opened",
                 user_id="no_reply_user",
-                character_id="sakura",
+                character_id="atri",
                 session_id="no_reply_session",
                 payload={},
             ),
@@ -2649,7 +2722,7 @@ def test_location_upload_reads_existing_weather_without_qweather_refresh() -> No
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.story_completed = True
             user.news_enabled = False
@@ -2688,7 +2761,7 @@ def test_location_upload_reads_existing_weather_without_qweather_refresh() -> No
             )
             session.commit()
         payload = client.post(
-            f"/api/location?user_id={user_id}&character_id=sakura",
+            f"/api/location?user_id={user_id}&character_id=atri",
             json={
                 "latitude": 22.54,
                 "longitude": 114.06,
@@ -2772,7 +2845,7 @@ def test_manual_weather_refreshes_qweather_once_and_creates_weather_proactive() 
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.story_completed = True
             user.news_enabled = False
@@ -2790,7 +2863,7 @@ def test_manual_weather_refreshes_qweather_once_and_creates_weather_proactive() 
             )
             session.commit()
         payload = client.post(
-            f"/api/weather/refresh?user_id={user_id}&character_id=sakura",
+            f"/api/weather/refresh?user_id={user_id}&character_id=atri",
             json={"local_time": "2026-06-10T15:30:00+08:00"},
         ).json()
         assert payload["ok"] is True
@@ -2801,7 +2874,7 @@ def test_manual_weather_refreshes_qweather_once_and_creates_weather_proactive() 
         assert "/v7/warning/now" not in calls
         first_call_count = len(calls)
         second = client.post(
-            f"/api/weather/refresh?user_id={user_id}&character_id=sakura",
+            f"/api/weather/refresh?user_id={user_id}&character_id=atri",
             json={"local_time": "2026-06-10T15:30:10+08:00"},
         ).json()
         assert second["weather"]["snapshot_id"] == payload["weather"]["snapshot_id"]
@@ -2833,7 +2906,7 @@ def test_proactive_pending_uses_existing_weather_without_qweather_refresh() -> N
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.story_completed = True
             user.news_enabled = False
@@ -2887,7 +2960,7 @@ def test_proactive_pending_uses_existing_weather_without_qweather_refresh() -> N
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-10T15:30:00+08:00"),
                 generate_news=False,
             )
@@ -2922,11 +2995,11 @@ def test_daily_cycle_invokes_weather_refresh_once(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(schedule_module, "refresh_weather_snapshot", fake_refresh_weather_snapshot)
     monkeypatch.setattr(schedule_module, "ensure_weather_candidate", fake_ensure_weather_candidate)
     with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
+        ensure_seed(session, user_id=user_id, character_id="atri")
         user = session.get(User, user_id)
         user.story_completed = True
         session.commit()
-        run_daily_cycle(session, user_id=user_id, character_id="sakura", day=datetime.fromisoformat("2099-06-10T04:00:00+08:00"))
+        run_daily_cycle(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2099-06-10T04:00:00+08:00"))
     assert calls == {"refresh": 1, "candidate": 1}
 
 
@@ -2952,7 +3025,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -2974,7 +3047,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
                 delivered = create_proactive_event(
                     session,
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     source_type="memory",
                     source_id=f"delivered_{suffix}_{index}",
                     title=f"已投递标题 {index}",
@@ -2988,7 +3061,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             high = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_high_{suffix}",
                 title="高优先级但不选",
@@ -3000,7 +3073,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             selected = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_selected_{suffix}",
                 title="判断器选择目标",
@@ -3015,7 +3088,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T01:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3051,7 +3124,7 @@ def test_proactive_judge_can_defer_without_next_check() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3069,7 +3142,7 @@ def test_proactive_judge_can_defer_without_next_check() -> None:
             create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_defer_{suffix}",
                 title="暂缓测试",
@@ -3082,7 +3155,7 @@ def test_proactive_judge_can_defer_without_next_check() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3109,7 +3182,7 @@ def test_proactive_stale_next_check_does_not_block_judgement() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3128,7 +3201,7 @@ def test_proactive_stale_next_check_does_not_block_judgement() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_skip_{suffix}",
                 title="不再被 next_check 挡住",
@@ -3142,7 +3215,7 @@ def test_proactive_stale_next_check_does_not_block_judgement() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:06:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3167,7 +3240,7 @@ def test_proactive_error_state_does_not_block_retry() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3194,7 +3267,7 @@ def test_proactive_error_state_does_not_block_retry() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_error_retry_{suffix}",
                 title="错误重试",
@@ -3209,7 +3282,7 @@ def test_proactive_error_state_does_not_block_retry() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:06:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3230,7 +3303,7 @@ def test_proactive_next_check_keeps_selected_pending_unread_visible() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3249,7 +3322,7 @@ def test_proactive_next_check_keeps_selected_pending_unread_visible() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"selected_pending_{suffix}",
                 title="Unread message",
@@ -3271,7 +3344,7 @@ def test_proactive_next_check_keeps_selected_pending_unread_visible() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3293,7 +3366,7 @@ def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3311,7 +3384,7 @@ def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
             create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_bad_json_{suffix}",
                 title="非法 JSON 测试",
@@ -3324,7 +3397,7 @@ def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3344,14 +3417,14 @@ def test_proactive_judge_missing_provider_defaults_to_no_send() -> None:
     with SessionLocal() as session:
         for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind.in_(["llm", "llm_task"]))).scalars():
             config.enabled = False
-        ensure_seed(session, user_id=user_id, character_id="sakura")
+        ensure_seed(session, user_id=user_id, character_id="atri")
         user = session.get(User, user_id)
         user.story_completed = True
         user.notifications_enabled = True
         create_proactive_event(
             session,
             user_id=user_id,
-            character_id="sakura",
+            character_id="atri",
             source_type="memory",
             source_id=f"pending_no_provider_{suffix}",
             title="无模型测试",
@@ -3364,7 +3437,7 @@ def test_proactive_judge_missing_provider_defaults_to_no_send() -> None:
         result = pending_proactive_response(
             session,
             user_id=user_id,
-            character_id="sakura",
+            character_id="atri",
             local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
             generate_news=False,
             generate_weather=False,
@@ -3394,7 +3467,7 @@ def test_proactive_pending_and_delivered_routes() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     with SessionLocal() as session:
         try:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3412,7 +3485,7 @@ def test_proactive_pending_and_delivered_routes() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"route_memory_{suffix}",
                 title="路由测试",
@@ -3424,15 +3497,15 @@ def test_proactive_pending_and_delivered_routes() -> None:
             event_id = event.proactive_event_id
             session.commit()
             payload = client.get(
-                f"/api/proactive/pending?user_id={user_id}&character_id=sakura&local_time=2026-06-09T12:00:00%2B08:00"
+                f"/api/proactive/pending?user_id={user_id}&character_id=atri&local_time=2026-06-09T12:00:00%2B08:00"
             ).json()
             assert payload["event"]["proactive_event_id"] == event_id
             assert payload["widget"]["unread_count"] == 1
-            assert payload["widget"]["chibi_url"] == "/media/asset_chibi_sakura_widget"
+            assert payload["widget"]["chibi_url"] == "/media/asset_chibi_atri_widget"
             delivered = client.post(f"/api/proactive/{event_id}/delivered").json()
             assert delivered["event"]["status"] == "delivered"
             retained = client.get(
-                f"/api/proactive/pending?user_id={user_id}&character_id=sakura&local_time=2026-06-09T12:10:00%2B08:00"
+                f"/api/proactive/pending?user_id={user_id}&character_id=atri&local_time=2026-06-09T12:10:00%2B08:00"
             ).json()
             assert retained["event"] is None
             assert retained["widget"]["proactive_event_id"] == event_id
@@ -3459,7 +3532,7 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     with SessionLocal() as session:
         try:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3477,7 +3550,7 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"consume_memory_{suffix}",
                 title="清红点测试",
@@ -3491,7 +3564,7 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
             before = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3501,7 +3574,7 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
             after = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3529,7 +3602,7 @@ def test_proactive_daily_limit_is_soft_and_does_not_block_judgement() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3549,7 +3622,7 @@ def test_proactive_daily_limit_is_soft_and_does_not_block_judgement() -> None:
                 delivered = create_proactive_event(
                     session,
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     source_type="memory",
                     source_id=f"delivered_limit_{suffix}_{index}",
                     title="Delivered",
@@ -3563,7 +3636,7 @@ def test_proactive_daily_limit_is_soft_and_does_not_block_judgement() -> None:
             pending = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"pending_limit_{suffix}",
                 title="Pending",
@@ -3577,7 +3650,7 @@ def test_proactive_daily_limit_is_soft_and_does_not_block_judgement() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3615,7 +3688,7 @@ def test_proactive_unlimited_daily_limit_allows_judgement_after_stale_limited_st
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3643,7 +3716,7 @@ def test_proactive_unlimited_daily_limit_allows_judgement_after_stale_limited_st
                 delivered = create_proactive_event(
                     session,
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     source_type="memory",
                     source_id=f"unlimited_delivered_{suffix}_{index}",
                     title="Delivered",
@@ -3657,7 +3730,7 @@ def test_proactive_unlimited_daily_limit_allows_judgement_after_stale_limited_st
             pending = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"unlimited_pending_{suffix}",
                 title="Pending",
@@ -3673,7 +3746,7 @@ def test_proactive_unlimited_daily_limit_allows_judgement_after_stale_limited_st
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -3712,7 +3785,7 @@ def test_foreground_check_prepares_and_consumes_dialogue() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3741,7 +3814,7 @@ def test_foreground_check_prepares_and_consumes_dialogue() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="appointment",
                 source_id=f"appointment_{suffix}",
                 title="Flight reminder",
@@ -3756,7 +3829,7 @@ def test_foreground_check_prepares_and_consumes_dialogue() -> None:
             "/api/proactive/foreground-check",
             json={
                 "user_id": user_id,
-                "character_id": "sakura",
+                "character_id": "atri",
                 "device_id": f"device_{suffix}",
                 "screen": "home",
                 "idle_seconds": 45,
@@ -3809,7 +3882,7 @@ def test_fcm_push_sends_and_records_attempt() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3833,7 +3906,7 @@ def test_fcm_push_sends_and_records_attempt() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="weather",
                 source_id=f"weather_{suffix}",
                 title="Rain tonight",
@@ -3890,7 +3963,7 @@ def test_user_message_extracts_appointment_commitment() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -3922,7 +3995,7 @@ def test_user_message_extracts_appointment_commitment() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id=f"commitment_session_{suffix}",
                     payload={"text": "我明天早上9点要赶飞机"},
                     client_context={"local_time": "2026-06-09T20:00:00+08:00"},
@@ -3973,7 +4046,7 @@ def test_user_message_extracts_on_time_call_me_commitment() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4005,7 +4078,7 @@ def test_user_message_extracts_on_time_call_me_commitment() -> None:
                 EventIn(
                     event_type="user_message",
                     user_id=user_id,
-                    character_id="sakura",
+                    character_id="atri",
                     session_id=f"on_time_commitment_session_{suffix}",
                     payload={"text": "14:30叫我一下"},
                     client_context={"local_time": "2026-06-09T13:00:00+08:00"},
@@ -4030,7 +4103,7 @@ def test_appointment_on_time_fast_path_delivers_without_judge() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.story_completed = True
             user.notifications_enabled = True
@@ -4038,7 +4111,7 @@ def test_appointment_on_time_fast_path_delivers_without_judge() -> None:
             create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="appointment",
                 source_id=f"commit_on_time_{suffix}",
                 title="14:30叫我",
@@ -4057,7 +4130,7 @@ def test_appointment_on_time_fast_path_delivers_without_judge() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=remind_at,
                 generate_news=False,
                 generate_weather=False,
@@ -4079,7 +4152,7 @@ def test_follow_up_appointment_not_due_during_busy_window() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.story_completed = True
             user.notifications_enabled = True
@@ -4089,7 +4162,7 @@ def test_follow_up_appointment_not_due_during_busy_window() -> None:
             create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="appointment",
                 source_id=f"commit_follow_up_{suffix}",
                 title="忙完了联系",
@@ -4110,7 +4183,7 @@ def test_follow_up_appointment_not_due_during_busy_window() -> None:
             result = pending_proactive_response(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T17:00:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
@@ -4141,7 +4214,7 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             config = upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4164,7 +4237,7 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
                 )
             )
             user = session.get(User, user_id)
-            character = session.get(Character, "sakura")
+            character = session.get(Character, "atri")
             user.story_completed = True
             user.tts_enabled = True
             character.tts_voice_profile_id = voice_id
@@ -4173,7 +4246,7 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
             prepared = prepare_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T20:00:00+08:00"),
                 allow_llm=False,
             )
@@ -4183,7 +4256,7 @@ def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
             ready = consume_ready_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 session_id=f"opening_session_{suffix}",
                 local_time=datetime.fromisoformat("2026-06-09T20:01:00+08:00"),
             )
@@ -4240,7 +4313,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4259,10 +4332,10 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
             event = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="memory",
                 source_id=f"prewarm_memory_{suffix}",
-                title="小樱有话想说",
+                title="亚托莉有话想说",
                 text="主动想告诉用户：我想起了一件适合打开时说的小事。",
                 priority=90,
                 scheduled_at=datetime.fromisoformat("2026-06-09T11:50:00+08:00"),
@@ -4274,7 +4347,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
             prewarmed = prepare_due_openings(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
                 generate_news=False,
             )
@@ -4290,7 +4363,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
             ready = consume_ready_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 session_id=f"opening_prewarm_session_{suffix}",
                 local_time=datetime.fromisoformat("2026-06-09T12:01:00+08:00"),
             )
@@ -4305,7 +4378,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
 def test_repeated_moment_like_dedupes_proactive_event_by_moment() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"moment_like_dedupe_user_{suffix}"
-    moment_id = "seed_moment_sakura_walk"
+    moment_id = "seed_moment_atri_walk"
     first = client.post(f"/api/moments/{moment_id}/like?user_id={user_id}").json()
     second = client.post(f"/api/moments/{moment_id}/like?user_id={user_id}").json()
     assert first["ok"] is True and second["ok"] is True
@@ -4343,7 +4416,7 @@ def test_notification_opened_reflects_proactive_event_in_chat() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="proactive_open_user", character_id="sakura")
+            ensure_seed(session, user_id="proactive_open_user", character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4361,10 +4434,10 @@ def test_notification_opened_reflects_proactive_event_in_chat() -> None:
             proactive = create_proactive_event(
                 session,
                 user_id="proactive_open_user",
-                character_id="sakura",
+                character_id="atri",
                 source_type="moment_interaction",
                 source_id="mi_open",
-                title="小樱注意到了你的互动",
+                title="亚托莉注意到了你的互动",
                 text="我看到你在朋友圈里留言了。",
                 priority=80,
                 dedupe_key="mi_open",
@@ -4375,7 +4448,7 @@ def test_notification_opened_reflects_proactive_event_in_chat() -> None:
                 EventIn(
                     event_type="notification_opened",
                     user_id="proactive_open_user",
-                    character_id="sakura",
+                    character_id="atri",
                     session_id="proactive_open_session",
                     payload={"proactive_event_id": proactive.proactive_event_id},
                 ),
@@ -4403,7 +4476,7 @@ def test_news_candidate_uses_trend_radar_all_keywords() -> None:
     try:
         with SessionLocal() as session:
             user_id = f"trend_news_user_{suffix}"
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.interest_topics_json = json.dumps(["AI 游戏", "完全不匹配"], ensure_ascii=False)
             user.news_enabled = True
@@ -4421,7 +4494,7 @@ def test_news_candidate_uses_trend_radar_all_keywords() -> None:
             event = ensure_news_candidate(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-10T12:15:00+08:00"),
             )
             assert event is not None
@@ -4448,14 +4521,14 @@ def test_news_candidate_skips_deduped_trend_radar_topic() -> None:
     try:
         with SessionLocal() as session:
             user_id = f"trend_dedupe_user_{suffix}"
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.interest_topics_json = json.dumps(["AI 游戏", "芯片"], ensure_ascii=False)
             user.news_enabled = True
             create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="news",
                 source_id="existing_ai_game",
                 title="existing",
@@ -4476,7 +4549,7 @@ def test_news_candidate_skips_deduped_trend_radar_topic() -> None:
             event = ensure_news_candidate(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-10T13:00:00+08:00"),
             )
             assert event is not None
@@ -4526,7 +4599,7 @@ def test_news_candidate_does_not_call_disabled_ark_when_trend_radar_has_no_match
     try:
         with SessionLocal() as session:
             user_id = f"trend_fallback_user_{suffix}"
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             user = session.get(User, user_id)
             user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
             user.news_enabled = True
@@ -4555,7 +4628,7 @@ def test_news_candidate_does_not_call_disabled_ark_when_trend_radar_has_no_match
             event = ensure_news_candidate(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-10T14:00:00+08:00"),
             )
             assert event is None
@@ -4572,7 +4645,7 @@ def test_news_candidate_requires_verifiable_publish_time() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="news_skip_user", character_id="sakura")
+            ensure_seed(session, user_id="news_skip_user", character_id="atri")
             user = session.get(User, "news_skip_user")
             user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
             user.news_enabled = True
@@ -4591,7 +4664,7 @@ def test_news_candidate_requires_verifiable_publish_time() -> None:
             assert ensure_news_candidate(
                 session,
                 user_id="news_skip_user",
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
             ) is None
             assert session.query(ProactiveEvent).filter(ProactiveEvent.user_id == "news_skip_user", ProactiveEvent.source_type == "news").count() == 0
@@ -4619,7 +4692,7 @@ def test_admin_proactive_tools_generate_judge_and_schedule() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4637,7 +4710,7 @@ def test_admin_proactive_tools_generate_judge_and_schedule() -> None:
             user.proactive_daily_limit = "unlimited"
             session.commit()
 
-        schedule = client.get("/api/admin/ai-schedule/today", params={"user_id": user_id, "character_id": "sakura"})
+        schedule = client.get("/api/admin/ai-schedule/today", params={"user_id": user_id, "character_id": "atri"})
         assert schedule.status_code == 200
         assert schedule.json()["items"]
 
@@ -4645,7 +4718,7 @@ def test_admin_proactive_tools_generate_judge_and_schedule() -> None:
             "/api/admin/proactive-events/generate",
             json={
                 "user_id": user_id,
-                "character_id": "sakura",
+                "character_id": "atri",
                 "source_type": "schedule",
                 "manual_only": True,
                 "due_now": True,
@@ -4662,7 +4735,7 @@ def test_admin_proactive_tools_generate_judge_and_schedule() -> None:
             "/api/admin/proactive-events/judge",
             json={
                 "user_id": user_id,
-                "character_id": "sakura",
+                "character_id": "atri",
                 "ignore_next_check": True,
                 "generate_news": False,
                 "generate_weather": False,
@@ -4781,18 +4854,119 @@ def test_image_providers_save_real_media_assets() -> None:
         providers.HTTP_TRANSPORT = None
 
 
+def test_safe_image_request_policy_builds_supported_kinds_without_content_gate() -> None:
+    with SessionLocal() as session:
+        character = session.get(Character, "atri")
+        scenery = build_safe_image_request(
+            kind="scenery",
+            scene_hint="樱花雨后的安静街道",
+            character=character,
+            user_id="safe_image_user",
+            character_id="atri",
+            source_id="scene",
+        )
+        assert scenery.asset_type == "experience_cg"
+        assert "No people" in scenery.prompt
+
+        item = build_safe_image_request(
+            kind="object_pet",
+            scene_hint="窗边的一杯茶和樱花书签",
+            character=character,
+            user_id="safe_image_user",
+            character_id="atri",
+            source_id="object",
+        )
+        assert item.asset_type == "experience_cg"
+        assert "No humans" in item.prompt
+
+        selfie = build_safe_image_request(
+            kind="character_selfie",
+            scene_hint="窗边喝茶的日常自拍",
+            character=character,
+            user_id="safe_image_user",
+            character_id="atri",
+            source_id="selfie",
+        )
+        assert selfie.asset_type == "character_selfie"
+        assert selfie.reference_image_path is not None
+        assert selfie.reference_image_path.name == "selfie.png"
+        assert "same fictional adult anime catgirl" in selfie.prompt
+
+        direct_prompt = build_safe_image_request(
+            kind="character_selfie",
+            scene_hint="用户给的自拍短提示",
+            character=character,
+            user_id="safe_image_user",
+            character_id="atri",
+            source_id="direct_prompt",
+        )
+        assert "用户给的自拍短提示" in direct_prompt.prompt
+
+
+def test_character_selfie_uses_reference_image_and_records_asset() -> None:
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"s" * 100
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, headers={"content-type": "image/png"}, content=image_bytes)
+        body = json.loads(request.content.decode())
+        assert str(request.url) == "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+        assert body["image"][0].startswith("data:image/png;base64,")
+        assert body["response_format"] == "url"
+        assert body["size"] == "1920x1920"
+        assert "same fictional adult anime catgirl" in body["prompt"]
+        assert "same fictional adult anime catgirl" in body["prompt"]
+        return httpx.Response(200, json={"data": [{"url": "https://image.example/selfie.png"}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="selfie_user", character_id="atri")
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_image_selfie_doubao",
+                    kind="image",
+                    provider="doubao_seedream",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-seedream-5-0-260128",
+                    secrets={"api_key": "ark-key"},
+                    metadata={"size": "1920x1920", "output_format": "png", "response_format": "url"},
+                ),
+            )
+            character = session.get(Character, "atri")
+            asset = generate_safe_image(
+                session,
+                config=config,
+                kind="character_selfie",
+                scene_hint="窗边喝茶的日常自拍",
+                character=character,
+                user_id="selfie_user",
+                character_id="atri",
+                source_id="manual_test",
+                cooldown_seconds=0,
+            )
+            assert asset.asset_type == "character_selfie"
+            assert asset.ai_generated is True
+            assert asset.source_event_id.startswith("selfie:selfie_user:atri:")
+            assert "selfie.png" in asset.reference_image_ids_json
+            assert Path(asset.local_path).exists()
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_story_flow_without_llm() -> None:
     with SessionLocal() as session:
-        ensure_seed(session, user_id="story_flow_user", character_id="sakura")
+        ensure_seed(session, user_id="story_flow_user", character_id="atri")
         user = session.get(User, "story_flow_user")
-        character = session.get(Character, "sakura")
+        character = session.get(Character, "atri")
         user.tts_enabled = False
         character.tts_voice_profile_id = ""
         user.story_completed = False
         session.commit()
     response = client.post(
         "/api/events",
-        json={"event_type": "app_opened", "user_id": "story_flow_user", "character_id": "sakura", "session_id": "story_test", "payload": {}},
+        json={"event_type": "app_opened", "user_id": "story_flow_user", "character_id": "atri", "session_id": "story_test", "payload": {}},
     ).json()
     assert response["event_type"] in {"story_line", "dialogue"}
     if response["event_type"] == "story_line":
@@ -4806,7 +4980,7 @@ def test_schedule_interruption_and_daily_cycle() -> None:
             slot_id="slot_test_interrupt",
             schedule_date="2026-06-09",
             user_id="demo_user",
-            character_id="sakura",
+            character_id="atri",
             start_at="2026-06-09T14:00:00+08:00",
             end_at="2026-06-09T15:00:00+08:00",
             activity_title="学习",
@@ -4823,13 +4997,13 @@ def test_schedule_interruption_and_daily_cycle() -> None:
 def test_ensure_schedule_refreshes_elapsed_pending_slots() -> None:
     user_id = "schedule_refresh_user"
     with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
+        ensure_seed(session, user_id=user_id, character_id="atri")
         session.merge(
             ScheduleSlot(
                 slot_id="slot_test_refresh_elapsed",
                 schedule_date="2026-06-09",
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 start_at="2026-06-09T08:00:00+08:00",
                 end_at="2026-06-09T08:15:00+08:00",
                 activity_title="早饭",
@@ -4842,7 +5016,7 @@ def test_ensure_schedule_refreshes_elapsed_pending_slots() -> None:
                 slot_id="slot_test_refresh_interrupted",
                 schedule_date="2026-06-09",
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 start_at="2026-06-09T08:15:00+08:00",
                 end_at="2026-06-09T08:30:00+08:00",
                 activity_title="早饭",
@@ -4852,7 +5026,7 @@ def test_ensure_schedule_refreshes_elapsed_pending_slots() -> None:
         )
         session.commit()
 
-        ensure_schedule(session, user_id=user_id, character_id="sakura", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
+        ensure_schedule(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
         elapsed = session.get(ScheduleSlot, "slot_test_refresh_elapsed")
         interrupted = session.get(ScheduleSlot, "slot_test_refresh_interrupted")
         assert elapsed.actual_status == "completed"
@@ -4879,7 +5053,7 @@ def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id="moment_user", character_id="sakura")
+            ensure_seed(session, user_id="moment_user", character_id="atri")
             session.query(MomentInteraction).filter(MomentInteraction.moment_id.in_(session.query(Moment.moment_id).filter(Moment.text.contains("社团准备结束")))).delete(synchronize_session=False)
             session.query(Moment).filter(Moment.text.contains("社团准备结束")).delete(synchronize_session=False)
             session.query(Experience).filter(Experience.source_schedule_slot_id == "slot_test_llm_moment").delete(synchronize_session=False)
@@ -4899,7 +5073,7 @@ def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
                     slot_id="slot_test_llm_moment",
                     schedule_date="2026-06-09",
                     user_id="moment_user",
-                    character_id="sakura",
+                    character_id="atri",
                     start_at="2026-06-09T18:00:00+08:00",
                     end_at="2026-06-09T19:00:00+08:00",
                     activity_title="社团准备",
@@ -4912,7 +5086,7 @@ def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
                 )
             )
             session.commit()
-            result = run_daily_cycle(session, user_id="moment_user", character_id="sakura", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
+            result = run_daily_cycle(session, user_id="moment_user", character_id="atri", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
             assert result["moments"] >= 1
             assert result["proactive_events"] >= 1
             moment = session.query(Moment).filter(Moment.text.contains("社团准备结束")).order_by(Moment.created_at.desc()).first()
@@ -4923,6 +5097,125 @@ def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
             assert proactive.dedupe_key.startswith("schedule:moment_user:")
             interactions = session.query(MomentInteraction).filter(MomentInteraction.moment_id == moment.moment_id).all()
             assert {item.actor_name for item in interactions} >= {"隔壁班的遥", "社团前辈千夏", "图书委员澪"}
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"m" * 100
+    image_requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, headers={"content-type": "image/png"}, content=image_bytes)
+        body = json.loads(request.content.decode())
+        url = str(request.url)
+        if url == "https://ark.cn-beijing.volces.com/api/v3/chat/completions":
+            content = json.dumps(
+                {
+                    "text": "窗边的茶还冒着热气，所以顺手拍了一张。",
+                    "mood": "平静",
+                    "photo_kind": "character_selfie",
+                    "photo_prompt": "窗边喝茶的日常自拍",
+                    "likes": ["图书委员澪"],
+                    "comments": [{"actor_name": "同行同学", "content": "这张很像你的气氛。"}],
+                },
+                ensure_ascii=False,
+            )
+            return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+        if url == "https://ark.cn-beijing.volces.com/api/v3/images/generations":
+            image_requests.append(body)
+            assert body["image"][0].startswith("data:image/png;base64,")
+            assert "same fictional adult anime catgirl" in body["prompt"]
+            assert "窗边喝茶" in body["prompt"]
+            return httpx.Response(200, json={"data": [{"url": f"https://image.example/selfie-{len(image_requests)}.png"}]})
+        raise AssertionError(url)
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id="moment_selfie_user", character_id="atri")
+            session.query(MediaAsset).filter(MediaAsset.source_event_id.like("selfie:moment_selfie_user:atri:%")).delete(synchronize_session=False)
+            session.query(MomentInteraction).filter(
+                MomentInteraction.moment_id.in_(
+                    session.query(Moment.moment_id).filter(Moment.text.contains("窗边的茶还冒着热气"))
+                )
+            ).delete(synchronize_session=False)
+            session.query(Moment).filter(Moment.text.contains("窗边的茶还冒着热气")).delete(synchronize_session=False)
+            session.query(Experience).filter(Experience.source_schedule_slot_id == "slot_test_selfie_moment").delete(synchronize_session=False)
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_moment_selfie_llm",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_moment_selfie_task_llm",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_moment_selfie_image",
+                    kind="image",
+                    provider="doubao_seedream",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-seedream-5-0-260128",
+                    secrets={"api_key": "ark-key"},
+                    metadata={"size": "1920x1920", "output_format": "png", "response_format": "url"},
+                ),
+            )
+            session.merge(
+                ScheduleSlot(
+                    slot_id="slot_test_selfie_moment",
+                    schedule_date="2026-06-09",
+                    user_id="moment_selfie_user",
+                    character_id="atri",
+                    start_at="2026-06-09T16:00:00+08:00",
+                    end_at="2026-06-09T17:00:00+08:00",
+                    activity_title="窗边休息",
+                    activity_type="daily",
+                    location="教室窗边",
+                    actual_status="completed",
+                    can_generate_moment=True,
+                    can_generate_photo=True,
+                    salience=90,
+                )
+            )
+            session.commit()
+            result = run_daily_cycle(session, user_id="moment_selfie_user", character_id="atri", day=datetime.fromisoformat("2026-06-09T12:00:00+08:00"))
+            assert result["moments"] >= 1
+            moment = session.query(Moment).filter(Moment.text.contains("窗边的茶还冒着热气")).order_by(Moment.created_at.desc()).first()
+            assert moment is not None
+            assert moment.media_asset_id
+            asset = session.get(MediaAsset, moment.media_asset_id)
+            assert asset is not None
+            assert asset.asset_type == "character_selfie"
+            assert "selfie.png" in asset.reference_image_ids_json
+            proactive = session.query(ProactiveEvent).filter(
+                ProactiveEvent.user_id == "moment_selfie_user",
+                ProactiveEvent.source_type == "schedule",
+            ).order_by(ProactiveEvent.created_at.desc()).first()
+            assert proactive is not None
+            proactive_payload = json.loads(proactive.payload_json)
+            assert proactive_payload["moment_id"] == moment.moment_id
+            assert proactive_payload["moment_media_asset_id"] == moment.media_asset_id
+            assert proactive_payload["proactive_media_asset_id"]
+            assert proactive_payload["media_asset_id"] == proactive_payload["proactive_media_asset_id"]
+            assert proactive_payload["proactive_media_asset_id"] != moment.media_asset_id
+            assert len(image_requests) == 2
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -4946,12 +5239,12 @@ def test_calendar_returns_only_important_events() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"calendar_event_user_{suffix}"
     with SessionLocal() as session:
-        ensure_seed(session, user_id=user_id, character_id="sakura")
+        ensure_seed(session, user_id=user_id, character_id="atri")
         session.add(
             CalendarEvent(
                 event_id=f"cal_test_date_event_{suffix}",
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 event_date="2026-06-12",
                 title="第一次约会",
                 category="relationship",
@@ -4962,7 +5255,7 @@ def test_calendar_returns_only_important_events() -> None:
         )
         session.commit()
 
-    june = client.get(f"/api/calendar?month=2026-06&user_id={user_id}&character_id=sakura").json()
+    june = client.get(f"/api/calendar?month=2026-06&user_id={user_id}&character_id=atri").json()
     titles = [item["title"] for item in june["days"]]
     assert "第一次约会" in titles
     assert "端午节" in titles
@@ -4975,7 +5268,7 @@ def test_calendar_returns_only_important_events() -> None:
     with SessionLocal() as session:
         user = session.get(User, user_id)
         anniversary_month = str(user.created_at)[:7]
-    anniversary = client.get(f"/api/calendar?month={anniversary_month}&user_id={user_id}&character_id=sakura").json()
+    anniversary = client.get(f"/api/calendar?month={anniversary_month}&user_id={user_id}&character_id=atri").json()
     assert "相识纪念日" in [item["title"] for item in anniversary["days"]]
 
 
@@ -5052,7 +5345,7 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
         "/api/admin/calendar-events",
         json={
             "user_id": user_id,
-            "character_id": "sakura",
+            "character_id": "atri",
             "date": "2026-06-18",
             "title": "测试约会日",
             "category": "relationship",
@@ -5060,7 +5353,7 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
         },
     ).json()
     assert event["title"] == "测试约会日"
-    calendar_page = client.get(f"/api/admin/calendar-events?user_id={user_id}&character_id=sakura&q=测试约会日&page=1&page_size=5").json()
+    calendar_page = client.get(f"/api/admin/calendar-events?user_id={user_id}&character_id=atri&q=测试约会日&page=1&page_size=5").json()
     assert calendar_page["total"] == 1
     assert calendar_page["items"][0]["event_id"] == event["event_id"]
     changed = client.put(f"/api/admin/calendar-events/{event['event_id']}", json={"hidden": True, "title": "测试约会日改"}).json()
@@ -5123,7 +5416,7 @@ def test_consume_prefers_proactive_over_greeting() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -5142,14 +5435,14 @@ def test_consume_prefers_proactive_over_greeting() -> None:
             greeting = prepare_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T08:00:00+08:00"),
                 allow_llm=False,
             )
             proactive = create_proactive_event(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 source_type="schedule",
                 title="想你了",
                 text="刚刚有点想你。",
@@ -5160,7 +5453,7 @@ def test_consume_prefers_proactive_over_greeting() -> None:
             prepared = prepare_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 local_time=datetime.fromisoformat("2026-06-09T08:06:00+08:00"),
                 proactive_event_id=event_id,
                 allow_llm=True,
@@ -5169,7 +5462,7 @@ def test_consume_prefers_proactive_over_greeting() -> None:
             ready = consume_ready_opening(
                 session,
                 user_id=user_id,
-                character_id="sakura",
+                character_id="atri",
                 session_id=f"priority_{suffix}",
                 local_time=datetime.fromisoformat("2026-06-09T08:07:00+08:00"),
             )
@@ -5213,7 +5506,12 @@ def test_touch_reaction_has_no_relation_delta() -> None:
     providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
     try:
         with SessionLocal() as session:
-            ensure_seed(session, user_id=user_id, character_id="sakura")
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            user = session.get(User, user_id)
+            character = session.get(Character, "atri")
+            assert user is not None and character is not None
+            user.tts_enabled = False
+            character.tts_voice_profile_id = ""
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -5226,12 +5524,396 @@ def test_touch_reaction_has_no_relation_delta() -> None:
                 ),
             )
             session.commit()
-            refresh_touch_reaction_pools(session, user_id=user_id, character_id="sakura")
-            result = consume_touch_reaction(session, user_id=user_id, character_id="sakura", hit_area="head")
+            refresh_touch_reaction_pools(session, user_id=user_id, character_id="atri")
+            result = consume_touch_reaction(session, user_id=user_id, character_id="atri", hit_area="head")
             assert result["text"]
             assert "affection" not in result
     finally:
         providers.HTTP_TRANSPORT = None
+
+
+def test_touch_prompt_includes_japanese_schema_for_ja_voice() -> None:
+    with SessionLocal() as session:
+        ensure_seed(session, character_id="atri")
+        character = session.get(Character, "atri")
+        relation = session.execute(
+            select(RelationState).where(RelationState.user_id == "demo_user", RelationState.character_id == "atri")
+        ).scalar_one()
+        assert character is not None
+        prompt = _touch_prompt(
+            session, character, relation, "head", "mid", appearance_id="neko", requires_japanese_tts=True
+        )
+        assert "tts_text_ja" in prompt
+        assert "中文供界面显示" in prompt
+        zh_prompt = _touch_prompt(
+            session, character, relation, "head", "mid", appearance_id="neko", requires_japanese_tts=False
+        )
+        assert "tts_text_ja" not in zh_prompt
+
+
+def test_touch_tier_style_guidance_differs() -> None:
+    low = _tier_style_guidance("low", "")
+    mid = _tier_style_guidance("mid", "")
+    high = _tier_style_guidance("high", " 可暧昧。")
+    assert low != mid
+    assert "不要暧昧" in low
+    assert "可暧昧" in high
+
+
+def test_refresh_touch_pools_honors_explicit_tier() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_tier_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "触摸了你的" in body["messages"][1]["content"]:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "lines": [
+                                            {"text": "别碰。", "emotion": "shy", "expression": "shy", "motion": "TapHead"},
+                                            {"text": "会害羞的。", "emotion": "happy", "expression": "happy", "motion": "TapHead"},
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            relation = session.execute(
+                select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == "atri")
+            ).scalar_one()
+            relation.affection = 80
+            user = session.get(User, user_id)
+            character = session.get(Character, "atri")
+            assert user is not None and character is not None
+            user.tts_enabled = False
+            character.tts_voice_profile_id = ""
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_touch_tier_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.commit()
+            result = refresh_touch_reaction_pools(
+                session,
+                user_id=user_id,
+                character_id="atri",
+                hit_area="head",
+                tier="low",
+                force=True,
+            )
+            assert result["tiers_refreshed"] == ["low"]
+            pool = session.execute(
+                select(TouchReactionPool).where(
+                    TouchReactionPool.user_id == user_id,
+                    TouchReactionPool.character_id == "atri",
+                    TouchReactionPool.hit_area == "head",
+                    TouchReactionPool.tier == "low",
+                )
+            ).scalar_one()
+            assert len(json.loads(pool.lines_json)) >= 2
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_refresh_touch_pools_can_refresh_all_tiers() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_all_tier_user_{suffix}"
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "触摸了你的" in body["messages"][1]["content"]:
+            calls["count"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "lines": [
+                                            {"text": "嗯？", "emotion": "calm", "expression": "calm", "motion": "TapBody"},
+                                            {"text": "怎么啦。", "emotion": "happy", "expression": "happy", "motion": "TapBody"},
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            user = session.get(User, user_id)
+            character = session.get(Character, "atri")
+            assert user is not None and character is not None
+            user.tts_enabled = False
+            character.tts_voice_profile_id = ""
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_touch_all_tier_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.commit()
+            result = refresh_touch_reaction_pools(
+                session,
+                user_id=user_id,
+                character_id="atri",
+                hit_area="head",
+                tiers=["low", "mid", "high"],
+                force=True,
+            )
+            assert set(result["tiers_refreshed"]) == {"low", "mid", "high"}
+            assert calls["count"] == 3
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_touch_pool_generation_requires_tts_text_ja_for_japanese_voice() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_ja_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "触摸了你的" in body["messages"][1]["content"]:
+            assert "tts_text_ja" in body["messages"][1]["content"]
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "lines": [
+                                            {
+                                                "text": "别碰。",
+                                                "tts_text_ja": "触らないで。",
+                                                "emotion": "shy",
+                                                "expression": "shy",
+                                                "motion": "TapHead",
+                                            },
+                                            {
+                                                "text": "会害羞的。",
+                                                "tts_text_ja": "恥ずかしいよ。",
+                                                "emotion": "happy",
+                                                "expression": "happy",
+                                                "motion": "TapHead",
+                                            },
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            user = session.get(User, user_id)
+            character = session.get(Character, "atri")
+            assert user is not None and character is not None
+            user.tts_enabled = True
+            voice = TtsVoiceProfile(
+                voice_id=f"voice_ja_touch_{suffix}",
+                provider_id="",
+                label="测试日文",
+                speaker="ja_speaker",
+                resource_id="ja_resource",
+                language="ja",
+                enabled=True,
+            )
+            session.add(voice)
+            character.tts_voice_profile_id = voice.voice_id
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_touch_ja_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.commit()
+            refresh_touch_reaction_pools(
+                session,
+                user_id=user_id,
+                character_id="atri",
+                hit_area="head",
+                tier="mid",
+                force=True,
+            )
+            pool = session.execute(
+                select(TouchReactionPool).where(
+                    TouchReactionPool.user_id == user_id,
+                    TouchReactionPool.character_id == "atri",
+                    TouchReactionPool.hit_area == "head",
+                    TouchReactionPool.tier == "mid",
+                )
+            ).scalar_one()
+            lines = json.loads(pool.lines_json)
+            assert lines[0]["tts_text_ja"] == "触らないで。"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_list_touch_pool_admin_all_view() -> None:
+    with SessionLocal() as session:
+        ensure_seed(session, character_id="atri")
+        payload = list_touch_pool_admin(session, user_id="demo_user", character_id="atri", hit_area="head", tier="all")
+        assert payload["view_mode"] == "all"
+        assert len(payload["tiers"]) == 3
+
+
+def test_consume_touch_reaction_missing_pool_raises() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_missing_pool_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        with pytest.raises(ProviderError, match="touch_pool_missing"):
+            consume_touch_reaction(session, user_id=user_id, character_id="atri", hit_area="head")
+
+
+def test_live2d_touch_api_returns_404_when_pool_missing() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"touch_missing_api_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        session.commit()
+    response = client.post(
+        "/api/live2d/touch",
+        json={"user_id": user_id, "character_id": "atri", "appearance_id": "neko", "hit_area": "head"},
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["pool_missing"] is True
+
+
+def test_touch_pool_coverage_admin_reports_matrix() -> None:
+    with SessionLocal() as session:
+        ensure_seed(session, user_id="demo_user", character_id="atri")
+        payload = touch_pool_coverage_admin(session, user_id="demo_user", character_id="atri", appearance_id="neko")
+        assert payload["relation_tier"] in {"low", "mid", "high"}
+        assert len(payload["matrix"]) == len(payload["hit_areas"]) * 3
+        assert "bundle_preview" in payload
+
+
+def test_consume_touch_reaction_can_use_shared_pool() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    source_user = f"touch_source_user_{suffix}"
+    target_user = f"touch_target_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        if "触摸了你的" in body["messages"][1]["content"]:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "lines": [
+                                            {"text": "共享池台词一。", "emotion": "shy", "expression": "shy", "motion": "TapHead"},
+                                            {"text": "共享池台词二。", "emotion": "happy", "expression": "happy", "motion": "TapHead"},
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=source_user, character_id="atri")
+            ensure_seed(session, user_id=target_user, character_id="atri")
+            user = session.get(User, source_user)
+            character = session.get(Character, "atri")
+            assert user is not None and character is not None
+            user.tts_enabled = False
+            for uid in (source_user, target_user):
+                relation = session.execute(
+                    select(RelationState).where(RelationState.user_id == uid, RelationState.character_id == "atri")
+                ).scalar_one()
+                relation.affection = 20
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_shared_touch_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.commit()
+            refresh_touch_reaction_pools(session, user_id=source_user, character_id="atri", hit_area="chest", tier="low", force=True)
+            result = consume_touch_reaction(session, user_id=target_user, character_id="atri", hit_area="chest")
+            assert result["text"]
+            tracking = session.execute(
+                select(TouchReactionPool).where(
+                    TouchReactionPool.user_id == target_user,
+                    TouchReactionPool.character_id == "atri",
+                    TouchReactionPool.hit_area == "chest",
+                    TouchReactionPool.tier == "low",
+                )
+            ).scalar_one_or_none()
+            assert tracking is not None
+            assert json.loads(tracking.consumed_indices_json)
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_instant_greeting_payload_uses_full_script() -> None:
+    payload = _instant_greeting_payload(datetime(2026, 6, 11, 9, 0, tzinfo=timezone.utc))
+    assert payload.reply_mode == "opening"
+    assert len(payload.lines) == 3
 
 
 def test_dialogue_line_supports_expression_field() -> None:
@@ -5246,3 +5928,154 @@ def test_dialogue_line_supports_expression_field() -> None:
     assert payload["expression"] == "shy"
     restored = DialogueLine.model_validate(payload)
     assert restored.expression == "shy"
+
+
+def _map_screen_to_model_space(screen_x: float, screen_y: float, placement: dict[str, float]) -> tuple[float, float]:
+    horizontal_range = 480.0
+    vertical_range = 900.0
+    bottom_inset_range = 650.0
+    character_center_x = 0.5
+    character_center_y = 0.42
+    scale = max(0.25, min(4.0, float(placement.get("scale", 1.0))))
+    offset_x_norm = float(placement.get("offsetX", 0.0)) / horizontal_range * 0.14
+    offset_y_norm = float(placement.get("offsetY", 0.0)) / vertical_range * 0.11
+    bottom_lift = float(placement.get("bottomInset", 0.0)) / bottom_inset_range * 0.07
+    x = screen_x - offset_x_norm
+    y = screen_y + bottom_lift - offset_y_norm
+    x = character_center_x + (x - character_center_x) / max(scale, 0.25)
+    y = character_center_y + (y - character_center_y) / max(scale, 0.25)
+    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+
+def _map_model_to_screen_space(model_x: float, model_y: float, placement: dict[str, float]) -> tuple[float, float]:
+    horizontal_range = 480.0
+    vertical_range = 900.0
+    bottom_inset_range = 650.0
+    character_center_x = 0.5
+    character_center_y = 0.42
+    scale = max(0.25, min(4.0, float(placement.get("scale", 1.0))))
+    offset_x_norm = float(placement.get("offsetX", 0.0)) / horizontal_range * 0.14
+    offset_y_norm = float(placement.get("offsetY", 0.0)) / vertical_range * 0.11
+    bottom_lift = float(placement.get("bottomInset", 0.0)) / bottom_inset_range * 0.07
+    x = character_center_x + (model_x - character_center_x) * max(scale, 0.25)
+    y = character_center_y + (model_y - character_center_y) * max(scale, 0.25)
+    x += offset_x_norm
+    y = y + offset_y_norm - bottom_lift
+    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+
+
+def test_live2d_bootstrap_includes_default_placement() -> None:
+    payload = client.get("/api/bootstrap").json()
+    live2d = payload["live2d"]
+    assert live2d["appearance_id"] == "neko"
+    assert live2d["character_id"] == "neko"
+    assert live2d["default_placement"]["scale"] == 1.1
+    assert live2d["default_placement"]["bottomInset"] == 30
+
+
+def test_bootstrap_appearance_switch_changes_config_version() -> None:
+    neko = client.get("/api/bootstrap", params={"appearance_id": "neko"}).json()["live2d"]
+    atri = client.get("/api/bootstrap", params={"appearance_id": "atri"}).json()["live2d"]
+    assert neko["appearance_id"] == "neko"
+    assert atri["appearance_id"] == "atri"
+    assert neko["config_version"] != atri["config_version"]
+
+
+def test_live2d_config_endpoint_matches_bootstrap_hit_areas() -> None:
+    bootstrap_live2d = client.get("/api/bootstrap", params={"appearance_id": "neko"}).json()["live2d"]
+    config = client.get("/api/live2d/config", params={"appearance_id": "neko"}).json()
+    assert config["appearance_id"] == "neko"
+    assert config["config_version"] == bootstrap_live2d["config_version"]
+    assert config["hit_areas"] == bootstrap_live2d["hit_areas"]
+    assert config["touch_pool_version"] == bootstrap_live2d["touch_pool_version"]
+
+
+def test_update_hit_area_changes_live2d_config_version() -> None:
+    from app.live2d_config import get_hit_area, update_hit_area
+
+    before = client.get("/api/live2d/config", params={"appearance_id": "neko"}).json()
+    with SessionLocal() as session:
+        ensure_seed(session, character_id="atri")
+        row = get_hit_area(session, appearance_id="neko", area_id="head")
+        assert row is not None
+        update_hit_area(
+            session,
+            appearance_id="neko",
+            area_id="head",
+            payload={"left": round(row.left + 0.03, 2)},
+        )
+        session.commit()
+        updated_left = get_hit_area(session, appearance_id="neko", area_id="head").left
+    after = client.get("/api/live2d/config", params={"appearance_id": "neko"}).json()
+    head = next(item for item in after["hit_areas"] if item["area_id"] == "head")
+    assert head["left"] == updated_left
+    assert after["config_version"] != before["config_version"]
+
+
+def test_live2d_preview_config_modes() -> None:
+    neko = client.get("/api/admin/live2d/preview-config", params={"appearance_id": "neko"}).json()
+    atri = client.get("/api/admin/live2d/preview-config", params={"appearance_id": "atri"}).json()
+    assert neko["renderer_mode"] == "live2d"
+    assert neko["model_url"].endswith("neko.model3.json")
+    assert atri["renderer_mode"] == "static_png"
+    assert atri["default_placement"]["scale"] == 1.14
+
+
+def _map_model_to_screen_space_raw(model_x: float, model_y: float, placement: dict[str, float]) -> tuple[float, float]:
+    horizontal_range = 480.0
+    vertical_range = 900.0
+    bottom_inset_range = 650.0
+    character_center_x = 0.5
+    character_center_y = 0.42
+    scale = max(0.25, min(4.0, float(placement.get("scale", 1.0))))
+    offset_x_norm = float(placement.get("offsetX", 0.0)) / horizontal_range * 0.14
+    offset_y_norm = float(placement.get("offsetY", 0.0)) / vertical_range * 0.11
+    bottom_lift = float(placement.get("bottomInset", 0.0)) / bottom_inset_range * 0.07
+    x = character_center_x + (model_x - character_center_x) * max(scale, 0.25)
+    y = character_center_y + (model_y - character_center_y) * max(scale, 0.25)
+    x += offset_x_norm
+    y = y + offset_y_norm - bottom_lift
+    return x, y
+
+
+def test_live2d_character_screen_rect_follows_placement_scale() -> None:
+    def character_height(placement: dict[str, float]) -> float:
+        top = _map_model_to_screen_space_raw(0.5, 0.0, placement)
+        bottom = _map_model_to_screen_space_raw(0.5, 1.0, placement)
+        return abs(bottom[1] - top[1])
+
+    default = {"scale": 1.1, "offsetX": 0.0, "offsetY": -10.0, "bottomInset": 30.0}
+    shifted = {"scale": 1.32, "offsetX": 48.0, "offsetY": -28.0, "bottomInset": 38.0}
+    assert character_height(shifted) > character_height(default)
+
+
+def test_live2d_hit_area_accepts_extended_model_coords() -> None:
+    from app.live2d_config import MODEL_COORD_MAX, MODEL_COORD_MIN, _normalize_area_payload
+
+    payload = _normalize_area_payload(
+        {
+            "area_id": "leg",
+            "character_id": "neko",
+            "label": "腿",
+            "left": 0.2,
+            "top": 0.7,
+            "right": 1.2,
+            "bottom": 1.35,
+        }
+    )
+    assert payload["bottom"] == 1.35
+    assert payload["right"] == 1.2
+    assert MODEL_COORD_MIN == -0.5
+    assert MODEL_COORD_MAX == 1.5
+
+
+def test_live2d_coordinate_round_trip_matches_placement_adjustment() -> None:
+    placement = {"scale": 1.0, "offsetX": 0.0, "offsetY": 0.0, "bottomInset": 0.0}
+    centered = _map_screen_to_model_space(0.5, 0.4, placement)
+    round_trip = _map_model_to_screen_space(centered[0], centered[1], placement)
+    assert round_trip[0] == pytest.approx(0.5, abs=0.02)
+    assert round_trip[1] == pytest.approx(0.4, abs=0.02)
+
+    shifted_placement = {"scale": 1.4, "offsetX": 40.0, "offsetY": 0.0, "bottomInset": 0.0}
+    shifted = _map_screen_to_model_space(0.5, 0.4, shifted_placement)
+    assert shifted[0] != pytest.approx(centered[0], abs=0.001) or shifted[1] != pytest.approx(centered[1], abs=0.001)

@@ -33,7 +33,7 @@ from .persona import (
     relation_attitude,
     user_profile_summary,
 )
-from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected
+from .proactive import consume_proactive_event, mark_proactive_opened, mark_proactive_reflected, proactive_media_asset_id
 from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider, get_task_llm_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
@@ -693,7 +693,7 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
                         ),
                     },
                 ],
-                max_tokens=180,
+                max_tokens=1024,
                 temperature=0.2,
                 diagnostic={
                     "feature": "日文 TTS 修复",
@@ -760,6 +760,7 @@ def _save_message(
     source: str = "",
     relation_delta: RelationDelta | None = None,
     tts_audio_asset_id: str = "",
+    media_asset_id: str = "",
 ) -> Message:
     msg = Message(
         message_id=uid("msg"),
@@ -773,6 +774,7 @@ def _save_message(
         source=source,
         relation_delta_json=dump_json((relation_delta or RelationDelta()).model_dump()),
         tts_audio_asset_id=tts_audio_asset_id,
+        media_asset_id=media_asset_id,
     )
     session.add(msg)
     return msg
@@ -1511,7 +1513,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
 
 
 def _save_dialogue_lines(session: Session, event: EventIn, payload: DialoguePayload) -> None:
-    for line in payload.lines:
+    for index, line in enumerate(payload.lines):
         _save_message(
             session,
             event=event,
@@ -1521,6 +1523,7 @@ def _save_dialogue_lines(session: Session, event: EventIn, payload: DialoguePayl
             source=event.event_type,
             relation_delta=payload.relation_delta,
             tts_audio_asset_id=line.tts_audio_url.rsplit("/", 1)[-1] if line.tts_audio_url else "",
+            media_asset_id=payload.media_asset_id if index == 0 else "",
         )
 
 
@@ -1621,6 +1624,9 @@ def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
                 except ProviderError:
                     consume_proactive_event(session, proactive.proactive_event_id)
                     raise
+            media_asset_id = proactive_media_asset_id(proactive)
+            if media_asset_id and not payload.media_asset_id:
+                payload.media_asset_id = media_asset_id
             if not payload.lines:
                 with diagnostic_span(
                     "reply_stage",

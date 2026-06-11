@@ -39,6 +39,8 @@ final class NekoLive2DModel extends CubismUserModel {
     private float smoothedLookY;
     private float motionPulse;
     private long lastCommandNonce = Long.MIN_VALUE;
+    private String lastMotionName = "";
+    private String lastExpressionName = "";
     private String activeExpression = "";
     private float smoothedDroopyEye;
     private float smoothedDroopyBrow;
@@ -129,14 +131,18 @@ final class NekoLive2DModel extends CubismUserModel {
             return;
         }
         elapsedSeconds += Math.max(0.0f, deltaSeconds);
-        if (command != null && command.getCommandNonce() != lastCommandNonce) {
+        if (command != null) {
             lastCommandNonce = command.getCommandNonce();
-            motionPulse = 1.0f;
         }
         motionPulse = approach(motionPulse, 0.0f, deltaSeconds * 1.8f);
 
         String emotion = command == null ? "calm" : normalize(command.getEmotion());
         String motion = command == null ? "idle" : normalize(command.getMotion());
+        if (!motion.equals(lastMotionName) || !emotion.equals(lastExpressionName)) {
+            motionPulse = 1.0f;
+            lastMotionName = motion;
+            lastExpressionName = emotion;
+        }
         float targetMouth = command == null ? 0.0f : clamp(command.getMouthOpen(), 0.0f, 1.0f);
         if (command == null || !command.getSpeaking()) {
             targetMouth *= 0.18f;

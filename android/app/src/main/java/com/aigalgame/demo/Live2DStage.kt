@@ -3,6 +3,7 @@ package com.aigalgame.demo
 import android.util.Log
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
@@ -71,7 +72,10 @@ fun Live2DStage(
     live2DVisible: Boolean = true,
     onRendererStatus: (OfficialLive2DRendererStatus) -> Unit = {},
     tapBridge: Live2DTapBridge? = null,
-    useInternalTapLayer: Boolean = true
+    useInternalTapLayer: Boolean = true,
+    remoteHitAreas: List<Live2DHitArea> = emptyList(),
+    remoteReactions: List<Live2DReactionConfig> = emptyList(),
+    touchCooldownRequest: TouchCooldownRequest? = null
 ) {
     val context = LocalContext.current
     val controller = remember(character) { Live2DController(context, character) }
@@ -106,6 +110,17 @@ fun Live2DStage(
         }
     }
 
+    LaunchedEffect(remoteHitAreas, remoteReactions) {
+        if (remoteHitAreas.isNotEmpty()) {
+            controller.applyRemoteConfig(remoteHitAreas, remoteReactions)
+        }
+    }
+
+    LaunchedEffect(touchCooldownRequest) {
+        val request = touchCooldownRequest ?: return@LaunchedEffect
+        controller.applyTouchCooldown(request.hitArea, request.cooldownMs, System.currentTimeMillis())
+    }
+
     val transformState = rememberTransformableState { zoomChange, panChange, _ ->
         if (!editable || onPlacementChange == null) return@rememberTransformableState
         val dx = with(density) { panChange.x.toDp().value }
@@ -130,11 +145,20 @@ fun Live2DStage(
         if (reaction != null) onReaction(reaction)
     }
 
-    DisposableEffect(tapBridge) {
+    DisposableEffect(tapBridge, effectivePlacement) {
+        tapBridge?.setGazeHandler { normalizedX, normalizedY ->
+            controller.updateGazeFromTap(
+                normalizedX = normalizedX.coerceIn(0f, 1f),
+                normalizedY = normalizedY.coerceIn(0f, 1f),
+                placement = effectivePlacement,
+                nowMs = System.currentTimeMillis()
+            )
+        }
         tapBridge?.setHandler { normalizedX, normalizedY ->
             handleStageTap(normalizedX, normalizedY)
         }
         onDispose {
+            tapBridge?.setGazeHandler(null)
             tapBridge?.setHandler(null)
         }
     }
@@ -256,13 +280,15 @@ fun Live2DStage(
 }
 
 @Composable
-fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
+fun Live2DSelfTestStage(vm: MainViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val controller = remember { Live2DController(context, Live2DCharacterConfigs.DefaultCharacter) }
     var status by remember { mutableStateOf<OfficialLive2DRendererStatus?>(null) }
     var error by remember { mutableStateOf("") }
     var hitDebug by remember { mutableStateOf("Tap model to test hit areas") }
-    val placement = remember { defaultOutfitPlacement("neko").coerceForStage() }
+    var hitAreas by remember { mutableStateOf<List<Live2DHitArea>>(emptyList()) }
+    var hitAreaMeta by remember { mutableStateOf("Loading hit areas from server…") }
+    val placement = (vm.outfitPlacements["neko"] ?: defaultOutfitPlacement("neko")).coerceForStage()
     val command = remember(placement) {
         Live2DRenderCommand(
             characterId = "neko",
@@ -277,7 +303,25 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
             commandNonce = 1L
         )
     }
-    val hitAreas = remember { Live2DCharacterConfigs.forCharacter("neko").hitAreas }
+    val effectiveHitAreas = hitAreas.ifEmpty { Live2DCharacterConfigs.forCharacter("neko").hitAreas }
+    LaunchedEffect(vm.baseUrl) {
+        if (vm.baseUrl.isBlank()) {
+            hitAreaMeta = "未连接后端，使用 APK 内置默认区域"
+            return@LaunchedEffect
+        }
+        val (remoteAreas, configVersion) = vm.fetchNekoSelfTestHitAreas()
+        if (remoteAreas.isNotEmpty()) {
+            hitAreas = remoteAreas
+            hitAreaMeta = "appearance=neko · config_version=$configVersion · ${remoteAreas.size} areas (server)"
+        } else {
+            hitAreaMeta = "拉取失败或无数据，使用 APK 内置默认区域"
+        }
+    }
+    LaunchedEffect(effectiveHitAreas) {
+        if (effectiveHitAreas.isNotEmpty()) {
+            controller.applyRemoteConfig(effectiveHitAreas, emptyList())
+        }
+    }
     Box(modifier) {
         SakuraSceneBackground("classroom")
         OfficialLive2DAndroidStage(
@@ -285,7 +329,7 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
             visible = true,
             onTap = { normalizedX, normalizedY ->
                 val (modelX, modelY) = Live2DHitTest.mapScreenToModelSpace(normalizedX, normalizedY, placement)
-                val hit = hitAreas.firstOrNull { it.contains(modelX, modelY) }?.id ?: "miss"
+                val hit = effectiveHitAreas.firstOrNull { it.contains(modelX, modelY) }?.id ?: "miss"
                 hitDebug = "screen(${String.format("%.2f", normalizedX)}, ${String.format("%.2f", normalizedY)}) " +
                     "→ model(${String.format("%.2f", modelX)}, ${String.format("%.2f", modelY)}) → $hit"
                 controller.handleTap(normalizedX, normalizedY, placement, RelationState(), System.currentTimeMillis())
@@ -297,7 +341,7 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
                 .zIndex(1f)
         )
         HitAreaDebugOverlay(
-            hitAreas = hitAreas,
+            hitAreas = effectiveHitAreas,
             placement = placement,
             modifier = Modifier
                 .fillMaxSize()
@@ -312,6 +356,17 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
                 .padding(10.dp)
                 .background(Color(0x99000000))
                 .padding(8.dp)
+                .zIndex(4f)
+        )
+        Text(
+            text = hitAreaMeta,
+            color = Color(0xFF9AD0FF),
+            fontSize = 10.sp,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(10.dp)
+                .background(Color(0x99000000))
+                .padding(6.dp)
                 .zIndex(4f)
         )
         Text(
@@ -437,8 +492,8 @@ fun HitAreaDebugOverlay(
         val heightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
         Canvas(Modifier.fillMaxSize()) {
             for (area in hitAreas) {
-                val (leftX, topY) = Live2DHitTest.mapModelToScreenSpace(area.left, area.top, placement)
-                val (rightX, bottomY) = Live2DHitTest.mapModelToScreenSpace(area.right, area.bottom, placement)
+                val (leftX, topY) = Live2DHitTest.mapModelToScreenSpaceRaw(area.left, area.top, placement)
+                val (rightX, bottomY) = Live2DHitTest.mapModelToScreenSpaceRaw(area.right, area.bottom, placement)
                 val left = minOf(leftX, rightX) * widthPx
                 val top = minOf(topY, bottomY) * heightPx
                 val rectWidth = kotlin.math.abs(rightX - leftX) * widthPx
@@ -518,11 +573,45 @@ fun StandeeGestureZone(
 }
 
 @Composable
+fun GazeDragZone(
+    enabled: Boolean,
+    onGaze: (Float, Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (!enabled) return
+    Box(
+        modifier
+            .fillMaxSize()
+            .pointerInput(enabled) {
+                fun emitGaze(x: Float, y: Float) {
+                    onGaze(
+                        x / size.width.coerceAtLeast(1).toFloat(),
+                        y / size.height.coerceAtLeast(1).toFloat()
+                    )
+                }
+                detectDragGestures(
+                    onDragStart = { offset -> emitGaze(offset.x, offset.y) },
+                    onDrag = { change, _ -> emitGaze(change.position.x, change.position.y) }
+                )
+            }
+            .pointerInput(enabled) {
+                detectTapGestures { offset ->
+                    onGaze(
+                        offset.x / size.width.coerceAtLeast(1).toFloat(),
+                        offset.y / size.height.coerceAtLeast(1).toFloat()
+                    )
+                }
+            }
+    )
+}
+
+@Composable
 fun CharacterTapZone(
     enabled: Boolean,
     headerBottomPx: Int,
     panelTopPx: Int,
     onTap: (Float, Float) -> Unit,
+    onGaze: (Float, Float) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     if (!enabled || panelTopPx <= headerBottomPx) return
@@ -534,16 +623,32 @@ fun CharacterTapZone(
     BoxWithConstraints(modifier) {
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenHeightPx = with(density) { maxHeight.toPx() }
+        fun toScreenCoords(localX: Float, localY: Float): Pair<Float, Float> {
+            val screenX = localX / screenWidthPx.coerceAtLeast(1f)
+            val screenY = (topPx + localY) / screenHeightPx.coerceAtLeast(1f)
+            return screenX.coerceIn(0f, 1f) to screenY.coerceIn(0f, 1f)
+        }
         Box(
             Modifier
                 .offset { IntOffset(0, topPx) }
                 .fillMaxWidth()
                 .height(with(density) { heightPx.toDp() })
                 .pointerInput(enabled, topPx, heightPx, screenWidthPx, screenHeightPx) {
+                    detectDragGestures(
+                        onDragStart = { offset ->
+                            val (x, y) = toScreenCoords(offset.x, offset.y)
+                            onGaze(x, y)
+                        },
+                        onDrag = { change, _ ->
+                            val (x, y) = toScreenCoords(change.position.x, change.position.y)
+                            onGaze(x, y)
+                        }
+                    )
+                }
+                .pointerInput(enabled, topPx, heightPx, screenWidthPx, screenHeightPx) {
                     detectTapGestures { offset ->
-                        val screenX = offset.x / screenWidthPx.coerceAtLeast(1f)
-                        val screenY = (topPx + offset.y) / screenHeightPx.coerceAtLeast(1f)
-                        onTap(screenX.coerceIn(0f, 1f), screenY.coerceIn(0f, 1f))
+                        val (x, y) = toScreenCoords(offset.x, offset.y)
+                        onTap(x, y)
                     }
                 }
         )

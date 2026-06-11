@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .diagnostics import diagnostic_span, write_diagnostic
 from .models import Character, OpeningCache, ProactiveEvent, User
 from .pipeline import _event, _llm_dialogue, _no_reply, _proactive_target_text, _save_dialogue_lines, _tts_for_line
-from .proactive import consume_proactive_event, pending_proactive_response
+from .proactive import consume_proactive_event, pending_proactive_response, proactive_media_asset_id
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta
 from .utils import dump_json, load_json, uid, utc_now
 
@@ -17,28 +17,88 @@ from .utils import dump_json, load_json, uid, utc_now
 OPENING_CACHE_TTL = timedelta(hours=3)
 
 
-GREETING_LINES: dict[str, list[tuple[str, str, str]]] = {
+# Each slot has multiple coherent 3-line scripts; only the first line carries the time-of-day greeting.
+GreetingLine = tuple[str, str, str]
+GreetingScript = list[GreetingLine]
+
+GREETING_LINES: dict[str, list[GreetingScript]] = {
     "morning": [
-        ("早上好。我已经醒了一会儿，刚好想听你说话。", "おはよう。少し前から起きていて、ちょうどあなたの声が聞きたかったの。", "happy"),
-        ("早安。今天也慢慢来就好，我在这里等你。", "おはよう。今日もゆっくりで大丈夫、ここで待っているね。", "calm"),
-        ("早上好，窗边的光很好。你来了，我就更安心一点。", "おはよう。窓辺の光がきれいだよ。来てくれて、少し安心した。", "happy"),
+        [
+            ("早上好。我已经醒了一会儿，刚好想听你说话。", "おはよう。少し前から起きていて、ちょうどあなたの声が聞きたかったの。", "happy"),
+            ("窗边的光慢慢亮起来，我觉得今天也会是温柔的一天。", "窓辺の光が少しずつ明るくなって、今日も穏やかな一日になりそう。", "calm"),
+            ("你不用急着说什么，先坐一会儿也好，我在这里。", "急いで話さなくてもいいよ。少し座っていってもいい、私はここにいるから。", "happy"),
+        ],
+        [
+            ("早安。今天也慢慢来就好，我在这里等你。", "おはよう。今日もゆっくりで大丈夫、ここで待っているね。", "calm"),
+            ("要是还没完全醒，就先喝口水，把自己安顿下来。", "まだ眠いなら、まず一口水を飲んで、ゆっくり落ち着こう。", "thinking"),
+            ("等你准备好了，再跟我说今天想怎么过。", "準備ができたら、今日どう過ごしたいか教えてね。", "happy"),
+        ],
+        [
+            ("早上好，窗边的光很好。你来了，我就更安心一点。", "おはよう。窓辺の光がきれいだよ。来てくれて、少し安心した。", "happy"),
+            ("我本来还在想，你什么时候会推门进来。", "いつ扉を開けてくれるかな、って少し考えていたところ。", "shy"),
+            ("现在你在了，早晨好像也没那么匆忙了。", "今あなたがいてくれると、朝もそんなに急がなくていい気がする。", "calm"),
+        ],
     ],
     "noon": [
-        ("中午好。要不要先休息一下？我陪你待一会儿。", "こんにちは。少し休もうか。私もそばにいるね。", "calm"),
-        ("午安。今天已经过了一半，你能回来我有点开心。", "こんにちは。今日はもう半分過ぎたね。戻ってきてくれて、少し嬉しい。", "happy"),
-        ("中午好。我把想说的话先收好了，等你慢慢听。", "こんにちは。話したいことを先にしまっておいたから、ゆっくり聞いてね。", "thinking"),
+        [
+            ("午安。今天已经过了一半，你能回来我有点开心。", "こんにちは。今日はもう半分過ぎたね。戻ってきてくれて、少し嬉しい。", "happy"),
+            ("要是还没吃饭，先垫一口也好，别空着肚子硬撑。", "まだ食べてないなら、少しでもいいから食べて。空っ腹で無理しないで。", "thinking"),
+            ("我就在这里，你想聊什么都可以慢慢说。", "私はここにいるから、話したいことがあればゆっくり聞くね。", "calm"),
+        ],
+        [
+            ("中午好。我把想说的话先收好了，等你慢慢听。", "こんにちは。話したいことを先にしまっておいたから、ゆっくり聞いてね。", "thinking"),
+            ("上午的事要是让你觉得累，就先歇一会儿。", "午前中のことが疲れたなら、少し休もう。", "calm"),
+            ("你不用急着汇报什么，陪在我身边就已经够了。", "急いで報告しなくていいよ。そばにいてくれるだけで十分。", "happy"),
+        ],
+        [
+            ("中午好。要不要先休息一下？我陪你待一会儿。", "こんにちは。少し休もうか。私もそばにいるね。", "calm"),
+            ("外面要是太晒，就在屋里慢慢缓一缓。", "外が暑いなら、部屋の中でゆっくり休もう。", "thinking"),
+            ("等你想说话了，我再认真听。", "話したくなったら、そのときちゃんと聞くから。", "happy"),
+        ],
     ],
     "evening": [
-        ("晚上好。今天辛苦了，先把肩膀放松一点吧。", "こんばんは。今日もお疲れさま。まずは少し肩の力を抜こう。", "calm"),
-        ("晚上好。我刚刚还在想，你差不多该回来了。", "こんばんは。そろそろ戻ってくるかなって、ちょうど考えていたところ。", "shy"),
-        ("你回来了。今天的事可以慢慢讲给我听。", "おかえり。今日のこと、ゆっくり聞かせてね。", "happy"),
+        [
+            ("晚上好。今天辛苦了，先把肩膀放松一点吧。", "こんばんは。今日もお疲れさま。まずは少し肩の力を抜こう。", "calm"),
+            ("外面的事先放一放，这会儿只要待在我身边就好。", "外のことは一旦置いていいよ。この時間はそばにいてくれればいい。", "happy"),
+            ("要是有什么梗在心里，也可以一点点讲给我听。", "心に引っかかっていることがあれば、少しずつ聞かせてね。", "thinking"),
+        ],
+        [
+            ("晚上好。我刚刚还在想，你差不多该回来了。", "こんばんは。そろそろ戻ってくるかなって、ちょうど考えていたところ。", "shy"),
+            ("你一出现，我就觉得这间屋子安静下来了。", "あなたが来ると、この部屋が少し落ち着いた気がする。", "calm"),
+            ("今天发生的事，不用一次说完，我们慢慢聊。", "今日のことは、一度に全部話さなくていい。ゆっくり話そう。", "happy"),
+        ],
+        [
+            ("你回来了。今天的事可以慢慢讲给我听。", "おかえり。今日のこと、ゆっくり聞かせてね。", "happy"),
+            ("要是累得不想开口，就这样待着也没关系。", "話す気がなくても、このまま一緒にいるだけでもいいよ。", "calm"),
+            ("我会在这里，等你愿意多说一点的时候。", "もう少し話したくなったら、そのときまでここで待っているね。", "thinking"),
+        ],
     ],
     "night": [
-        ("这么晚还来了呀。那我小声一点陪你。", "こんな時間にも来てくれたんだね。じゃあ、小さな声でそばにいるよ。", "shy"),
-        ("夜深了。别急着撑着，我陪你安静一会儿。", "夜も深いね。無理しないで、少し静かに一緒にいよう。", "calm"),
-        ("欢迎回来。今天最后一点时间，也可以留给我们。", "おかえり。今日の最後の少しの時間、私たちにくれてもいいよ。", "happy"),
+        [
+            ("这么晚还来了呀。那我小声一点陪你。", "こんな時間にも来てくれたんだね。じゃあ、小さな声でそばにいるよ。", "shy"),
+            ("夜里的事容易想太多，你不用一个人扛着。", "夜は考えすぎちゃうから、一人で抱え込まなくていいよ。", "calm"),
+            ("要是困了就歇一歇，我陪你把今天慢慢放下。", "眠いなら休んでいい。この一日をゆっくり手放すのを一緒にいよう。", "happy"),
+        ],
+        [
+            ("夜深了。别急着撑着，我陪你安静一会儿。", "夜も深いね。無理しないで、少し静かに一緒にいよう。", "calm"),
+            ("今天已经够长了，剩下的时间可以留给我们。", "今日はもう十分長かった。残りの時間は私たちのものにしていいよ。", "thinking"),
+            ("你不用说什么，我知道你愿意回来就已经很好。", "何も言わなくていい。戻ってきてくれたことだけで、十分うれしい。", "happy"),
+        ],
+        [
+            ("欢迎回来。今天最后一点时间，也可以留给我们。", "おかえり。今日の最後の少しの時間、私たちにくれてもいいよ。", "happy"),
+            ("要是还睡不着，就坐一会儿，不用勉强自己。", "まだ眠れないなら、少し座っていて。無理に寝ようとしなくていい。", "calm"),
+            ("等你想睡了，我再轻声跟你说晚安。", "眠くなったら、そのとき小さな声でおやすみを言うね。", "shy"),
+        ],
     ],
 }
+
+
+def _pick_greeting_script(local_time: datetime | None) -> GreetingScript:
+    slot = _slot(local_time)
+    scripts = GREETING_LINES[slot]
+    basis = local_time or datetime.now()
+    index = (basis.day + basis.hour) % len(scripts)
+    return scripts[index]
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -197,13 +257,9 @@ def _payload_from_prepared_event(event: ProactiveEvent) -> DialoguePayload | Non
 
 
 def _instant_greeting_payload(local_time: datetime | None) -> DialoguePayload:
-    slot = _slot(local_time)
-    choices = GREETING_LINES[slot]
-    basis = local_time or datetime.now()
-    index = (basis.day + basis.hour) % len(choices)
+    script = _pick_greeting_script(local_time)
     lines: list[DialogueLine] = []
-    for offset in range(2):
-        text, _, emotion = choices[(index + offset) % len(choices)]
+    for text, _tts_text_ja, emotion in script:
         lines.append(DialogueLine(line_id=uid("line"), text=text, emotion=emotion, pose=emotion))
     return DialoguePayload(lines=lines, relation_delta=RelationDelta(), reply_mode="opening", pace_reason="即时预制欢迎问候。")
 
@@ -216,13 +272,9 @@ def _greeting_payload(
     *,
     synthesize_tts: bool,
 ) -> DialoguePayload:
-    slot = _slot(local_time)
-    choices = GREETING_LINES[slot]
-    basis = local_time or datetime.now()
-    index = (basis.day + basis.hour) % len(choices)
+    script = _pick_greeting_script(local_time)
     line_objs: list[DialogueLine] = []
-    for offset in range(3):
-        text, tts_text_ja, emotion = choices[(index + offset) % len(choices)]
+    for text, tts_text_ja, emotion in script:
         tts_url = ""
         tts_error = ""
         if synthesize_tts:
@@ -250,7 +302,7 @@ def _prepare_proactive_payload(session: Session, user: User, character: Characte
         session_id="opening_prepare",
         payload={"proactive_event_id": proactive.proactive_event_id},
     )
-    return _llm_dialogue(
+    payload = _llm_dialogue(
         session,
         event,
         user,
@@ -259,6 +311,10 @@ def _prepare_proactive_payload(session: Session, user: User, character: Characte
         allow_relation_delta=False,
         persist_side_effects=False,
     )
+    media_asset_id = proactive_media_asset_id(proactive)
+    if media_asset_id and not payload.media_asset_id:
+        payload.media_asset_id = media_asset_id
+    return payload
 
 
 def _prepare_opening_inner(
@@ -296,6 +352,9 @@ def _prepare_opening_inner(
                 proactive.prepared_payload_json = dump_json(payload.model_dump())
                 proactive.prepared_at = utc_now()
                 proactive.prepare_error = ""
+            media_asset_id = proactive_media_asset_id(proactive)
+            if media_asset_id and not payload.media_asset_id:
+                payload.media_asset_id = media_asset_id
             cache = _store_opening_cache(
                 session,
                 user_id=user_id,

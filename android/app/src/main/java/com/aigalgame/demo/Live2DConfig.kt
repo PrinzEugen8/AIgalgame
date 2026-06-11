@@ -75,10 +75,10 @@ object Live2DCharacterConfigs {
     )
 
     private val defaultHitAreas = listOf(
-        Live2DHitArea("head", "head", left = 0.38f, top = 0.05f, right = 0.62f, bottom = 0.26f),
-        Live2DHitArea("chest", "chest", left = 0.40f, top = 0.28f, right = 0.60f, bottom = 0.48f),
-        Live2DHitArea("hand", "hand", left = 0.28f, top = 0.40f, right = 0.72f, bottom = 0.66f),
-        Live2DHitArea("body", "body", left = 0.34f, top = 0.26f, right = 0.66f, bottom = 0.78f)
+        Live2DHitArea("head", "head", left = 0.38f, top = 0.05f, right = 0.62f, bottom = 0.26f, priority = 40),
+        Live2DHitArea("chest", "chest", left = 0.43f, top = 0.30f, right = 0.57f, bottom = 0.42f, priority = 30),
+        Live2DHitArea("hand", "hand", left = 0.28f, top = 0.40f, right = 0.72f, bottom = 0.66f, priority = 25),
+        Live2DHitArea("body", "body", left = 0.34f, top = 0.26f, right = 0.66f, bottom = 0.78f, priority = 10)
     )
 
     private val defaultReactions = listOf(

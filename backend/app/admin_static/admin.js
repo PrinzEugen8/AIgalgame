@@ -42,10 +42,18 @@ const state = {
   memoryPage: { page: 1, pageSize: 10, total: 0, q: "" },
   calendarPage: { page: 1, pageSize: 10, total: 0, q: "" },
   proactivePage: { page: 1, pageSize: 10, total: 0, q: "" },
-  activeCharacterId: "",
   activeUserId: "",
+  activeCharacterId: "atri",
   editingVoiceId: "",
   editingCalendarEventId: "",
+  live2dAppearanceId: "neko",
+  live2dHitAreas: [],
+  live2dSelectedAreaId: "",
+  live2dReferenceImage: null,
+  live2dPreviewConfig: null,
+  live2dPlacement: { scale: 1.1, offsetX: 0, offsetY: -10, bottomInset: 30 },
+  live2dDrag: null,
+  live2dPreviewReady: false,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -142,6 +150,11 @@ function switchPage(page) {
       .catch((error) => {
         $("#proactiveEditor").innerHTML = `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`;
       });
+  }
+  if (page === "live2d") {
+    loadLive2dManager().catch((error) => {
+      $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+    });
   }
 }
 
@@ -638,7 +651,7 @@ function activeUser() {
 function activeRelation() {
   const user = activeUser();
   if (!user) return null;
-  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === "sakura")
+  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === "atri")
     || state.relations.find((item) => item.user_id === user.user_id)
     || null;
 }
@@ -753,7 +766,7 @@ function renderMemoryEditor() {
       <label><span>层级</span><input name="layer" value="chat"></label>
       <label><span>重要度</span><input name="importance" type="number" step="0.01" value="0.5"></label>
       <label><span>置信度</span><input name="confidence" type="number" step="0.01" value="0.8"></label>
-      <label><span>角色</span><input name="character_id" value="sakura"></label>
+      <label><span>角色</span><input name="character_id" value="atri"></label>
       <label><span>Tags（逗号分隔）</span><input name="tags" placeholder="interest,event"></label>
       <label class="wide"><span>内容</span><textarea name="content"></textarea></label>
       <label class="wide"><span>Metadata JSON</span><textarea name="metadata">{}</textarea></label>
@@ -987,7 +1000,7 @@ function renderProactiveEditor() {
   $("#proactivePrewarm").addEventListener("click", async () => {
     state.proactiveActionResult = await api("/api/admin/proactive-events/prewarm", {
       method: "POST",
-      body: JSON.stringify({ user_id: state.activeUserId, character_id: "sakura", limit: 4 }),
+      body: JSON.stringify({ user_id: state.activeUserId, character_id: "atri", limit: 4 }),
     });
     await loadProactiveEvents();
     renderProactiveEditor();
@@ -1071,7 +1084,7 @@ async function loadCalendarEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "sakura",
+    character_id: "atri",
     page: String(state.calendarPage.page),
     page_size: String(state.calendarPage.pageSize),
     q: state.calendarPage.q,
@@ -1091,7 +1104,7 @@ async function loadProactiveEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "sakura",
+    character_id: "atri",
     page: String(state.proactivePage.page),
     page_size: String(state.proactivePage.pageSize),
     q: state.proactivePage.q,
@@ -1108,7 +1121,7 @@ async function loadAiSchedule() {
     state.aiSchedule = [];
     return;
   }
-  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "sakura" });
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "atri" });
   const payload = await api(`/api/admin/ai-schedule/today?${params.toString()}`);
   state.aiSchedule = payload.items || [];
 }
@@ -1123,7 +1136,7 @@ function proactiveFormPayload() {
   const form = $("#proactiveGenerateForm");
   return {
     user_id: state.activeUserId,
-    character_id: "sakura",
+    character_id: "atri",
     source_type: form.elements.source_type.value,
     slot_id: form.elements.slot_id.value,
     priority: Number(form.elements.priority.value || 80),
@@ -1200,7 +1213,7 @@ async function saveRelation(event) {
   event.preventDefault();
   const form = $("#relationForm");
   const payload = {
-    character_id: "sakura",
+    character_id: "atri",
     affection: Number(form.elements.affection.value || 0),
     trust: Number(form.elements.trust.value || 0),
     dependency: Number(form.elements.dependency.value || 0),
@@ -1216,7 +1229,7 @@ async function createMemory(event) {
   const form = $("#memoryForm");
   try {
     const payload = {
-      character_id: form.elements.character_id.value.trim() || "sakura",
+      character_id: form.elements.character_id.value.trim() || "atri",
       layer: form.elements.layer.value.trim() || "chat",
       content: form.elements.content.value.trim(),
       importance: Number(form.elements.importance.value || 0.5),
@@ -1251,7 +1264,7 @@ async function saveCalendarEvent(event) {
   const form = $("#calendarEventForm");
   const payload = {
     user_id: state.activeUserId,
-    character_id: "sakura",
+    character_id: "atri",
     date: form.elements.date.value,
     title: form.elements.title.value.trim(),
     category: form.elements.category.value,
@@ -1896,6 +1909,789 @@ function bindAdminNavigation() {
     await loadTestData();
   });
   switchPage(state.currentPage);
+}
+
+const LIVE2D_AREA_COLORS = ["#ff6b8a", "#6bc6ff", "#ffd166", "#8df0b3", "#c792ff", "#ffa36b"];
+const LIVE2D_COORD_PRECISION = 2;
+const LIVE2D_MODEL_MIN = -0.5;
+const LIVE2D_MODEL_MAX = 1.5;
+const LIVE2D_FULL_BODY_BOUNDS = { left: 0, top: 0, right: 1, bottom: 1 };
+
+function live2dRoundCoord(value) {
+  const factor = 10 ** LIVE2D_COORD_PRECISION;
+  return Math.round(Number(value) * factor) / factor;
+}
+
+function live2dClampModelCoord(value, min = LIVE2D_MODEL_MIN, max = LIVE2D_MODEL_MAX) {
+  return live2dClamp(value, min, max);
+}
+
+function live2dNormalizeAreaBounds(area) {
+  if (!area) return area;
+  area.left = live2dClampModelCoord(live2dRoundCoord(area.left));
+  area.top = live2dClampModelCoord(live2dRoundCoord(area.top));
+  area.right = live2dClampModelCoord(live2dRoundCoord(area.right));
+  area.bottom = live2dClampModelCoord(live2dRoundCoord(area.bottom));
+  const minSize = live2dRoundCoord(0.04);
+  if (area.right - area.left < minSize) {
+    area.right = live2dClampModelCoord(Math.min(LIVE2D_MODEL_MAX, area.left + minSize));
+  }
+  if (area.bottom - area.top < minSize) {
+    area.bottom = live2dClampModelCoord(Math.min(LIVE2D_MODEL_MAX, area.top + minSize));
+  }
+  return area;
+}
+
+function live2dSelectedArea() {
+  return state.live2dHitAreas.find((item) => item.area_id === state.live2dSelectedAreaId) || null;
+}
+
+function setLive2dAreaForm(area) {
+  const form = $("#live2dAreaForm");
+  if (!form || !area) return;
+  live2dNormalizeAreaBounds(area);
+  form.elements.area_id.value = area.area_id || "";
+  form.elements.label.value = area.label || "";
+  form.elements.left.value = live2dRoundCoord(area.left ?? 0).toFixed(LIVE2D_COORD_PRECISION);
+  form.elements.top.value = live2dRoundCoord(area.top ?? 0).toFixed(LIVE2D_COORD_PRECISION);
+  form.elements.right.value = live2dRoundCoord(area.right ?? 1).toFixed(LIVE2D_COORD_PRECISION);
+  form.elements.bottom.value = live2dRoundCoord(area.bottom ?? 1).toFixed(LIVE2D_COORD_PRECISION);
+  form.elements.priority.value = area.priority ?? 0;
+  form.elements.base_cooldown_ms.value = area.base_cooldown_ms ?? 1400;
+  form.elements.enabled.checked = Boolean(area.enabled);
+  form.elements.flirt_hint.checked = Boolean(area.flirt_hint);
+}
+
+function renderLive2dAreaList() {
+  const list = $("#live2dAreaList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!state.live2dHitAreas.length) {
+    list.innerHTML = `<div class="editor-placeholder">还没有触摸区域。</div>`;
+    return;
+  }
+  for (const area of state.live2dHitAreas) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `live2d-area-item${area.area_id === state.live2dSelectedAreaId ? " active" : ""}`;
+    item.innerHTML = `<strong>${escapeHtml(area.label || area.area_id)}</strong><small>${escapeHtml(area.area_id)} · priority ${area.priority}</small>`;
+    item.addEventListener("click", async () => {
+      state.live2dSelectedAreaId = area.area_id;
+      setLive2dAreaForm(area);
+      renderLive2dAreaList();
+      drawLive2dPreview();
+      await loadLive2dTouchPool();
+    });
+    list.appendChild(item);
+  }
+}
+
+function live2dPlacementFromInputs() {
+  return {
+    scale: Number($("#live2dPlacementScale")?.value || state.live2dPlacement.scale),
+    offsetX: Number($("#live2dPlacementOffsetX")?.value || state.live2dPlacement.offsetX),
+    offsetY: Number($("#live2dPlacementOffsetY")?.value || state.live2dPlacement.offsetY),
+    bottomInset: Number($("#live2dPlacementBottomInset")?.value || state.live2dPlacement.bottomInset),
+  };
+}
+
+function setLive2dPlacementInputs(placement) {
+  const next = placement || state.live2dPlacement;
+  state.live2dPlacement = { ...next };
+  if ($("#live2dPlacementScale")) $("#live2dPlacementScale").value = String(next.scale);
+  if ($("#live2dPlacementOffsetX")) $("#live2dPlacementOffsetX").value = String(next.offsetX);
+  if ($("#live2dPlacementOffsetY")) $("#live2dPlacementOffsetY").value = String(next.offsetY);
+  if ($("#live2dPlacementBottomInset")) $("#live2dPlacementBottomInset").value = String(next.bottomInset);
+}
+
+function live2dScreenRect(area) {
+  const canvas = $("#live2dPreviewOverlay");
+  if (!canvas || !window.Live2DHitTest) return null;
+  const width = canvas.width;
+  const height = canvas.height;
+  const topLeft = Live2DHitTest.mapModelToScreenSpaceRaw(area.left, area.top, state.live2dPlacement);
+  const bottomRight = Live2DHitTest.mapModelToScreenSpaceRaw(area.right, area.bottom, state.live2dPlacement);
+  return {
+    left: topLeft.x * width,
+    top: topLeft.y * height,
+    right: bottomRight.x * width,
+    bottom: bottomRight.y * height,
+  };
+}
+
+function drawLive2dCharacterLayer() {
+  const config = state.live2dPreviewConfig;
+  if (!config) return;
+  if (config.renderer_mode === "live2d" && window.Live2DPreview) {
+    Live2DPreview.setPlacement(state.live2dPlacement);
+    return;
+  }
+  const bg = $("#live2dPreviewBg");
+  if (!bg || !window.Live2DPreview) return;
+  const ctx = bg.getContext("2d");
+  if (state.live2dReferenceImage) {
+    Live2DPreview.drawStaticStandee(ctx, state.live2dReferenceImage, state.live2dPlacement, bg.width, bg.height);
+  } else {
+    ctx.clearRect(0, 0, bg.width, bg.height);
+    ctx.fillStyle = "#1a1a22";
+    ctx.fillRect(0, 0, bg.width, bg.height);
+    ctx.fillStyle = "#888";
+    ctx.font = "14px sans-serif";
+    ctx.fillText("未找到立绘参考图", 16, 32);
+  }
+}
+
+const LIVE2D_HANDLE_RADIUS = 8;
+
+function live2dClamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function live2dAreaHandles(rect) {
+  const cx = (rect.left + rect.right) / 2;
+  const cy = (rect.top + rect.bottom) / 2;
+  return [
+    { id: "nw", x: rect.left, y: rect.top },
+    { id: "n", x: cx, y: rect.top },
+    { id: "ne", x: rect.right, y: rect.top },
+    { id: "e", x: rect.right, y: cy },
+    { id: "se", x: rect.right, y: rect.bottom },
+    { id: "s", x: cx, y: rect.bottom },
+    { id: "sw", x: rect.left, y: rect.bottom },
+    { id: "w", x: rect.left, y: cy },
+  ];
+}
+
+function live2dHandleAtPoint(px, py, area) {
+  const rect = live2dScreenRect(area);
+  if (!rect) return null;
+  const radius = LIVE2D_HANDLE_RADIUS + 4;
+  if (area.area_id === state.live2dSelectedAreaId) {
+    for (const handle of live2dAreaHandles(rect)) {
+      if (Math.abs(px - handle.x) <= radius && Math.abs(py - handle.y) <= radius) {
+        return handle.id;
+      }
+    }
+  }
+  if (px >= rect.left && px <= rect.right && py >= rect.top && py <= rect.bottom) {
+    return "move";
+  }
+  return null;
+}
+
+function live2dApplyResize(area, handle, currentModel) {
+  const minSize = 0.04;
+  switch (handle) {
+    case "se":
+      area.right = live2dClampModelCoord(currentModel.x, area.left + minSize);
+      area.bottom = live2dClampModelCoord(currentModel.y, area.top + minSize);
+      break;
+    case "sw":
+      area.left = live2dClampModelCoord(currentModel.x, LIVE2D_MODEL_MIN, area.right - minSize);
+      area.bottom = live2dClampModelCoord(currentModel.y, area.top + minSize);
+      break;
+    case "ne":
+      area.right = live2dClampModelCoord(currentModel.x, area.left + minSize);
+      area.top = live2dClampModelCoord(currentModel.y, LIVE2D_MODEL_MIN, area.bottom - minSize);
+      break;
+    case "nw":
+      area.left = live2dClampModelCoord(currentModel.x, LIVE2D_MODEL_MIN, area.right - minSize);
+      area.top = live2dClampModelCoord(currentModel.y, LIVE2D_MODEL_MIN, area.bottom - minSize);
+      break;
+    case "e":
+      area.right = live2dClampModelCoord(currentModel.x, area.left + minSize);
+      break;
+    case "w":
+      area.left = live2dClampModelCoord(currentModel.x, LIVE2D_MODEL_MIN, area.right - minSize);
+      break;
+    case "n":
+      area.top = live2dClampModelCoord(currentModel.y, LIVE2D_MODEL_MIN, area.bottom - minSize);
+      break;
+    case "s":
+      area.bottom = live2dClampModelCoord(currentModel.y, area.top + minSize);
+      break;
+    default:
+      break;
+  }
+}
+
+function live2dApplyFullBodyBounds() {
+  const area = live2dSelectedArea();
+  if (!area) return;
+  area.left = LIVE2D_FULL_BODY_BOUNDS.left;
+  area.top = LIVE2D_FULL_BODY_BOUNDS.top;
+  area.right = LIVE2D_FULL_BODY_BOUNDS.right;
+  area.bottom = LIVE2D_FULL_BODY_BOUNDS.bottom;
+  live2dNormalizeAreaBounds(area);
+  setLive2dAreaForm(area);
+  drawLive2dPreview({ overlayOnly: true });
+}
+
+function live2dNudgeSelectedArea(delta) {
+  const area = live2dSelectedArea();
+  if (!area) return;
+  const minSize = 0.04;
+  area.left = live2dClampModelCoord(area.left - delta, LIVE2D_MODEL_MIN, area.right - minSize);
+  area.top = live2dClampModelCoord(area.top - delta, LIVE2D_MODEL_MIN, area.bottom - minSize);
+  area.right = live2dClampModelCoord(area.right + delta, area.left + minSize);
+  area.bottom = live2dClampModelCoord(area.bottom + delta, area.top + minSize);
+  setLive2dAreaForm(area);
+  drawLive2dPreview();
+}
+
+function drawLive2dPreview(options = {}) {
+  const overlayOnly = Boolean(options.overlayOnly);
+  const characterLayer = Boolean(options.characterLayer) || !overlayOnly;
+  if (characterLayer) {
+    drawLive2dCharacterLayer();
+  }
+  const canvas = $("#live2dPreviewOverlay");
+  if (!canvas || !window.Live2DHitTest) return;
+  const ctx = canvas.getContext("2d");
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  state.live2dHitAreas.forEach((area, index) => {
+    const rect = live2dScreenRect(area);
+    if (!rect) return;
+    const x = rect.left;
+    const y = rect.top;
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    const selected = area.area_id === state.live2dSelectedAreaId;
+    const color = LIVE2D_AREA_COLORS[index % LIVE2D_AREA_COLORS.length];
+    ctx.fillStyle = selected ? `${color}66` : `${color}33`;
+    ctx.strokeStyle = selected ? "#26313d" : color;
+    ctx.lineWidth = selected ? 2 : 1;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = selected ? "#26313d" : "#fff";
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(area.label || area.area_id, x + 6, y + 18);
+    if (selected) {
+      for (const handle of live2dAreaHandles(rect)) {
+        ctx.beginPath();
+        ctx.arc(handle.x, handle.y, LIVE2D_HANDLE_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff";
+        ctx.fill();
+        ctx.strokeStyle = "#d95f76";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
+  });
+}
+
+function live2dCanvasPoint(event) {
+  const canvas = $("#live2dPreviewOverlay");
+  const rect = canvas.getBoundingClientRect();
+  const x = ((event.clientX - rect.left) / rect.width) * canvas.width;
+  const y = ((event.clientY - rect.top) / rect.height) * canvas.height;
+  return { x, y, width: canvas.width, height: canvas.height };
+}
+
+function live2dModelPoint(px, py, width, height) {
+  const screenX = px / width;
+  const screenY = py / height;
+  return Live2DHitTest.mapScreenToModelSpace(screenX, screenY, state.live2dPlacement);
+}
+
+function live2dHitAtPoint(px, py, width, height) {
+  const model = live2dModelPoint(px, py, width, height);
+  const sorted = [...state.live2dHitAreas].sort((a, b) => b.priority - a.priority);
+  for (const area of sorted) {
+    if (model.x >= area.left && model.x <= area.right && model.y >= area.top && model.y <= area.bottom) {
+      return area;
+    }
+  }
+  return null;
+}
+
+function bindLive2dCanvas() {
+  const canvas = $("#live2dPreviewOverlay");
+  if (!canvas || canvas.dataset.bound === "1") return;
+  canvas.dataset.bound = "1";
+  canvas.addEventListener("pointerdown", (event) => {
+    const point = live2dCanvasPoint(event);
+    let area = live2dSelectedArea();
+    let handle = area ? live2dHandleAtPoint(point.x, point.y, area) : null;
+    if (!handle) {
+      area = live2dHitAtPoint(point.x, point.y, point.width, point.height);
+      if (!area) return;
+      handle = live2dHandleAtPoint(point.x, point.y, area);
+    }
+    state.live2dSelectedAreaId = area.area_id;
+    setLive2dAreaForm(area);
+    renderLive2dAreaList();
+    const mode = handle && handle !== "move" ? "resize" : "move";
+    state.live2dDrag = {
+      areaId: area.area_id,
+      mode,
+      resizeHandle: mode === "resize" ? handle : "",
+      startModel: live2dModelPoint(point.x, point.y, point.width, point.height),
+      startArea: { ...area },
+    };
+    canvas.setPointerCapture(event.pointerId);
+    drawLive2dPreview({ overlayOnly: true });
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!state.live2dDrag) return;
+    const point = live2dCanvasPoint(event);
+    const area = live2dSelectedArea();
+    if (!area || area.area_id !== state.live2dDrag.areaId) return;
+    const currentModel = live2dModelPoint(point.x, point.y, point.width, point.height);
+    const start = state.live2dDrag.startArea;
+    if (state.live2dDrag.mode === "resize") {
+      live2dApplyResize(area, state.live2dDrag.resizeHandle, currentModel);
+    } else {
+      const dx = currentModel.x - state.live2dDrag.startModel.x;
+      const dy = currentModel.y - state.live2dDrag.startModel.y;
+      const widthNorm = start.right - start.left;
+      const heightNorm = start.bottom - start.top;
+      area.left = live2dClampModelCoord(start.left + dx, LIVE2D_MODEL_MIN, LIVE2D_MODEL_MAX - widthNorm);
+      area.top = live2dClampModelCoord(start.top + dy, LIVE2D_MODEL_MIN, LIVE2D_MODEL_MAX - heightNorm);
+      area.right = area.left + widthNorm;
+      area.bottom = area.top + heightNorm;
+    }
+    setLive2dAreaForm(area);
+    drawLive2dPreview({ overlayOnly: true });
+  });
+  const endDrag = () => {
+    if (state.live2dDrag) {
+      const area = live2dSelectedArea();
+      if (area) {
+        live2dNormalizeAreaBounds(area);
+        setLive2dAreaForm(area);
+        drawLive2dPreview({ overlayOnly: true });
+      }
+    }
+    state.live2dDrag = null;
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+}
+
+async function ensureLive2dPreviewEngine() {
+  if (!window.Live2DPreview || state.live2dPreviewReady) return;
+  const glCanvas = $("#live2dPreviewGl");
+  if (!glCanvas) return;
+  if (typeof window.PIXI === "undefined") {
+    throw new Error("PIXI / Cubism Web 脚本未加载，无法预览 Live2D");
+  }
+  await Live2DPreview.init(glCanvas);
+  state.live2dPreviewReady = true;
+}
+
+async function loadLive2dPreviewConfig() {
+  const appearanceId = state.live2dAppearanceId || "neko";
+  const payload = await api(`/api/admin/live2d/preview-config?appearance_id=${encodeURIComponent(appearanceId)}`);
+  state.live2dPreviewConfig = payload;
+  setLive2dPlacementInputs(payload.default_placement || state.live2dPlacement);
+  if (payload.renderer_mode === "live2d") {
+    await ensureLive2dPreviewEngine();
+    Live2DPreview.setRendererMode("live2d");
+    if (payload.model_url) {
+      await Live2DPreview.loadModel(payload.model_url);
+    }
+    $("#live2dPreviewBg")?.style.setProperty("display", "none");
+  } else {
+    Live2DPreview?.setRendererMode?.("static_png");
+    const bg = $("#live2dPreviewBg");
+    if (bg) bg.style.display = "block";
+  }
+}
+
+function loadLive2dAppearanceOptions() {
+  const select = $("#live2dAppearanceId");
+  if (!select) return;
+  const previous = state.live2dAppearanceId || select.value || "neko";
+  if ([...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  }
+  state.live2dAppearanceId = select.value;
+}
+
+function applyLive2dPlacementFromInputs() {
+  const placement = live2dPlacementFromInputs();
+  setLive2dPlacementInputs(placement);
+  drawLive2dPreview({ characterLayer: true });
+}
+
+async function loadLive2dHitAreas() {
+  const appearanceId = $("#live2dAppearanceId")?.value || state.live2dAppearanceId;
+  state.live2dAppearanceId = appearanceId;
+  const payload = await api(`/api/admin/live2d/hit-areas?appearance_id=${encodeURIComponent(appearanceId)}`);
+  state.live2dHitAreas = (payload.items || []).map((item) => live2dNormalizeAreaBounds({ ...item }));
+  if (!state.live2dSelectedAreaId && state.live2dHitAreas.length) {
+    state.live2dSelectedAreaId = state.live2dHitAreas[0].area_id;
+  }
+  if (!state.live2dHitAreas.some((item) => item.area_id === state.live2dSelectedAreaId)) {
+    state.live2dSelectedAreaId = state.live2dHitAreas[0]?.area_id || "";
+  }
+  $("#live2dStatus").textContent = `${state.live2dHitAreas.length} 个区域`;
+  renderLive2dAreaList();
+  setLive2dAreaForm(live2dSelectedArea());
+  drawLive2dPreview();
+}
+
+async function loadLive2dReferenceImage() {
+  const config = state.live2dPreviewConfig;
+  if (!config?.reference_image_url) {
+    state.live2dReferenceImage = null;
+    return;
+  }
+  const image = new Image();
+  image.src = `${config.reference_image_url}&t=${Date.now()}`;
+  await new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = reject;
+  });
+  state.live2dReferenceImage = image;
+}
+
+async function saveLive2dArea(event) {
+  event.preventDefault();
+  const form = $("#live2dAreaForm");
+  const areaId = form.elements.area_id.value.trim();
+  const payload = {
+    appearance_id: state.live2dAppearanceId,
+    label: form.elements.label.value.trim(),
+    left: live2dRoundCoord(form.elements.left.value),
+    top: live2dRoundCoord(form.elements.top.value),
+    right: live2dRoundCoord(form.elements.right.value),
+    bottom: live2dRoundCoord(form.elements.bottom.value),
+    priority: Number(form.elements.priority.value || 0),
+    base_cooldown_ms: Number(form.elements.base_cooldown_ms.value || 1400),
+    enabled: form.elements.enabled.checked,
+    flirt_hint: form.elements.flirt_hint.checked,
+  };
+  const result = await api(`/api/admin/live2d/hit-areas/${encodeURIComponent(areaId)}?appearance_id=${encodeURIComponent(state.live2dAppearanceId)}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  $("#live2dResult").textContent = pretty(result);
+  await loadLive2dHitAreas();
+}
+
+async function createLive2dArea() {
+  const areaId = window.prompt("新部位 area_id，例如 left_leg", "left_leg");
+  if (!areaId) return;
+  const label = window.prompt("显示名称", areaId) || areaId;
+  const result = await api("/api/admin/live2d/hit-areas", {
+    method: "POST",
+    body: JSON.stringify({
+      area_id: areaId.trim().toLowerCase(),
+      appearance_id: state.live2dAppearanceId,
+      label,
+      left: 0.45,
+      top: 0.45,
+      right: 0.55,
+      bottom: 0.55,
+      priority: 20,
+      enabled: true,
+      base_cooldown_ms: 1400,
+      tap_motions: [],
+      reactions: [{ intensity: "soft", motion: "idle", expression: "calm", cooldown_ms: 1400 }],
+    }),
+  });
+  state.live2dSelectedAreaId = result.item.area_id;
+  $("#live2dResult").textContent = pretty(result);
+  await loadLive2dHitAreas();
+  await loadLive2dTouchPool();
+}
+
+async function deleteLive2dArea() {
+  const area = live2dSelectedArea();
+  if (!area) return;
+  if (!window.confirm(`删除触摸区域 ${area.area_id}？`)) return;
+  const result = await api(`/api/admin/live2d/hit-areas/${encodeURIComponent(area.area_id)}?appearance_id=${encodeURIComponent(state.live2dAppearanceId)}`, {
+    method: "DELETE",
+  });
+  state.live2dSelectedAreaId = "";
+  $("#live2dResult").textContent = pretty(result);
+  await loadLive2dHitAreas();
+}
+
+function live2dTouchTierForRefresh() {
+  const selected = $("#live2dTouchTier")?.value || "";
+  if (selected === "all" || !selected) {
+    return "";
+  }
+  return selected;
+}
+
+function renderLive2dTouchPoolLine(line) {
+  const item = document.createElement("article");
+  item.className = "live2d-pool-item";
+  const jaLine = line.tts_text_ja ? `<small class="live2d-pool-ja">${escapeHtml(line.tts_text_ja)}</small>` : "";
+  item.innerHTML = `
+    <header>
+      <strong>#${line.index + 1}${line.consumed ? " · 已消费" : ""}</strong>
+      <span>${line.tts_duration_ms || 0} ms · cooldown ${line.cooldown_ms || 0} ms</span>
+    </header>
+    <p>${escapeHtml(line.text || "")}</p>
+    ${jaLine}
+    <div class="actions">
+      ${line.tts_audio_url ? `<button type="button" data-play="${escapeHtml(line.tts_audio_url)}">试听</button>` : "<span>无 TTS</span>"}
+    </div>
+  `;
+  const playButton = item.querySelector("[data-play]");
+  if (playButton) {
+    playButton.addEventListener("click", () => {
+      const audio = new Audio(playButton.dataset.play);
+      audio.play().catch(() => {});
+    });
+  }
+  return item;
+}
+
+function updateLive2dTouchPoolMeta(payload) {
+  const meta = $("#live2dTouchPoolMeta");
+  if (!meta || !payload) return;
+  const viewTier = $("#live2dTouchTier")?.value || "当前好感";
+  meta.textContent = [
+    `查看档：${viewTier}`,
+    `用户好感档：${payload.relation_tier || "-"}`,
+    `声线：${payload.voice_profile_id || "-"} (${payload.voice_language || "zh"})`,
+    payload.pool_id ? `pool_id：${payload.pool_id}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+async function loadLive2dTouchCoverage() {
+  const meta = $("#live2dTouchCoverageMeta");
+  const grid = $("#live2dTouchCoverageGrid");
+  if (!meta || !grid) return;
+  const query = new URLSearchParams({
+    character_id: state.activeCharacterId || "atri",
+    appearance_id: state.live2dAppearanceId || "neko",
+  });
+  try {
+    const payload = await api(`/api/admin/live2d/touch-pools/coverage?${query.toString()}`);
+    const preview = payload.bundle_preview || {};
+    meta.textContent = [
+      `App 当前好感档：${payload.relation_tier || "-"}`,
+      `声线：${payload.voice_profile_id || "-"}`,
+      `bundle 将下发 ${preview.line_count || 0} 条`,
+      preview.missing_mp3 ? `缺 MP3：${preview.missing_mp3}` : "MP3 齐全",
+      "改区域后 config_version 会变，App 回前台会 re-bootstrap 同步命中区域",
+    ].join(" · ");
+    grid.innerHTML = "";
+    const hitAreas = payload.hit_areas || [];
+    const tiers = ["low", "mid", "high"];
+    const table = document.createElement("table");
+    table.className = "live2d-coverage-table";
+    const head = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    headRow.innerHTML = "<th>部位</th>" + tiers.map((tier) => `<th>${tier}</th>`).join("");
+    head.appendChild(headRow);
+    table.appendChild(head);
+    const body = document.createElement("tbody");
+    for (const areaId of hitAreas) {
+      const row = document.createElement("tr");
+      const areaCell = document.createElement("td");
+      areaCell.textContent = areaId;
+      row.appendChild(areaCell);
+      for (const tier of tiers) {
+        const cell = document.createElement("td");
+        const entry = (payload.matrix || []).find((item) => item.hit_area === areaId && item.tier === tier);
+        if (!entry || !entry.ready) {
+          cell.className = "coverage-miss";
+          cell.textContent = entry ? `${entry.line_count}/${entry.mp3_count}` : "—";
+          cell.title = "未就绪：需至少 2 条台词且 1 条 MP3";
+        } else {
+          cell.className = "coverage-ok";
+          cell.textContent = `${entry.line_count}✓`;
+          if (entry.shared) cell.title = "来自共享模板池";
+        }
+        row.appendChild(cell);
+      }
+      body.appendChild(row);
+    }
+    table.appendChild(body);
+    grid.appendChild(table);
+  } catch (error) {
+    meta.textContent = `覆盖状态加载失败：${error.message}`;
+    grid.innerHTML = "";
+  }
+}
+
+async function regenerateAllLive2dTouchPools() {
+  const body = {
+    character_id: state.activeCharacterId || "atri",
+    appearance_id: state.live2dAppearanceId || "neko",
+    force: true,
+    tiers: ["low", "mid", "high"],
+  };
+  const result = await api("/api/admin/live2d/touch-pools/refresh", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  $("#live2dResult").textContent = pretty(result);
+  await loadLive2dTouchCoverage();
+  await loadLive2dTouchPool();
+}
+
+async function loadLive2dTouchPool() {
+  const area = live2dSelectedArea();
+  const list = $("#live2dTouchPoolList");
+  const meta = $("#live2dTouchPoolMeta");
+  if (!area || !list) {
+    if (list) list.textContent = "请选择左侧部位。";
+    if (meta) meta.textContent = "请选择左侧部位。";
+    return;
+  }
+  const tier = $("#live2dTouchTier")?.value || "";
+  const query = new URLSearchParams({
+    hit_area: area.area_id,
+    character_id: state.activeCharacterId || "atri",
+    appearance_id: state.live2dAppearanceId,
+  });
+  if (tier) query.set("tier", tier);
+  const payload = await api(`/api/admin/live2d/touch-pools?${query.toString()}`);
+  list.innerHTML = "";
+  updateLive2dTouchPoolMeta(payload);
+
+  if (payload.view_mode === "all") {
+    let hasAny = false;
+    for (const group of payload.tiers || []) {
+      const section = document.createElement("section");
+      section.className = "live2d-pool-tier-group";
+      const title = document.createElement("h4");
+      title.textContent = `${group.tier} · ${group.line_count || 0} 条${group.pool_id ? ` · ${group.pool_id}` : ""}`;
+      section.appendChild(title);
+      if (!group.lines?.length) {
+        const empty = document.createElement("div");
+        empty.className = "editor-placeholder";
+        empty.textContent = "该档位尚未生成触摸语音池。";
+        section.appendChild(empty);
+      } else {
+        hasAny = true;
+        for (const line of group.lines) {
+          section.appendChild(renderLive2dTouchPoolLine(line));
+        }
+      }
+      list.appendChild(section);
+    }
+    if (!hasAny) {
+      list.innerHTML = `<div class="editor-placeholder">三个档位都还没有触摸语音，可点击「重生当前档」或「重生全部档」。</div>`;
+    }
+    return;
+  }
+
+  if (!payload.lines?.length) {
+    list.innerHTML = `<div class="editor-placeholder">当前档位还没有触摸语音，可点击「重生当前档」或「重生全部档」。</div>`;
+    return;
+  }
+  for (const line of payload.lines) {
+    list.appendChild(renderLive2dTouchPoolLine(line));
+  }
+}
+
+async function regenerateLive2dTouchPool(options = {}) {
+  const area = live2dSelectedArea();
+  if (!area) return;
+  const body = {
+    hit_area: area.area_id,
+    character_id: state.activeCharacterId || "atri",
+    appearance_id: state.live2dAppearanceId,
+    force: true,
+  };
+  if (options.allTiers) {
+    body.tiers = ["low", "mid", "high"];
+  } else {
+    const tier = live2dTouchTierForRefresh();
+    if (tier) body.tier = tier;
+  }
+  const result = await api("/api/admin/live2d/touch-pools/refresh", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  $("#live2dResult").textContent = pretty(result);
+  await loadLive2dTouchPool();
+}
+
+function bindLive2dManager() {
+  if ($("#live2dManager")?.dataset.bound === "1") return;
+  $("#live2dManager").dataset.bound = "1";
+  $("#live2dAreaForm")?.addEventListener("submit", saveLive2dArea);
+  $("#live2dAddArea")?.addEventListener("click", () => createLive2dArea().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dRefreshAreas")?.addEventListener("click", () => loadLive2dManager().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dReloadPool")?.addEventListener("click", () => loadLive2dTouchPool().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dRegeneratePool")?.addEventListener("click", () => regenerateLive2dTouchPool().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dRegeneratePoolAllTiers")?.addEventListener("click", () => regenerateLive2dTouchPool({ allTiers: true }).catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dRegeneratePoolAllAreas")?.addEventListener("click", () => regenerateAllLive2dTouchPools().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dTouchTier")?.addEventListener("change", () => loadLive2dTouchPool().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dAppearanceId")?.addEventListener("change", () => loadLive2dManager().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  $("#live2dAreaForm")?.querySelector('[data-action="delete-area"]')?.addEventListener("click", () => deleteLive2dArea().catch((error) => {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }));
+  for (const id of ["live2dPlacementScale", "live2dPlacementOffsetX", "live2dPlacementOffsetY", "live2dPlacementBottomInset"]) {
+    $("#" + id)?.addEventListener("input", () => applyLive2dPlacementFromInputs());
+  }
+  $("#live2dPlacementReset")?.addEventListener("click", () => {
+    const defaults = state.live2dPreviewConfig?.default_placement || state.live2dPlacement;
+    setLive2dPlacementInputs(defaults);
+    drawLive2dPreview({ characterLayer: true });
+  });
+  $("#live2dPlacementShifted")?.addEventListener("click", () => {
+    const base = state.live2dPreviewConfig?.default_placement || state.live2dPlacement;
+    setLive2dPlacementInputs({
+      scale: Number(base.scale || 1) * 1.2,
+      offsetX: Number(base.offsetX || 0) + 48,
+      offsetY: Number(base.offsetY || 0) - 18,
+      bottomInset: Number(base.bottomInset || 0) + 8,
+    });
+    drawLive2dPreview({ characterLayer: true });
+  });
+  $("#live2dAreaFullBody")?.addEventListener("click", () => live2dApplyFullBodyBounds());
+  $("#live2dAreaGrow")?.addEventListener("click", () => live2dNudgeSelectedArea(0.02));
+  $("#live2dAreaShrink")?.addEventListener("click", () => live2dNudgeSelectedArea(-0.02));
+  for (const name of ["left", "top", "right", "bottom"]) {
+    $("#live2dAreaForm")?.elements[name]?.addEventListener("change", (event) => {
+      const area = live2dSelectedArea();
+      if (!area) return;
+      area[name] = live2dRoundCoord(event.target.value);
+      live2dNormalizeAreaBounds(area);
+      setLive2dAreaForm(area);
+      drawLive2dPreview({ overlayOnly: true });
+    });
+  }
+  bindLive2dCanvas();
+}
+
+async function loadLive2dManager() {
+  bindLive2dManager();
+  loadLive2dAppearanceOptions();
+  try {
+    await loadLive2dPreviewConfig();
+  } catch (error) {
+    $("#live2dResult").textContent = pretty({ ok: false, message: error.message });
+  }
+  await loadLive2dHitAreas();
+  try {
+    await loadLive2dReferenceImage();
+  } catch (_error) {
+    state.live2dReferenceImage = null;
+  }
+  drawLive2dPreview();
+  await loadLive2dTouchCoverage();
+  await loadLive2dTouchPool();
 }
 
 async function boot() {

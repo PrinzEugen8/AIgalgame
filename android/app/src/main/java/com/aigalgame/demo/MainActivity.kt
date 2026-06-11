@@ -117,6 +117,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -129,6 +130,7 @@ import com.aigalgame.demo.live2d.PersistentLive2DEngine
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -215,6 +217,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var locationUploadInFlight = false
     private var lastUserActivityAt = System.currentTimeMillis()
     private var foregroundCheckInFlight = false
+    private val touchTtsCache = TouchTtsCache(application)
+    private var cachedTouchTier = ""
 
     var baseUrl by mutableStateOf("")
         private set
@@ -228,6 +232,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var errorMessage by mutableStateOf("")
     var storyCompleted by mutableStateOf(false)
     var selectedCharacter by mutableStateOf("neko")
+    var activeCharacterId by mutableStateOf("atri")
+    var characterName by mutableStateOf("角色")
     var selectedBackground by mutableStateOf("classroom")
     var previewEmotion by mutableStateOf("calm")
     var ttsEnabled by mutableStateOf(true)
@@ -242,6 +248,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var placementDraft by mutableStateOf<OutfitPlacement?>(null)
         private set
     var standeeEditMode by mutableStateOf(false)
+        private set
+    var live2dHitAreas by mutableStateOf<List<Live2DHitArea>>(emptyList())
+        private set
+    var live2dReactions by mutableStateOf<List<Live2DReactionConfig>>(emptyList())
+        private set
+    var live2dConfigVersion by mutableStateOf("")
+        private set
+    var touchPoolVersion by mutableStateOf("")
+        private set
+    var touchCooldownRequest by mutableStateOf<TouchCooldownRequest?>(null)
+        private set
+    var dialogueMediaUrl by mutableStateOf("")
         private set
 
     val lines = mutableStateListOf<DialogueLine>()
@@ -265,7 +283,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     api = ApiClient(saved)
                     syncLocation()
                     registerPushTokenIfAvailable()
-                    refreshBootstrap(openAfterBootstrap = pendingProactiveEventId.isBlank())
+                    val ui = settings.uiSettings.first()
+                    val syncState = settings.readLive2dSyncState()
+                    val needsLive2dRefresh = syncState.configVersion.isBlank() ||
+                        syncState.appearanceId != ui.selectedCharacter
+                    refreshBootstrap(
+                        openAfterBootstrap = pendingProactiveEventId.isBlank(),
+                        force = needsLive2dRefresh,
+                    )
                     openPendingProactive()
                 } else {
                     api = null
@@ -286,6 +311,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun currentLine(): DialogueLine? = lines.getOrNull(currentLineIndex)
+    fun playableLine(): DialogueLine? = currentLine() ?: live2dReactionLine
+
+    fun hasDialoguePriority(): Boolean {
+        if (currentLine() != null) return true
+        if (awaitingUserReplyResponse) return true
+        if (lines.isNotEmpty() && currentLine() == null && (normalReplies.isNotEmpty() || keyReplies.isNotEmpty())) {
+            return true
+        }
+        return false
+    }
     fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
 
@@ -375,16 +410,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyLive2DReaction(reaction: Live2DReaction) {
-        if (reaction.text.isNotBlank()) {
-            live2dReactionLine = DialogueLine(
-                id = "live2d_touch_${System.currentTimeMillis()}",
-                text = reaction.text,
-                emotion = expressionToEmotion(reaction.expression),
-                pose = reaction.motion.ifBlank { "idle" },
-                motion = reaction.motion,
-                expression = reaction.expression
-            )
+        val cooldownMs = maxOf(
+            reaction.cooldownMs,
+            reaction.ttsDurationMs + 300L
+        )
+        if (cooldownMs > 0L) {
+            touchCooldownRequest = TouchCooldownRequest(reaction.hitArea, cooldownMs)
         }
+        if (hasDialoguePriority()) return
+        if (reaction.text.isBlank()) return
+        live2dReactionLine = DialogueLine(
+            id = "live2d_touch_${System.currentTimeMillis()}",
+            text = reaction.text,
+            emotion = expressionToEmotion(reaction.expression),
+            pose = reaction.motion.ifBlank { "idle" },
+            motion = reaction.motion,
+            expression = reaction.expression,
+            ttsUrl = reaction.ttsUrl.ifBlank { "" }
+        )
     }
 
     fun clearLive2DReaction() {
@@ -425,14 +468,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun refreshBootstrap(openAfterBootstrap: Boolean = true) {
+    fun refreshBootstrap(openAfterBootstrap: Boolean = true, force: Boolean = false) {
         val client = api ?: return
         val urlKey = baseUrl
-        if (urlKey.isBlank() || bootstrapInFlight || bootstrappedBaseUrl == urlKey) return
+        if (urlKey.isBlank() || bootstrapInFlight) return
+        if (!force && bootstrappedBaseUrl == urlKey) return
         bootstrapInFlight = true
         launchBusy {
             try {
-                val boot = client.bootstrap()
+                val boot = client.bootstrap(
+                    characterId = activeCharacterId,
+                    appearanceId = selectedCharacter,
+                )
+                val characterJson = boot.optObject("character")
+                activeCharacterId = characterJson.optString("character_id", activeCharacterId).ifBlank { activeCharacterId }
+                characterName = characterJson.optString("name", characterName).ifBlank { activeCharacterId }
                 val rel = boot.optObject("relation")
                 relation = RelationState(
                     affection = rel.optInt("affection", relation.affection),
@@ -442,15 +492,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     stage = rel.optString("stage", relation.stage)
                 )
                 storyCompleted = boot.optObject("user").optBoolean("story_completed", storyCompleted)
+                val live2d = boot.optObject("live2d")
+                touchPoolVersion = live2d.optString("touch_pool_version")
+                applyLive2dBootstrap(live2d)
+                settings.saveLive2dSyncState(selectedCharacter, live2dConfigVersion)
                 bootstrappedBaseUrl = urlKey
                 syncLocation()
                 if (storyCompleted) {
-                    viewModelScope.launch {
-                        try {
-                            client.refreshTouchReactions()
-                        } catch (_: Exception) {
-                        }
-                    }
+                    maybeRefreshTouchAssets(client, force = true)
                 }
                 if (openAfterBootstrap && lines.isEmpty()) {
                     openApp()
@@ -459,6 +508,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 bootstrapInFlight = false
             }
         }
+    }
+
+    suspend fun fetchNekoSelfTestHitAreas(): Pair<List<Live2DHitArea>, String> {
+        val client = api ?: return emptyList<Live2DHitArea>() to ""
+        return try {
+            val live2d = client.fetchLive2dConfig(
+                characterId = activeCharacterId,
+                appearanceId = "neko",
+            )
+            live2d.parseLive2dHitAreas() to live2d.optString("config_version")
+        } catch (_: Exception) {
+            emptyList<Live2DHitArea>() to ""
+        }
+    }
+
+    private suspend fun reloadLive2dConfig(client: ApiClient, force: Boolean = false): Boolean {
+        val persisted = settings.readLive2dSyncState()
+        if (
+            !force &&
+            persisted.appearanceId == selectedCharacter &&
+            persisted.configVersion.isNotBlank() &&
+            persisted.configVersion == live2dConfigVersion &&
+            live2dHitAreas.isNotEmpty()
+        ) {
+            return false
+        }
+        val live2d = client.fetchLive2dConfig(
+            characterId = activeCharacterId,
+            appearanceId = selectedCharacter,
+        )
+        val remoteVersion = live2d.optString("config_version")
+        if (!force && remoteVersion == live2dConfigVersion && live2dHitAreas.isNotEmpty()) {
+            return false
+        }
+        val poolVersion = live2d.optString("touch_pool_version")
+        if (poolVersion.isNotBlank()) {
+            touchPoolVersion = poolVersion
+        }
+        applyLive2dBootstrap(live2d)
+        settings.saveLive2dSyncState(selectedCharacter, live2dConfigVersion)
+        return true
     }
 
     fun consumeLaunchIntent(intent: Intent?) {
@@ -518,6 +608,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun resumeFromForeground() {
         if (baseUrl.isBlank()) return
         syncLocation()
+        api?.let { client ->
+            viewModelScope.launch {
+                try {
+                    if (storyCompleted) {
+                        reloadLive2dConfig(client, force = true)
+                        maybeRefreshTouchAssets(client, force = false)
+                    } else {
+                        reloadLive2dConfig(client, force = true)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
         val waitingForUser = currentLine() == null && (normalReplies.isNotEmpty() || keyReplies.isNotEmpty())
         if (storyCompleted && waitingForUser) {
             normalReplies.clear()
@@ -556,29 +659,93 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun requestTouchReaction(hitArea: String, motion: String, expression: String, onResult: (Live2DReaction) -> Unit) {
-        val client = api ?: run {
-            onResult(localTouchReactionFallback(hitArea, motion, expression))
+        val motionOnly = hasDialoguePriority()
+        touchTtsCache.pickLocalLine(hitArea)?.let { cached ->
+            val localUrl = if (!motionOnly && java.io.File(cached.localPath).exists()) {
+                "file://${cached.localPath}"
+            } else {
+                ""
+            }
+            onResult(
+                Live2DReaction(
+                    hitArea = hitArea,
+                    intensity = Live2DReactionIntensity.Soft,
+                    motion = cached.motion.ifBlank { motion },
+                    expression = cached.expression.ifBlank { expression },
+                    text = if (motionOnly) "" else cached.text,
+                    relationDelta = RelationDelta(),
+                    cooldownMs = cached.cooldownMs,
+                    ttsUrl = localUrl,
+                    ttsDurationMs = if (motionOnly) 0L else cached.ttsDurationMs
+                )
+            )
+            if (!motionOnly) {
+                touchTtsCache.markConsumed(hitArea, cached.contentHash)
+            }
             return
         }
+        onResult(motionOnlyTouchReaction(hitArea, motion, expression))
+    }
+
+    private fun motionOnlyTouchReaction(hitArea: String, motion: String, expression: String): Live2DReaction {
+        return Live2DReaction(
+            hitArea = hitArea,
+            intensity = Live2DReactionIntensity.Soft,
+            motion = motion,
+            expression = expression,
+            text = "",
+            relationDelta = RelationDelta(),
+            cooldownMs = 0L,
+        )
+    }
+
+    private fun affectionTier(affection: Int): String = when {
+        affection >= 70 -> "high"
+        affection >= 45 -> "mid"
+        else -> "low"
+    }
+
+    private fun applyLive2dBootstrap(live2d: org.json.JSONObject) {
+        if (live2d.length() == 0) return
+        live2dConfigVersion = live2d.optString("config_version")
+        val parsedAreas = live2d.parseLive2dHitAreas()
+        if (parsedAreas.isEmpty()) return
+        live2dHitAreas = parsedAreas
+        live2dReactions = live2d.parseLive2dReactions()
+    }
+
+    private fun maybeRefreshTouchAssets(client: ApiClient, force: Boolean = false) {
         viewModelScope.launch {
             try {
-                val result = client.fetchTouchReaction(hitArea)
-                val text = result.optString("text").ifBlank { localTouchReactionFallback(hitArea, motion, expression).text }
-                val emotion = result.optString("emotion", expressionToEmotion(expression))
-                val expr = result.optString("expression", expression).ifBlank { expression }
-                val mot = result.optString("motion", motion).ifBlank { motion }
-                onResult(
-                    Live2DReaction(
-                        hitArea = hitArea,
-                        intensity = Live2DReactionIntensity.Soft,
-                        motion = mot,
-                        expression = expr,
-                        text = text,
-                        relationDelta = RelationDelta()
-                    )
+                reloadLive2dConfig(client, force = force)
+                val tier = affectionTier(relation.affection)
+                val tierChanged = cachedTouchTier.isNotBlank() && cachedTouchTier != tier
+                val bundle = client.fetchTouchBundle(
+                    characterId = activeCharacterId,
+                    appearanceId = selectedCharacter,
                 )
+                val voiceProfileId = bundle.optString("voice_profile_id")
+                val poolVersion = bundle.optString("touch_pool_version")
+                if (force || tierChanged || touchTtsCache.shouldRefresh(
+                        relation,
+                        tier,
+                        voiceProfileId,
+                        live2dConfigVersion,
+                        poolVersion,
+                    )
+                ) {
+                    touchPoolVersion = poolVersion
+                    touchTtsCache.syncBundle(bundle, live2dConfigVersion, ::resolveUrl)
+                    cachedTouchTier = tier
+                    val summary = touchTtsCache.syncSummary()
+                    when {
+                        summary.mp3Count == 0 && summary.lineCount > 0 ->
+                            connectionMessage = "触摸语音下载失败：bundle 有台词但本地无 MP3，请检查后端 /media 是否可访问"
+                        summary.missingAreas.isNotEmpty() ->
+                            connectionMessage = "触摸语音未完全同步：${summary.missingAreas.joinToString()}（已缓存 ${summary.mp3Count}/${summary.lineCount} 条）"
+                    }
+                }
             } catch (_: Exception) {
-                onResult(localTouchReactionFallback(hitArea, motion, expression))
             }
         }
     }
@@ -631,7 +798,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 moments.add(
                     MomentItem(
                         id = item.optString("moment_id"),
-                        authorName = item.optString("author_name", "小樱"),
+                        authorName = item.optString("author_name", characterName),
                         text = item.optString("text"),
                         mediaUrl = item.optString("media_url"),
                         likes = item.optInt("likes"),
@@ -708,7 +875,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun chooseCharacter(value: String) {
         selectedCharacter = value
-        viewModelScope.launch { settings.saveSelectedCharacter(value) }
+        viewModelScope.launch {
+            settings.saveSelectedCharacter(value)
+            api?.let { client ->
+                refreshBootstrap(openAfterBootstrap = false, force = true)
+                maybeRefreshTouchAssets(client, force = true)
+            }
+        }
     }
 
     fun chooseBackground(value: String) {
@@ -865,6 +1038,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         calendar.clear()
         storyIndex = 0
         currentLineIndex = 0
+        dialogueMediaUrl = ""
         errorMessage = ""
     }
 
@@ -875,23 +1049,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (type == "no_reply") {
+            dialogueMediaUrl = ""
             normalReplies.clear()
             keyReplies.clear()
             return
         }
         val payload = event.optObject("payload")
+        val mediaAssetId = payload.optString("media_asset_id")
+        dialogueMediaUrl = payload.optString("media_url").ifBlank {
+            if (mediaAssetId.isNotBlank()) "/media/$mediaAssetId" else ""
+        }
         if (payload.has("story_completed")) {
             storyCompleted = payload.optBoolean("story_completed", storyCompleted)
         }
         storyIndex = payload.optInt("story_index", storyIndex)
         val relationJson = payload.optObject("relation_delta")
         if (relationJson.length() > 0) {
+            val previousTier = affectionTier(relation.affection)
             relation = relation.copy(
                 affection = relation.affection + relationJson.optInt("affection"),
                 trust = relation.trust + relationJson.optInt("trust"),
                 dependency = relation.dependency + relationJson.optInt("dependency"),
                 mood = relation.mood + relationJson.optInt("mood")
             )
+            val nextTier = affectionTier(relation.affection)
+            if (previousTier != nextTier) {
+                api?.let { maybeRefreshTouchAssets(it, force = true) }
+            }
         }
         val newLines = payload.optArray("lines")
         lines.clear()
@@ -1008,7 +1192,7 @@ fun AiGalgameApp(vm: MainViewModel) {
             ConnectionScreen(vm)
         } else {
             Box(Modifier.fillMaxSize()) {
-                val sharedLine = vm.live2dReactionLine ?: vm.currentLine() ?: vm.lines.lastOrNull()
+                val sharedLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
                 val stageOnPrimaryScreens = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
                 val stageShowsCharacter = !vm.live2dBootReady || stageOnPrimaryScreens
                 if (vm.live2dBootReady && vm.screen == AppScreen.DressUp) {
@@ -1042,6 +1226,9 @@ fun AiGalgameApp(vm: MainViewModel) {
                     onRendererStatus = { vm.updateLive2DBootStatus(it) },
                     tapBridge = live2DTapBridge,
                     useInternalTapLayer = vm.screen == AppScreen.DressUp,
+                    remoteHitAreas = vm.live2dHitAreas,
+                    remoteReactions = vm.live2dReactions,
+                    touchCooldownRequest = vm.touchCooldownRequest,
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(1f)
@@ -1107,18 +1294,27 @@ fun AiGalgameApp(vm: MainViewModel) {
 fun AudioLinePlayer(vm: MainViewModel) {
     val context = LocalContext.current
     val player = remember {
+        val dataSourceFactory = DefaultDataSource.Factory(
+            context,
+            OkHttpDataSource.Factory(backendHttpClient()),
+        )
         ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(OkHttpDataSource.Factory(backendHttpClient())))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
     }
-    val line = vm.currentLine()
-    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dBootReady) {
+    val line = vm.playableLine()
+    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dBootReady, vm.live2dReactionLine?.id) {
         val url = line?.ttsUrl.orEmpty()
         if (vm.live2dBootReady && vm.ttsEnabled && url.isNotBlank()) {
+            val playUrl = if (url.startsWith("file://") || url.startsWith("content://")) {
+                url
+            } else {
+                vm.resolveUrl(url)
+            }
             try {
                 player.stop()
                 player.clearMediaItems()
-                player.setMediaItem(MediaItem.fromUri(vm.resolveUrl(url)))
+                player.setMediaItem(MediaItem.fromUri(playUrl))
                 player.prepare()
                 player.play()
                 var elapsedMs = 0L
@@ -1165,6 +1361,32 @@ fun simulatedSpeechMouthOpen(text: String, elapsedMs: Long): Float {
     val base = pattern[Math.floorMod(frame, pattern.size)]
     val emphasis = 0.86f + (Math.floorMod(text.hashCode(), 9) * 0.015f)
     return (base * emphasis).coerceIn(0f, 1f)
+}
+
+@Composable
+fun DialogueCgLayer(mediaUrl: String, modifier: Modifier = Modifier) {
+    val bitmap by produceState<Bitmap?>(initialValue = null, mediaUrl) {
+        value = if (mediaUrl.isBlank()) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = HttpDownloader.bytes(mediaUrl)
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }.getOrNull()
+            }
+        }
+    }
+    Box(modifier.background(Color(0xFF171417))) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = "dialogue cg",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+    }
 }
 
 @Composable
@@ -1271,8 +1493,8 @@ fun HomeScreen(
     var headerBottomPx by remember { mutableIntStateOf(0) }
     var panelTopPx by remember { mutableIntStateOf(0) }
     val line = vm.currentLine()
-    val visibleLine = vm.live2dReactionLine ?: line
-    val lastLine = visibleLine ?: vm.lines.lastOrNull()
+    val dialogueLine = line ?: vm.live2dReactionLine
+    val lastLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
     val density = LocalDensity.current
     val keyboardLift = with(density) {
         (WindowInsets.ime.getBottom(this) - WindowInsets.navigationBars.getBottom(this)).coerceAtLeast(0).toDp()
@@ -1284,6 +1506,15 @@ fun HomeScreen(
         }
     }
     Box(modifier.fillMaxSize()) {
+        if (vm.dialogueMediaUrl.isNotBlank()) {
+            DialogueCgLayer(
+                mediaUrl = vm.resolveUrl(vm.dialogueMediaUrl),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(0f)
+            )
+        }
+
         if (showStage) {
             Live2DStage(
                 background = vm.selectedBackground,
@@ -1301,6 +1532,10 @@ fun HomeScreen(
                     }
                 },
                 relation = vm.relation,
+                remoteHitAreas = vm.live2dHitAreas,
+                remoteReactions = vm.live2dReactions,
+                touchCooldownRequest = vm.touchCooldownRequest,
+                tapBridge = tapBridge,
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -1310,6 +1545,7 @@ fun HomeScreen(
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
                 .padding(horizontal = 18.dp, vertical = 18.dp)
+                .zIndex(5f)
                 .onGloballyPositioned { coordinates ->
                     headerBottomPx = coordinates.boundsInRoot().bottom.toInt()
                 }
@@ -1322,13 +1558,12 @@ fun HomeScreen(
                 modifier = Modifier
                     .align(Alignment.End)
                     .padding(top = 8.dp)
-                    .zIndex(10f)
             )
         }
 
         HomeInteractionPanel(
             vm = vm,
-            line = visibleLine,
+            line = dialogueLine,
             input = input,
             onInputChange = {
                 input = it
@@ -1343,6 +1578,7 @@ fun HomeScreen(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .padding(start = 14.dp, top = 12.dp, end = 14.dp, bottom = 12.dp + keyboardLift)
+                .zIndex(5f)
                 .onGloballyPositioned { coordinates ->
                     panelTopPx = coordinates.boundsInRoot().top.toInt()
                 }
@@ -1359,6 +1595,17 @@ fun HomeScreen(
                     .zIndex(3f)
             )
         } else {
+            GazeDragZone(
+                enabled = tapBridge != null &&
+                    vm.live2dBootReady &&
+                    vm.selectedCharacter == "neko",
+                onGaze = { normalizedX, normalizedY ->
+                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(1f)
+            )
             CharacterTapZone(
                 enabled = tapBridge != null &&
                     vm.live2dBootReady &&
@@ -1367,6 +1614,9 @@ fun HomeScreen(
                 panelTopPx = panelTopPx,
                 onTap = { normalizedX, normalizedY ->
                     tapBridge?.dispatch(normalizedX, normalizedY)
+                },
+                onGaze = { normalizedX, normalizedY ->
+                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
                 },
                 modifier = Modifier
                     .fillMaxSize()
@@ -1377,10 +1627,12 @@ fun HomeScreen(
         if (historyExpanded) {
             DialogueHistoryOverlay(
                 history = vm.dialogueHistory,
+                characterName = vm.characterName,
                 onDismiss = { historyExpanded = false },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(horizontal = 14.dp, vertical = 12.dp)
+                    .zIndex(6f)
             )
         }
     }
@@ -1401,6 +1653,7 @@ fun HomeInteractionPanel(
             DialogueBox(
                 line = line,
                 history = vm.dialogueHistory,
+                characterName = vm.characterName,
                 canAdvance = vm.lines.isNotEmpty() || vm.live2dReactionLine != null,
                 onAdvance = {
                     if (vm.live2dReactionLine != null) {
@@ -1526,7 +1779,7 @@ fun CharacterInfoCard(vm: MainViewModel, modifier: Modifier = Modifier) {
     ) {
         Row(Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("小樱", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
+                Text(vm.characterName, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
                 Box(
                     Modifier
                         .fillMaxWidth()
@@ -1551,6 +1804,7 @@ fun CharacterInfoCard(vm: MainViewModel, modifier: Modifier = Modifier) {
 fun DialogueBox(
     line: DialogueLine,
     history: List<DialogueLine>,
+    characterName: String,
     canAdvance: Boolean,
     onAdvance: () -> Unit,
     onShowHistory: () -> Unit
@@ -1572,7 +1826,7 @@ fun DialogueBox(
     ) {
         Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
             Surface(color = Color(0xFFEFA178), shape = RoundedCornerShape(16.dp), modifier = Modifier.width(112.dp)) {
-                Text("小樱", color = Color(0xFF5C2E24), fontWeight = FontWeight.Bold, fontSize = 17.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(vertical = 3.dp))
+                Text(characterName, color = Color(0xFF5C2E24), fontWeight = FontWeight.Bold, fontSize = 17.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(vertical = 3.dp))
             }
             Text(
                 line.text,
@@ -1595,7 +1849,12 @@ fun DialogueBox(
 }
 
 @Composable
-fun DialogueHistoryOverlay(history: List<DialogueLine>, onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+fun DialogueHistoryOverlay(
+    history: List<DialogueLine>,
+    characterName: String,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -1616,7 +1875,7 @@ fun DialogueHistoryOverlay(history: List<DialogueLine>, onDismiss: () -> Unit, m
             ) {
                 items(history.asReversed()) { item ->
                     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text("小樱", color = Color(0xFFE86B8D), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(characterName, color = Color(0xFFE86B8D), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                         Text(item.text, color = Color(0xFF3D211D), fontSize = 17.sp, lineHeight = 24.sp)
                     }
                 }
@@ -1928,7 +2187,7 @@ fun DressUpScreen(
                     Text("角色", fontWeight = FontWeight.Bold)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         SelectablePill("NEKO Live2D", vm.selectedCharacter == "neko") { vm.chooseCharacter("neko") }
-                        SelectablePill("小樱 静态", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
+                        SelectablePill("亚托莉 立绘", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
                     }
                     Spacer(Modifier.height(8.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2044,6 +2303,7 @@ fun CalendarScreen(vm: MainViewModel) {
             DayScheduleCard(
                 date = selectedDate,
                 events = eventsByDay[selectedDate].orEmpty(),
+                characterName = vm.characterName,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 14.dp)
@@ -2072,10 +2332,10 @@ fun JournalScreen(vm: MainViewModel) {
                 JournalHeader(onBack = { vm.screen = AppScreen.Home })
             }
             item {
-                JournalProfileSection(vm.relation)
+                JournalProfileSection(vm.relation, vm.characterName)
             }
             item {
-                JournalPerspectiveSection(vm.relation)
+                JournalPerspectiveSection(vm.relation, vm.characterName)
             }
             item {
                 Text("我们的回忆", color = Color(0xFF5C2E24), fontSize = 26.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
@@ -2140,7 +2400,7 @@ fun MomentCard(vm: MainViewModel, item: MomentItem) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Image(
                     painter = painterResource(R.drawable.character_atri_happy),
-                    contentDescription = "小樱头像",
+                    contentDescription = "${vm.characterName}头像",
                     modifier = Modifier
                         .size(54.dp)
                         .clip(CircleShape)
@@ -2328,7 +2588,12 @@ fun CalendarDayCell(date: LocalDate?, events: List<CalendarItem>, selected: Bool
 }
 
 @Composable
-fun DayScheduleCard(date: LocalDate, events: List<CalendarItem>, modifier: Modifier = Modifier) {
+fun DayScheduleCard(
+    date: LocalDate,
+    events: List<CalendarItem>,
+    characterName: String,
+    modifier: Modifier = Modifier,
+) {
     val summary = events
         .distinctBy { it.id.ifBlank { it.title } }
         .sortedByDescending { it.salience }
@@ -2348,7 +2613,7 @@ fun DayScheduleCard(date: LocalDate, events: List<CalendarItem>, modifier: Modif
                     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                         Text(item.title, color = Color(0xFF3D211D), fontWeight = FontWeight.Bold, fontSize = 17.sp)
                         Text("${categoryLabel(item.category)} · ${statusLabel(item.status)}", color = Color(0xFFE86B8D), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Text(dayEventNote(item), color = Color(0xFF8F6B62), fontSize = 14.sp, lineHeight = 20.sp)
+                        Text(dayEventNote(item, characterName), color = Color(0xFF8F6B62), fontSize = 14.sp, lineHeight = 20.sp)
                     }
                 }
             }
@@ -2394,13 +2659,13 @@ fun categoryLabel(value: String): String {
     }
 }
 
-fun dayEventNote(item: CalendarItem): String {
+fun dayEventNote(item: CalendarItem, characterName: String): String {
     if (item.dayNote.isNotBlank()) return item.dayNote
     if (item.description.isNotBlank()) return item.description
     return when (item.status) {
-        "completed" -> "小樱把这一天收进了回忆。"
-        "today" -> "小樱想认真感受今天。"
-        else -> "小樱对这一天有一点小小的期待。"
+        "completed" -> "${characterName}把这一天收进了回忆。"
+        "today" -> "${characterName}想认真感受今天。"
+        else -> "${characterName}对这一天有一点小小的期待。"
     }
 }
 
@@ -2422,7 +2687,7 @@ fun JournalHeader(onBack: () -> Unit) {
 }
 
 @Composable
-fun JournalProfileSection(relation: RelationState) {
+fun JournalProfileSection(relation: RelationState, characterName: String) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBF2)),
@@ -2434,19 +2699,19 @@ fun JournalProfileSection(relation: RelationState) {
             Column(Modifier.padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Image(
                     painter = painterResource(R.drawable.character_atri_happy),
-                    contentDescription = "小樱",
+                    contentDescription = "${characterName}头像",
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(116.dp)
                         .background(Color(0xFFFFE4EA)),
                     contentScale = ContentScale.Crop
                 )
-                Text("小樱", color = Color(0xFF5C2E24), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text(characterName, color = Color(0xFF5C2E24), fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
         }
         Spacer(Modifier.width(18.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Text("我眼中的小樱 ♥", color = Color(0xFF5C2E24), fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            Text("我眼中的${characterName} ♥", color = Color(0xFF5C2E24), fontSize = 26.sp, fontWeight = FontWeight.Bold)
             Text("生日：3月15日", color = Color(0xFF3D211D), fontSize = 18.sp)
             Text("喜欢：草莓蛋糕、读书、钢琴", color = Color(0xFF3D211D), fontSize = 18.sp)
             Text("性格：温柔、害羞、善良", color = Color(0xFF3D211D), fontSize = 18.sp)
@@ -2456,7 +2721,7 @@ fun JournalProfileSection(relation: RelationState) {
 }
 
 @Composable
-fun JournalPerspectiveSection(relation: RelationState) {
+fun JournalPerspectiveSection(relation: RelationState, characterName: String) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xAAFFFFFF)),
         shape = RoundedCornerShape(12.dp),
@@ -2465,7 +2730,7 @@ fun JournalPerspectiveSection(relation: RelationState) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("☺", color = Color(0xFF5C2E24), fontSize = 72.sp, modifier = Modifier.width(92.dp), textAlign = TextAlign.Center)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("小樱眼中的我 ♥", color = Color(0xFF5C2E24), fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text("${characterName}眼中的我 ♥", color = Color(0xFF5C2E24), fontSize = 24.sp, fontWeight = FontWeight.Bold)
                 Text("总是很温柔地对我，会认真听我说话。陪我散步的时候很开心。", color = Color(0xFF3D211D), fontSize = 18.sp, lineHeight = 26.sp)
                 Text("印象：可靠、体贴  信任 ${relation.trust}", color = Color(0xFF3D211D), fontSize = 17.sp)
             }
@@ -2520,7 +2785,7 @@ fun ensureSakuraNotificationChannel(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
     val manager = context.getSystemService(NotificationManager::class.java) ?: return
     if (manager.getNotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID) != null) return
-    val channel = NotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID, "小樱主动消息", NotificationManager.IMPORTANCE_DEFAULT)
+    val channel = NotificationChannel(SAKURA_NOTIFICATION_CHANNEL_ID, "伴侣主动消息", NotificationManager.IMPORTANCE_DEFAULT)
     channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
     manager.createNotificationChannel(channel)
 }
@@ -2603,7 +2868,7 @@ fun SettingsScreen(vm: MainViewModel) {
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBFA))) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("陪伴体验", fontWeight = FontWeight.Bold)
-                    SettingSwitch("语音播放", "开启后会自动播放小樱回复的语音。", vm.ttsEnabled) { vm.updateTtsEnabled(it) }
+                    SettingSwitch("语音播放", "开启后会自动播放${vm.characterName}回复的语音。", vm.ttsEnabled) { vm.updateTtsEnabled(it) }
                     SettingSwitch("主动提醒", "开启后桌面组件和本地通知会显示新消息。", vm.notificationsEnabled) { vm.updateNotificationsEnabled(it) }
                     NotificationPermissionPanel(
                         status = notificationStatus,
@@ -2677,7 +2942,7 @@ fun Live2DSelfTestScreen(vm: MainViewModel) {
                 .clip(RoundedCornerShape(8.dp))
                 .background(Color(0xFF1D2230))
         ) {
-            Live2DSelfTestStage(Modifier.fillMaxSize())
+            Live2DSelfTestStage(vm, Modifier.fillMaxSize())
         }
     }
 }

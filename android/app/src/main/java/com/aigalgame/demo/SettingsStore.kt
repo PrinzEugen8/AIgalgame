@@ -23,6 +23,8 @@ class SettingsStore(private val context: Context) {
         val TtsEnabled = booleanPreferencesKey("tts_enabled")
         val NotificationsEnabled = booleanPreferencesKey("notifications_enabled")
         val LastLocationUploadedAt = longPreferencesKey("last_location_uploaded_at")
+        val Live2dAppearanceId = stringPreferencesKey("live2d_appearance_id")
+        val Live2dConfigVersion = stringPreferencesKey("live2d_config_version")
     }
 
     val baseUrl: Flow<String> = context.settingsDataStore.data.map { prefs ->
@@ -78,6 +80,21 @@ class SettingsStore(private val context: Context) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.LastLocationUploadedAt] = value }
     }
 
+    suspend fun readLive2dSyncState(): Live2dSyncState {
+        val prefs = context.settingsDataStore.data.first()
+        return Live2dSyncState(
+            appearanceId = prefs[Keys.Live2dAppearanceId] ?: "",
+            configVersion = prefs[Keys.Live2dConfigVersion] ?: "",
+        )
+    }
+
+    suspend fun saveLive2dSyncState(appearanceId: String, configVersion: String) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.Live2dAppearanceId] = appearanceId
+            prefs[Keys.Live2dConfigVersion] = configVersion
+        }
+    }
+
     suspend fun savePlacement(character: String, placement: OutfitPlacement) {
         val next = placement.coerceForStage()
         context.settingsDataStore.edit { prefs ->
@@ -103,6 +120,11 @@ class SettingsStore(private val context: Context) {
 
     private fun placementKey(character: String, field: String) = floatPreferencesKey("placement_${character}_$field")
 }
+
+data class Live2dSyncState(
+    val appearanceId: String,
+    val configVersion: String,
+)
 
 data class LocalUiSettings(
     val selectedCharacter: String,
