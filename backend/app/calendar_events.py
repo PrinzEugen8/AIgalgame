@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -193,6 +193,69 @@ def calendar_items(session: Session, *, user_id: str, character_id: str, month: 
     return sorted(items, key=lambda item: (item["date"], -int(item["salience"]), item["title"]))
 
 
+def ensure_calendar_proactive_candidates(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    local_time: datetime | None = None,
+    lookahead_days: int = 7,
+) -> int:
+    ensure_calendar_events(session, user_id=user_id, character_id=character_id)
+    now = local_time or datetime.now()
+    today = now.date()
+    end = today + timedelta(days=max(1, lookahead_days))
+    rows = session.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.hidden == False,  # noqa: E712
+            CalendarEvent.user_id.in_(["", user_id]),
+        )
+    ).scalars().all()
+    from .proactive import create_proactive_event
+
+    created = 0
+    for event in rows:
+        if event.character_id not in {"", character_id} or event.salience < 75:
+            continue
+        candidate_dates: list[date] = []
+        if event.repeats_yearly:
+            try:
+                candidate_dates.append(date(today.year, int(event.event_date[5:7]), int(event.event_date[8:10])))
+            except (ValueError, IndexError):
+                continue
+        else:
+            try:
+                candidate_dates.append(date.fromisoformat(event.event_date))
+            except ValueError:
+                continue
+        for event_day in candidate_dates:
+            if event_day < today or event_day > end:
+                continue
+            days_until = (event_day - today).days
+            scheduled_day = today if days_until <= 1 else event_day - timedelta(days=2)
+            scheduled_at = datetime.combine(scheduled_day, time(20, 0))
+            text = event.description or f"{event.title} is coming soon. Ask the user whether they have plans."
+            proactive = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                source_type="calendar_event",
+                source_id=event.event_id,
+                title=event.title,
+                text=text,
+                priority=min(90, max(60, event.salience)),
+                dedupe_key=f"calendar_event:{user_id}:{character_id}:{event.event_id}:{event_day.isoformat()}",
+                payload={"calendar_event_id": event.event_id, "event_date": event_day.isoformat(), "category": event.category, "days_until": days_until},
+                scheduled_at=scheduled_at,
+                expires_at=datetime.combine(event_day + timedelta(days=1), time(12, 0)),
+            )
+            if proactive is not None and proactive.source_type == "calendar_event":
+                created += 1
+    if created:
+        session.commit()
+    return created
+
+
 def day_note(session: Session, *, day: str) -> str:
     experiences = session.execute(
         select(Experience).where(Experience.created_at.like(f"{day}%")).order_by(Experience.created_at.desc()).limit(3)
@@ -250,4 +313,3 @@ def update_calendar_event(session: Session, event_id: str, payload: dict[str, An
     event.updated_at = utc_now()
     session.commit()
     return event
-

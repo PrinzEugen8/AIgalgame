@@ -4,7 +4,7 @@ import ipaddress
 import logging
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +16,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, update_calendar_event
+from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, ensure_calendar_proactive_candidates, update_calendar_event
 from .database import get_session, init_db
 from .diagnostics import runtime_logs, tail_diagnostics, write_diagnostic
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
     CalendarEvent,
+    DeviceRegistration,
     MediaAsset,
     Memory,
     Moment,
@@ -30,17 +31,20 @@ from .models import (
     Message,
     OpeningCache,
     ProviderConfig,
+    ProactiveDeliveryAttempt,
     ProactiveEvent,
     RelationState,
     ScheduleSlot,
     TtsVoiceProfile,
     User,
+    UserCommitment,
     UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
-from .online import mark_offline, mark_online
+from .online import mark_heartbeat, mark_offline, mark_online, presence_context
 from .pipeline import handle_event
-from .proactive import consume_proactive_event, create_moment_feedback_event, mark_proactive_delivered, pending_proactive_response
+from .proactive import consume_proactive_event, create_moment_feedback_event, create_proactive_event, ensure_news_candidate, mark_proactive_delivered, mark_proactive_dismissed, pending_proactive_response
+from .push import record_delivery_attempt, register_device
 from .providers import (
     OpenAICompatibleClient,
     ProviderError,
@@ -329,6 +333,78 @@ def _proactive_event_to_out(event: ProactiveEvent) -> dict[str, Any]:
     }
 
 
+def _schedule_slot_to_out(slot: ScheduleSlot) -> dict[str, Any]:
+    return {
+        "slot_id": slot.slot_id,
+        "schedule_date": slot.schedule_date,
+        "user_id": slot.user_id,
+        "character_id": slot.character_id,
+        "start_at": slot.start_at,
+        "end_at": slot.end_at,
+        "activity_title": slot.activity_title,
+        "activity_type": slot.activity_type,
+        "location": slot.location,
+        "planned_status": slot.planned_status,
+        "actual_status": slot.actual_status,
+        "interrupted_by_session_id": slot.interrupted_by_session_id,
+        "salience": slot.salience,
+        "can_generate_moment": slot.can_generate_moment,
+        "can_generate_photo": slot.can_generate_photo,
+    }
+
+
+def _device_registration_to_out(item: DeviceRegistration) -> dict[str, Any]:
+    return {
+        "device_id": item.device_id,
+        "user_id": item.user_id,
+        "platform": item.platform,
+        "has_push_token": bool(item.push_token),
+        "app_version": item.app_version,
+        "locale": item.locale,
+        "timezone": item.timezone,
+        "notifications_enabled": item.notifications_enabled,
+        "last_seen_at": item.last_seen_at,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
+def _delivery_attempt_to_out(item: ProactiveDeliveryAttempt) -> dict[str, Any]:
+    return {
+        "attempt_id": item.attempt_id,
+        "proactive_event_id": item.proactive_event_id,
+        "user_id": item.user_id,
+        "character_id": item.character_id,
+        "channel": item.channel,
+        "target_device_id": item.target_device_id,
+        "status": item.status,
+        "status_code": item.status_code,
+        "error_message": item.error_message,
+        "request": load_json(item.request_json, {}),
+        "response": load_json(item.response_json, {}),
+        "created_at": item.created_at,
+    }
+
+
+def _commitment_to_out(item: UserCommitment) -> dict[str, Any]:
+    return {
+        "commitment_id": item.commitment_id,
+        "user_id": item.user_id,
+        "character_id": item.character_id,
+        "title": item.title,
+        "description": item.description,
+        "event_at": item.event_at,
+        "remind_at": item.remind_at,
+        "timezone": item.timezone,
+        "source_message_id": item.source_message_id,
+        "status": item.status,
+        "dedupe_key": item.dedupe_key,
+        "payload": load_json(item.payload_json, {}),
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    }
+
+
 def _page_bounds(page: int, page_size: int) -> tuple[int, int]:
     safe_page = max(1, int(page or 1))
     safe_size = max(1, min(int(page_size or 20), 100))
@@ -589,6 +665,41 @@ def admin_proactive_events(
     return _page_response([_proactive_event_to_out(item) for item in events], total, page, page_size)
 
 
+@app.get("/api/admin/device-registrations")
+def admin_device_registrations(user_id: str = "", page: int = 1, page_size: int = 20, session: Session = Depends(get_session)) -> dict[str, Any]:
+    stmt = select(DeviceRegistration).order_by(DeviceRegistration.updated_at.desc())
+    if user_id:
+        stmt = stmt.where(DeviceRegistration.user_id == user_id)
+    rows, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_device_registration_to_out(item) for item in rows], total, page, page_size)
+
+
+@app.get("/api/admin/proactive-delivery-attempts")
+def admin_delivery_attempts(
+    user_id: str = "",
+    proactive_event_id: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(ProactiveDeliveryAttempt).order_by(ProactiveDeliveryAttempt.created_at.desc())
+    if user_id:
+        stmt = stmt.where(ProactiveDeliveryAttempt.user_id == user_id)
+    if proactive_event_id:
+        stmt = stmt.where(ProactiveDeliveryAttempt.proactive_event_id == proactive_event_id)
+    rows, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_delivery_attempt_to_out(item) for item in rows], total, page, page_size)
+
+
+@app.get("/api/admin/user-commitments")
+def admin_user_commitments(user_id: str = "", page: int = 1, page_size: int = 20, session: Session = Depends(get_session)) -> dict[str, Any]:
+    stmt = select(UserCommitment).order_by(UserCommitment.remind_at.desc())
+    if user_id:
+        stmt = stmt.where(UserCommitment.user_id == user_id)
+    rows, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
+    return _page_response([_commitment_to_out(item) for item in rows], total, page, page_size)
+
+
 @app.post("/api/admin/proactive-events/prewarm")
 def admin_prewarm_proactive(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
     body = payload or {}
@@ -601,6 +712,176 @@ def admin_prewarm_proactive(payload: dict[str, Any] | None = None, session: Sess
         limit=int(body.get("limit") or 8),
         generate_news=bool(body.get("generate_news", False)),
     )
+
+
+@app.get("/api/admin/ai-schedule/today")
+def admin_ai_schedule_today(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    local_time: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    day = _parse_client_time(local_time) or datetime.now()
+    slots = ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
+    return {"ok": True, "items": [_schedule_slot_to_out(item) for item in sorted(slots, key=lambda slot: slot.start_at)]}
+
+
+def _payload_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _payload_int(payload: dict[str, Any], key: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(float(payload.get(key, default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _admin_due_time(payload: dict[str, Any], local_time: datetime | None) -> datetime:
+    scheduled_at = _parse_client_time(str(payload.get("scheduled_at") or ""))
+    if scheduled_at is not None:
+        return scheduled_at
+    now = local_time or datetime.now(timezone.utc)
+    if _payload_bool(payload, "due_now", True):
+        return now
+    return now + timedelta(minutes=15)
+
+
+@app.post("/api/admin/proactive-events/generate")
+def admin_generate_proactive_source(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    source_type = str(body.get("source_type") or "memory").strip()
+    if source_type not in {"news", "weather", "schedule", "calendar_event", "moment_interaction", "appointment", "memory"}:
+        raise HTTPException(status_code=400, detail="unsupported proactive source_type")
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    local_time = _parse_client_time(str(body.get("local_time") or ""))
+    title = str(body.get("title") or "").strip()
+    text = str(body.get("text") or "").strip()
+    priority = _payload_int(body, "priority", 75, minimum=0, maximum=100)
+    generated_by = "manual"
+    events: list[ProactiveEvent] = []
+
+    if source_type == "news" and not _payload_bool(body, "manual_only", False):
+        event = ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+        if event is not None:
+            generated_by = "news_provider"
+            events.append(event)
+    elif source_type == "weather" and not _payload_bool(body, "manual_only", False):
+        snapshot = refresh_weather_snapshot(session, user_id=user_id, local_time=local_time, force=_payload_bool(body, "force_refresh", True))
+        event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time) if snapshot is not None else None
+        if event is not None:
+            generated_by = "weather_provider"
+            events.append(event)
+    elif source_type == "calendar_event" and not _payload_bool(body, "manual_only", False):
+        generated = ensure_calendar_proactive_candidates(session, user_id=user_id, character_id=character_id, local_time=local_time)
+        if generated:
+            generated_by = "calendar_event_provider"
+            events.extend(generated)
+    elif source_type == "schedule" and not _payload_bool(body, "manual_only", False):
+        slots = ensure_schedule(session, user_id=user_id, character_id=character_id, day=local_time or datetime.now())
+        slot_id = str(body.get("slot_id") or "")
+        slot = next((item for item in slots if item.slot_id == slot_id), None)
+        slot = slot or next((item for item in slots if item.actual_status == "pending" and item.salience >= 60), None) or (slots[0] if slots else None)
+        if slot is not None:
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                source_type="schedule",
+                source_id=slot.slot_id,
+                title=title or "小樱有一件日常想告诉你",
+                text=text or f"小樱今天在{slot.location}安排了「{slot.activity_title}」，想找个合适的时候告诉你。",
+                priority=priority,
+                scheduled_at=_admin_due_time(body, local_time),
+                payload={"activity_title": slot.activity_title, "location": slot.location, "activity_type": slot.activity_type, "admin_generated": True},
+            )
+            if event is not None:
+                generated_by = "schedule_slot"
+                events.append(event)
+
+    if not events:
+        if source_type == "moment_interaction":
+            event = create_moment_feedback_event(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                interaction_id=uid("admin_interaction"),
+                interaction_type=str(body.get("interaction_type") or "comment"),
+                moment_id=str(body.get("moment_id") or "admin_moment"),
+                content=text or "后台测试：用户刚刚在朋友圈有互动。",
+            )
+        else:
+            fallback_text = text or {
+                "news": "后台测试：有一条用户可能感兴趣的新闻，适合主动开口。",
+                "weather": "后台测试：天气有变化，适合提醒用户。",
+                "schedule": "后台测试：今天的 AI 日程里有一件事想告诉用户。",
+                "calendar_event": "后台测试：最近有一个日历事件适合问问用户安排。",
+                "appointment": "后台测试：用户之前提到的约定快到了，需要温柔提醒。",
+                "memory": "后台测试：小樱想起了一件和用户有关的小事。",
+            }[source_type]
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id=character_id,
+                source_type=source_type,
+                source_id=str(body.get("source_id") or f"admin:{uid('src')}"),
+                title=title or "后台测试主动消息",
+                text=fallback_text,
+                priority=priority,
+                scheduled_at=_admin_due_time(body, local_time),
+                payload={"admin_generated": True, "source_type": source_type},
+            )
+        if event is not None:
+            events.append(event)
+
+    session.commit()
+    return {"ok": True, "source_type": source_type, "generated_by": generated_by, "items": [_proactive_event_to_out(item) for item in events]}
+
+
+@app.post("/api/admin/proactive-events/judge")
+def admin_judge_proactive_now(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    local_time = _parse_client_time(str(body.get("local_time") or ""))
+    foreground_context = {
+        "app_state": str(body.get("app_state") or "admin"),
+        "screen": str(body.get("screen") or "admin"),
+        "idle_seconds": _payload_int(body, "idle_seconds", 120, minimum=0, maximum=86400),
+        "input_active": _payload_bool(body, "input_active", False),
+    }
+    result = pending_proactive_response(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        local_time=local_time,
+        generate_news=_payload_bool(body, "generate_news", False),
+        generate_weather=_payload_bool(body, "generate_weather", False),
+        delivery_channel=str(body.get("delivery_channel") or "admin"),
+        foreground_context=foreground_context,
+        ignore_next_check=_payload_bool(body, "ignore_next_check", True),
+    )
+    prepare_result: dict[str, Any] | None = None
+    event_payload = result.get("event") or {}
+    event_id = str(event_payload.get("proactive_event_id") or "")
+    if event_id and _payload_bool(body, "prepare", False):
+        prepare_result = prepare_opening(session, user_id=user_id, character_id=character_id, local_time=local_time, proactive_event_id=event_id)
+    user = session.get(User, user_id)
+    return {
+        "ok": True,
+        "pending": result,
+        "prepared": prepare_result,
+        "judgement": load_json(user.proactive_judgement_json, {}) if user is not None else {},
+        "next_check_at": user.proactive_next_check_at if user is not None else "",
+    }
 
 
 @app.get("/api/admin/tts-voices")
@@ -918,9 +1199,100 @@ def proactive_pending(
     )
 
 
+@app.post("/api/devices/register")
+def devices_register(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+    user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
+    ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    try:
+        registration = register_device(session, {**payload, "user_id": user_id})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "device": _device_registration_to_out(registration)}
+
+
+@app.post("/api/presence/heartbeat")
+def presence_heartbeat(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    device_id = str(body.get("device_id") or "android")
+    context = {
+        "app_state": str(body.get("app_state") or "foreground"),
+        "screen": str(body.get("screen") or ""),
+        "idle_seconds": int(body.get("idle_seconds") or 0),
+        "input_active": bool(body.get("input_active", False)),
+        "local_time": str(body.get("local_time") or ""),
+    }
+    return {"ok": True, "presence": mark_heartbeat(user_id, device_id, context)}
+
+
+@app.post("/api/proactive/foreground-check")
+def proactive_foreground_check(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    device_id = str(body.get("device_id") or "android")
+    ensure_seed(session, user_id=user_id, character_id=character_id)
+    heartbeat = {
+        "app_state": "foreground",
+        "screen": str(body.get("screen") or ""),
+        "idle_seconds": int(body.get("idle_seconds") or 0),
+        "input_active": bool(body.get("input_active", False)),
+        "local_time": str(body.get("local_time") or ""),
+    }
+    mark_heartbeat(user_id, device_id, heartbeat)
+    local_time = _parse_client_time(str(body.get("local_time") or ""))
+    pending = pending_proactive_response(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        local_time=local_time,
+        delivery_channel="foreground",
+        foreground_context=presence_context(user_id),
+    )
+    event_payload = pending.get("event") or {}
+    event_id = str(event_payload.get("proactive_event_id") or "")
+    if not event_id:
+        return {"event_type": "no_reply", "event_id": uid("evt"), "session_id": str(body.get("session_id") or "android"), "payload": {"pace_reason": "no foreground proactive event"}}
+    prepared = prepare_opening(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        local_time=local_time,
+        proactive_event_id=event_id,
+        allow_llm=True,
+    )
+    if not prepared.get("prepared"):
+        return {"event_type": "no_reply", "event_id": uid("evt"), "session_id": str(body.get("session_id") or "android"), "payload": {"pace_reason": str(prepared.get("reason") or "not prepared")}}
+    event = session.get(ProactiveEvent, event_id)
+    if event is not None:
+        record_delivery_attempt(session, event=event, channel="foreground", target_device_id=device_id, status="sent")
+    result = consume_ready_opening(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        session_id=str(body.get("session_id") or "android"),
+        local_time=local_time,
+        proactive_event_id=event_id,
+    )
+    output = result.model_dump()
+    if isinstance(output.get("payload"), dict):
+        output["payload"]["proactive_event_id"] = event_id
+    if output.get("event_type") == "dialogue":
+        consume_proactive_event(session, event_id)
+    return output
+
+
 @app.post("/api/proactive/{event_id}/delivered")
 def proactive_delivered(event_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
     event = mark_proactive_delivered(session, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="proactive event not found")
+    return {"ok": True, "event": {"proactive_event_id": event.proactive_event_id, "status": event.status}}
+
+
+@app.post("/api/proactive/{event_id}/dismiss")
+def proactive_dismiss(event_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    event = mark_proactive_dismissed(session, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="proactive event not found")
     return {"ok": True, "event": {"proactive_event_id": event.proactive_event_id, "status": event.status}}

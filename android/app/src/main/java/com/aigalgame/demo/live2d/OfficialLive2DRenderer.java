@@ -3,6 +3,8 @@ package com.aigalgame.demo.live2d;
 import android.content.Context;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
+import android.os.SystemClock;
+import android.os.Trace;
 import android.util.Log;
 
 import com.aigalgame.demo.Live2DRenderCommand;
@@ -30,6 +32,7 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
     }
 
     private static final String TAG = "OfficialLive2D";
+    private static final String PERF_TAG = "OfficialLive2DPerf";
     private static final String MODEL3_PATH = "live2d/models/neko/neko.model3.json";
     private static final Object FRAMEWORK_LOCK = new Object();
 
@@ -58,6 +61,12 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
     private boolean coreLoaded;
     private String glLifecycle = "created";
     private String lastError = "";
+    private Live2DBootState bootState = Live2DBootState.NotStarted;
+    private String phase = "created";
+    private long loadStartedAtMs;
+    private long loadElapsedMs;
+    private boolean surfaceAttached;
+    private boolean engineReused;
 
     public OfficialLive2DRenderer(Context context, Callback callback) {
         appContext = context.getApplicationContext();
@@ -70,15 +79,27 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
         }
     }
 
+    public void setEngineState(boolean surfaceAttached, boolean engineReused) {
+        this.surfaceAttached = surfaceAttached;
+        this.engineReused = engineReused;
+    }
+
     @Override
     public void onSurfaceCreated(GL10 unused, EGLConfig config) {
         glLifecycle = "surface-created";
+        phase = "core";
+        bootState = Live2DBootState.Loading;
         loadAttempted = false;
         lastFrameNanos = 0L;
         releaseModel();
 
+        boolean traceOpen = false;
         try {
+            Trace.beginSection("Live2D.ensureFramework");
+            traceOpen = true;
             ensureCubismFramework();
+            Trace.endSection();
+            traceOpen = false;
             coreLoaded = true;
             CubismShaderAndroid.getInstance().releaseInvalidShaderProgram();
             CubismShaderAndroid.deleteInstance();
@@ -87,6 +108,9 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
             GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             reportStatus();
         } catch (Throwable t) {
+            if (traceOpen) {
+                Trace.endSection();
+            }
             reportError("SDK/Core load failed: " + t.getMessage());
         }
     }
@@ -116,12 +140,28 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
                 return;
             }
             loadAttempted = true;
+            boolean traceOpen = false;
             try {
+                phase = "load-assets";
+                bootState = Live2DBootState.Loading;
+                loadStartedAtMs = SystemClock.elapsedRealtime();
+                Log.i(PERF_TAG, "loadAssets begin");
+                Trace.beginSection("Live2D.loadAssets");
+                traceOpen = true;
                 model = new NekoLive2DModel(appContext);
                 model.loadAssets(MODEL3_PATH, surfaceWidth, surfaceHeight);
                 model.setRenderTargetSize(surfaceWidth, surfaceHeight);
+                Trace.endSection();
+                traceOpen = false;
+                loadElapsedMs = SystemClock.elapsedRealtime() - loadStartedAtMs;
+                bootState = Live2DBootState.Ready;
+                phase = "ready";
+                Log.i(PERF_TAG, "loadAssets complete elapsedMs=" + loadElapsedMs + " drawableCount=" + model.getDrawableCount());
                 reportStatus();
             } catch (Throwable t) {
+                if (traceOpen) {
+                    Trace.endSection();
+                }
                 releaseModel();
                 reportError("NEKO model load failed: " + t.getMessage());
                 return;
@@ -150,6 +190,7 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
         releaseModel();
         CubismOffscreenManagerAndroid.releaseInstance();
         glLifecycle = "released";
+        surfaceAttached = false;
         reportStatus();
     }
 
@@ -206,12 +247,19 @@ public final class OfficialLive2DRenderer implements GLSurfaceView.Renderer {
             model != null && model.isInitialized(),
             model == null ? 0 : model.getDrawableCount(),
             glLifecycle,
-            lastError
+            lastError,
+            bootState,
+            phase,
+            loadElapsedMs,
+            surfaceAttached,
+            engineReused
         ));
     }
 
     private void reportError(String message) {
         lastError = message == null ? "Live2D renderer error" : message;
+        bootState = Live2DBootState.Failed;
+        phase = "failed";
         Log.e(TAG, lastError);
         reportStatus();
         if (callback != null) {

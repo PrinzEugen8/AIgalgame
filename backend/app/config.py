@@ -24,7 +24,7 @@ class Settings:
     debugpy_host: str = "127.0.0.1"
     debugpy_port: int = 5678
     debugpy_wait_for_client: bool = False
-    prewarm_interval_minutes: int = 15
+    prewarm_interval_minutes: int = 5
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -54,7 +54,7 @@ def load_settings() -> Settings:
         debugpy_host=os.getenv("AIGALGAME_DEBUGPY_HOST", "127.0.0.1"),
         debugpy_port=int(os.getenv("AIGALGAME_DEBUGPY_PORT", "5678")),
         debugpy_wait_for_client=_env_bool("AIGALGAME_DEBUGPY_WAIT"),
-        prewarm_interval_minutes=int(os.getenv("AIGALGAME_PREWARM_INTERVAL_MINUTES", "15")),
+        prewarm_interval_minutes=int(os.getenv("AIGALGAME_PREWARM_INTERVAL_MINUTES", "5")),
     )
 
 

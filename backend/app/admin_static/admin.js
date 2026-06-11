@@ -19,6 +19,8 @@ const state = {
   memories: [],
   calendarEvents: [],
   proactiveEvents: [],
+  aiSchedule: [],
+  proactiveActionResult: null,
   runtimeLogs: [],
   runtimeFeatures: [],
   runtimeFlows: [],
@@ -75,6 +77,13 @@ function formatDuration(ms) {
   const value = Number(ms || 0);
   if (value < 1000) return `${Math.max(0, Math.round(value))} ms`;
   return `${(value / 1000).toFixed(value < 10_000 ? 2 : 1)} s`;
+}
+
+function formatIsoTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function escapeHtml(value) {
@@ -863,6 +872,25 @@ function renderProactiveEditor() {
     node.textContent = "请选择用户。";
     return;
   }
+  const scheduleSegments = compactSchedule(state.aiSchedule);
+  const scheduleItems = scheduleSegments.map((slot) => `
+    <article class="data-item">
+      <strong>${escapeHtml(formatIsoTime(slot.start_at))} - ${escapeHtml(formatIsoTime(slot.end_at))} · ${escapeHtml(slot.activity_title || "")}</strong>
+      <small>${escapeHtml(slot.location || "")} · ${escapeHtml(slot.activity_type || "")} · ${escapeHtml(slot.actual_status || "")} · salience ${escapeHtml(slot.salience || 0)}</small>
+    </article>
+  `).join("");
+  const sourceOptions = [
+    ["news", "新闻"],
+    ["weather", "天气"],
+    ["schedule", "AI 日程"],
+    ["calendar_event", "日历事件"],
+    ["moment_interaction", "朋友圈互动"],
+    ["appointment", "约定"],
+    ["memory", "记忆"],
+  ].map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  const slotOptions = state.aiSchedule.map((slot) => `
+    <option value="${escapeHtml(slot.slot_id)}">${escapeHtml(formatIsoTime(slot.start_at))} ${escapeHtml(slot.activity_title || "")}</option>
+  `).join("");
   const items = state.proactiveEvents.map((event) => `
     <article class="data-item">
       <strong>${escapeHtml(event.status)} · ${escapeHtml(event.source_type)} · priority ${escapeHtml(event.priority)}</strong>
@@ -872,6 +900,25 @@ function renderProactiveEditor() {
     </article>
   `).join("");
   node.innerHTML = `
+    <form class="compact-form" id="proactiveGenerateForm">
+      <label><span>主动来源</span><select name="source_type">${sourceOptions}</select></label>
+      <label><span>AI 日程 slot</span><select name="slot_id"><option value="">自动选择</option>${slotOptions}</select></label>
+      <label><span>优先级</span><input name="priority" type="number" min="0" max="100" value="80"></label>
+      <label><span>标题</span><input name="title" placeholder="后台测试主动消息"></label>
+      <label class="wide"><span>内容</span><textarea name="text" placeholder="留空则按来源自动生成测试内容"></textarea></label>
+      <label class="inline-check"><input type="checkbox" name="due_now" checked><span>立刻到期</span></label>
+      <label class="inline-check"><input type="checkbox" name="manual_only"><span>只生成测试候选</span></label>
+      <label class="inline-check"><input type="checkbox" name="prepare"><span>判断后预制对话</span></label>
+      <div class="actions">
+        <button type="button" id="proactiveGenerate">从来源生成</button>
+        <button type="button" class="secondary" id="proactiveJudgeNow">立即判断</button>
+      </div>
+    </form>
+    <section class="data-list">
+      <h4>今天的 AI 日程</h4>
+      ${scheduleItems || "<small>暂无 AI 日程</small>"}
+    </section>
+    <pre id="proactiveActionResult">${state.proactiveActionResult ? escapeHtml(pretty(state.proactiveActionResult)) : "等待主动消息测试操作..."}</pre>
     <div class="table-toolbar">
       <label><span>搜索主动消息</span><input id="proactiveSearch" value="${escapeHtml(state.proactivePage.q)}" placeholder="标题 / 内容 / 来源"></label>
       <label><span>每页</span><select id="proactivePageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.proactivePage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
@@ -881,11 +928,13 @@ function renderProactiveEditor() {
     <div class="data-list">${items || "<small>暂无主动消息</small>"}</div>
     <div class="pager" id="proactivePager"></div>
   `;
+  $("#proactiveGenerate").addEventListener("click", () => generateProactiveFromSource());
+  $("#proactiveJudgeNow").addEventListener("click", () => judgeProactiveNow());
   $("#proactiveRefresh").addEventListener("click", async () => {
     state.proactivePage.q = $("#proactiveSearch").value.trim();
     state.proactivePage.pageSize = Number($("#proactivePageSize").value || 10);
     state.proactivePage.page = 1;
-    await loadProactiveEvents();
+    await Promise.all([loadProactiveEvents(), loadAiSchedule()]);
     renderProactiveEditor();
   });
   $("#proactiveSearch").addEventListener("keydown", async (event) => {
@@ -903,7 +952,7 @@ function renderProactiveEditor() {
     renderProactiveEditor();
   });
   $("#proactivePrewarm").addEventListener("click", async () => {
-    await api("/api/admin/proactive-events/prewarm", {
+    state.proactiveActionResult = await api("/api/admin/proactive-events/prewarm", {
       method: "POST",
       body: JSON.stringify({ user_id: state.activeUserId, character_id: "sakura", limit: 4 }),
     });
@@ -915,6 +964,25 @@ function renderProactiveEditor() {
     await loadProactiveEvents();
     renderProactiveEditor();
   });
+}
+
+function compactSchedule(items) {
+  const segments = [];
+  for (const item of items || []) {
+    const prev = segments[segments.length - 1];
+    const same = prev
+      && prev.activity_title === item.activity_title
+      && prev.activity_type === item.activity_type
+      && prev.location === item.location
+      && prev.actual_status === item.actual_status;
+    if (same) {
+      prev.end_at = item.end_at;
+      prev.salience = Math.max(Number(prev.salience || 0), Number(item.salience || 0));
+    } else {
+      segments.push({ ...item });
+    }
+  }
+  return segments;
 }
 
 function renderTestData() {
@@ -1003,10 +1071,58 @@ async function loadProactiveEvents() {
   state.proactivePage.pageSize = payload.page_size || state.proactivePage.pageSize;
 }
 
+async function loadAiSchedule() {
+  if (!state.activeUserId) {
+    state.aiSchedule = [];
+    return;
+  }
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "sakura" });
+  const payload = await api(`/api/admin/ai-schedule/today?${params.toString()}`);
+  state.aiSchedule = payload.items || [];
+}
+
 async function loadTestData() {
   await loadUsers();
-  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents(), loadAiSchedule()]);
   renderTestData();
+}
+
+function proactiveFormPayload() {
+  const form = $("#proactiveGenerateForm");
+  return {
+    user_id: state.activeUserId,
+    character_id: "sakura",
+    source_type: form.elements.source_type.value,
+    slot_id: form.elements.slot_id.value,
+    priority: Number(form.elements.priority.value || 80),
+    title: form.elements.title.value.trim(),
+    text: form.elements.text.value.trim(),
+    due_now: form.elements.due_now.checked,
+    manual_only: form.elements.manual_only.checked,
+    prepare: form.elements.prepare.checked,
+    ignore_next_check: true,
+    idle_seconds: 120,
+    input_active: false,
+  };
+}
+
+async function generateProactiveFromSource() {
+  state.proactiveActionResult = await api("/api/admin/proactive-events/generate", {
+    method: "POST",
+    body: JSON.stringify(proactiveFormPayload()),
+  });
+  state.proactivePage.page = 1;
+  await Promise.all([loadProactiveEvents(), loadAiSchedule()]);
+  renderProactiveEditor();
+}
+
+async function judgeProactiveNow() {
+  state.proactiveActionResult = await api("/api/admin/proactive-events/judge", {
+    method: "POST",
+    body: JSON.stringify(proactiveFormPayload()),
+  });
+  await loadProactiveEvents();
+  renderProactiveEditor();
 }
 
 async function createUser() {

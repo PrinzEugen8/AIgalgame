@@ -8,10 +8,11 @@ import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import jwt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,19 @@ class ProviderError(RuntimeError):
 
 
 HTTP_TRANSPORT: httpx.BaseTransport | None = None
+JSON_RESPONSE_FORMAT = {"type": "json_object"}
+JSON_MIN_MAX_TOKENS = 256
+JSON_RETRY_MAX_TOKENS = 4096
+JSON_OUTPUT_INSTRUCTION = (
+    "JSON Output mode is required. Return exactly one valid json object matching the user's requested schema. "
+    "Use double-quoted keys and strings. Do not include markdown, code fences, comments, or extra text. "
+    'Illustrative example only: {"ok": true}.'
+)
+JSON_RETRY_INSTRUCTION = (
+    "The previous response was not a valid json object. Return the complete corrected json object only, "
+    "matching the schema requested above. Do not include markdown or commentary. "
+    'Illustrative example only: {"ok": true}.'
+)
 
 
 def _client(timeout: float) -> httpx.Client:
@@ -76,6 +90,40 @@ def _json_or_empty(value: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_max_tokens(max_tokens: int, metadata: dict[str, Any]) -> int:
+    try:
+        floor = int(metadata.get("json_min_max_tokens") or JSON_MIN_MAX_TOKENS)
+    except (TypeError, ValueError):
+        floor = JSON_MIN_MAX_TOKENS
+    return max(max_tokens, max(0, floor))
+
+
+def _json_retry_max_tokens(max_tokens: int, metadata: dict[str, Any]) -> int:
+    try:
+        limit = int(metadata.get("json_retry_max_tokens") or JSON_RETRY_MAX_TOKENS)
+    except (TypeError, ValueError):
+        limit = JSON_RETRY_MAX_TOKENS
+    if limit <= max_tokens:
+        return max_tokens
+    return min(max_tokens * 2, limit)
+
+
+def _json_output_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    prepared = [dict(message) for message in messages]
+    for message in prepared:
+        if message.get("role") == "system":
+            content = str(message.get("content") or "")
+            message["content"] = f"{content}\n\n{JSON_OUTPUT_INSTRUCTION}".strip()
+            return prepared
+    return [{"role": "system", "content": JSON_OUTPUT_INSTRUCTION}, *prepared]
+
+
+def _json_retry_messages(messages: list[dict[str, str]], content: str, finish_reason: Any) -> list[dict[str, str]]:
+    preview = content[:1200] if content else "<empty content>"
+    repair_prompt = f"{JSON_RETRY_INSTRUCTION}\nPrevious finish_reason: {finish_reason or ''}\nPrevious content preview: {preview}"
+    return [*messages, {"role": "user", "content": repair_prompt}]
 
 
 def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
@@ -328,6 +376,25 @@ def provider_presets() -> dict[str, Any]:
                     _field("unit", "单位", "metadata", type_="select", default="m", options=["m", "i"]),
                     _field("cache_minutes", "天气缓存分钟", "metadata", type_="number", default=120),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                ],
+            }
+        ],
+        "push": [
+            {
+                "provider": "fcm_http_v1",
+                "label": "Firebase Cloud Messaging HTTP v1",
+                "base_url": "https://fcm.googleapis.com/v1",
+                "model": "",
+                "docs": "https://firebase.google.com/docs/cloud-messaging/send-message",
+                "supports_models": False,
+                "description": "Sends proactive messages to Android devices through Firebase Cloud Messaging HTTP v1.",
+                "fields": [
+                    _field("label", "Display name", "core", default="Firebase Cloud Messaging HTTP v1"),
+                    _field("base_url", "FCM API Base URL", "core", default="https://fcm.googleapis.com/v1", required=True),
+                    _field("project_id", "Firebase project_id", "metadata", placeholder="Optional when service account JSON includes project_id"),
+                    _field("service_account_json", "Service account JSON", "secret", required=True, type_="textarea"),
+                    _field("channel_id", "Android notification channel", "metadata", default="sakura"),
+                    _field("timeout", "Timeout seconds", "metadata", type_="number", default=20),
                 ],
             }
         ],
@@ -628,6 +695,116 @@ def get_task_llm_provider(session: Session) -> ProviderConfig | None:
     return get_enabled_provider(session, "llm_task") or get_enabled_provider(session, "llm")
 
 
+class FcmHttpV1Client:
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+        self.metadata = load_json(config.metadata_json, {})
+        raw_service_account = _secret(config, "service_account_json")
+        if not raw_service_account:
+            raise ProviderError("FCM service account JSON is not configured")
+        try:
+            self.service_account = json.loads(raw_service_account)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("FCM service account JSON is invalid") from exc
+        self.project_id = str(self.metadata.get("project_id") or self.service_account.get("project_id") or "").strip()
+        self.client_email = str(self.service_account.get("client_email") or "").strip()
+        self.private_key = str(self.service_account.get("private_key") or "").strip()
+        self.token_uri = str(self.service_account.get("token_uri") or "https://oauth2.googleapis.com/token").strip()
+        if not self.project_id:
+            raise ProviderError("FCM project_id is not configured")
+        if not self.client_email or not self.private_key:
+            raise ProviderError("FCM service account must include client_email and private_key")
+
+    def _access_token(self) -> str:
+        now = datetime.now(timezone.utc)
+        claims = {
+            "iss": self.client_email,
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+            "aud": self.token_uri,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=55)).timestamp()),
+        }
+        assertion = jwt.encode(claims, self.private_key, algorithm="RS256")
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            response = client.post(
+                self.token_uri,
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response.raise_for_status()
+        token = str(response.json().get("access_token") or "")
+        if not token:
+            raise ProviderError("FCM OAuth token response did not include access_token")
+        return token
+
+    def _url(self) -> str:
+        return f"{self.config.base_url.rstrip('/')}/projects/{self.project_id}/messages:send"
+
+    def send(
+        self,
+        *,
+        token: str,
+        title: str,
+        body: str,
+        data: dict[str, str],
+        channel_id: str = "",
+    ) -> dict[str, Any]:
+        if not token:
+            raise ProviderError("FCM target token is empty")
+        resolved_channel = channel_id or str(self.metadata.get("channel_id") or "sakura")
+        message = {
+            "token": token,
+            "notification": {"title": title[:120], "body": body[:500]},
+            "data": {key: str(value) for key, value in data.items()},
+            "android": {
+                "priority": "HIGH",
+                "notification": {
+                    "channel_id": resolved_channel,
+                    "visibility": "PUBLIC",
+                    "notification_priority": "PRIORITY_DEFAULT",
+                },
+            },
+        }
+        request_body = {"message": message}
+        started = time.monotonic()
+        with diagnostic_span(
+            "fcm_request",
+            feature="proactive_delivery",
+            stage="fcm_send",
+            purpose="Send proactive event through Firebase Cloud Messaging",
+            provider_id=self.config.provider_id,
+            endpoint=self._url(),
+            request=request_body,
+            input={"token_present": bool(token), "title": title, "data_keys": sorted(data.keys())},
+        ) as span:
+            with _client(float(self.metadata.get("timeout", 20.0))) as client:
+                try:
+                    response = client.post(
+                        self._url(),
+                        headers={"Authorization": f"Bearer {self._access_token()}", "Content-Type": "application/json"},
+                        json=request_body,
+                    )
+                    response.raise_for_status()
+                except Exception as exc:
+                    write_diagnostic(
+                        "fcm_error",
+                        provider_id=self.config.provider_id,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                    raise
+            payload = response.json() if response.content else {}
+            span.add(response=payload, status_code=response.status_code)
+            write_diagnostic(
+                "fcm_ok",
+                provider_id=self.config.provider_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                status_code=response.status_code,
+            )
+            return {"status_code": response.status_code, "body": payload, "request": request_body}
+
+
 class OpenAICompatibleClient:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
@@ -658,16 +835,22 @@ class OpenAICompatibleClient:
     ) -> dict[str, Any]:
         if not self.config.model:
             raise ProviderError("LLM model is not selected")
+        prepared_messages = _json_output_messages(messages)
+        effective_max_tokens = _json_max_tokens(max_tokens, self.metadata)
+        retry_max_tokens = _json_retry_max_tokens(effective_max_tokens, self.metadata)
         body: dict[str, Any] = {
             "model": self.config.model,
-            "messages": messages,
+            "messages": prepared_messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
+            "max_tokens": effective_max_tokens,
+            "response_format": JSON_RESPONSE_FORMAT,
         }
         extra_body = self.metadata.get("extra_body")
         if isinstance(extra_body, dict):
-            body.update(extra_body)
+            body.update({key: value for key, value in extra_body.items() if key not in {"messages", "max_tokens", "response_format"}})
+            body["messages"] = prepared_messages
+            body["max_tokens"] = effective_max_tokens
+            body["response_format"] = JSON_RESPONSE_FORMAT
         started = time.monotonic()
         diag = diagnostic or {}
         feature = str(diag.get("feature") or "LLM")
@@ -689,64 +872,105 @@ class OpenAICompatibleClient:
             references=diag.get("references") or {},
         ) as span:
             with _client(float(self.metadata.get("timeout", 30.0))) as client:
-                try:
-                    response = client.post(
-                        self._url("chat/completions"),
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json=body,
+                attempt_messages = prepared_messages
+                attempts: list[dict[str, Any]] = []
+                for attempt in range(1, 3):
+                    body["messages"] = attempt_messages
+                    try:
+                        response = client.post(
+                            self._url("chat/completions"),
+                            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                            json=body,
+                        )
+                        response.raise_for_status()
+                    except Exception as exc:
+                        write_diagnostic(
+                            "llm_error",
+                            provider_id=self.config.provider_id,
+                            model=self.config.model,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                        raise
+                    response_payload = response.json()
+                    choice = response_payload["choices"][0]
+                    message_payload = choice.get("message") or {}
+                    content = str(message_payload.get("content") or "")
+                    finish_reason = choice.get("finish_reason", "")
+                    reasoning_preview = str(message_payload.get("reasoning_content") or "")[:180]
+                    try:
+                        parsed = json.loads(content)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("JSON root is not an object")
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        error_preview = content[:180]
+                        if not error_preview:
+                            error_preview = f"<empty content>; finish_reason={finish_reason}; reasoning_preview={reasoning_preview}"
+                        elif finish_reason == "length":
+                            error_preview = f"{error_preview}; finish_reason=length; JSON may have been truncated"
+                        error_type = "json_decode" if isinstance(exc, json.JSONDecodeError) else "json_object"
+                        attempts.append(
+                            {
+                                "attempt": attempt,
+                                "error_type": error_type,
+                                "message": str(exc),
+                                "raw_preview": content[:180],
+                                "reasoning_preview": reasoning_preview,
+                                "finish_reason": finish_reason,
+                                "max_tokens": body.get("max_tokens"),
+                            }
+                        )
+                        if attempt == 1:
+                            write_diagnostic(
+                                "llm_retry",
+                                provider_id=self.config.provider_id,
+                                model=self.config.model,
+                                elapsed_ms=int((time.monotonic() - started) * 1000),
+                                error_type=error_type,
+                                message=str(exc),
+                                raw_preview=content[:180],
+                                reasoning_preview=reasoning_preview,
+                                finish_reason=finish_reason,
+                            )
+                            attempt_messages = _json_retry_messages(prepared_messages, content, finish_reason)
+                            body["max_tokens"] = retry_max_tokens
+                            continue
+                        write_diagnostic(
+                            "llm_error",
+                            provider_id=self.config.provider_id,
+                            model=self.config.model,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error_type=error_type,
+                            message=str(exc),
+                            raw_preview=content[:180],
+                            reasoning_preview=reasoning_preview,
+                            finish_reason=finish_reason,
+                        )
+                        span.add(raw_response=response_payload, raw_content=content, attempts=attempts)
+                        raise ProviderError(f"LLM did not return valid JSON: {error_preview}") from exc
+                    span.add(
+                        response=parsed,
+                        raw_response=response_payload,
+                        raw_content=content,
+                        finish_reason=finish_reason,
+                        keys=list(parsed.keys()),
+                        attempts=attempts,
+                        requested_max_tokens=max_tokens,
+                        effective_max_tokens=effective_max_tokens,
+                        retry_max_tokens=retry_max_tokens,
                     )
-                    response.raise_for_status()
-                except Exception as exc:
                     write_diagnostic(
-                        "llm_error",
+                        "llm_ok",
                         provider_id=self.config.provider_id,
                         model=self.config.model,
                         elapsed_ms=int((time.monotonic() - started) * 1000),
-                        error_type=type(exc).__name__,
-                        message=str(exc),
+                        keys=list(parsed.keys()),
+                        finish_reason=finish_reason,
+                        raw_preview=str(content)[:120],
                     )
-                    raise
-            response_payload = response.json()
-            choice = response_payload["choices"][0]
-            message_payload = choice.get("message") or {}
-            content = str(message_payload.get("content") or "")
-            reasoning_preview = str(message_payload.get("reasoning_content") or "")[:180]
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError as exc:
-                error_preview = content[:180]
-                if not error_preview and reasoning_preview:
-                    error_preview = f"<empty content>; finish_reason={choice.get('finish_reason', '')}; reasoning_preview={reasoning_preview}"
-                write_diagnostic(
-                    "llm_error",
-                    provider_id=self.config.provider_id,
-                    model=self.config.model,
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
-                    error_type="json_decode",
-                    message=str(exc),
-                    raw_preview=content[:180],
-                    reasoning_preview=reasoning_preview,
-                    finish_reason=choice.get("finish_reason", ""),
-                )
-                span.add(raw_response=response_payload, raw_content=content)
-                raise ProviderError(f"LLM did not return valid JSON: {error_preview}") from exc
-            span.add(
-                response=parsed,
-                raw_response=response_payload,
-                raw_content=content,
-                finish_reason=choice.get("finish_reason", ""),
-                keys=list(parsed.keys()) if isinstance(parsed, dict) else [],
-            )
-            write_diagnostic(
-                "llm_ok",
-                provider_id=self.config.provider_id,
-                model=self.config.model,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
-                keys=list(parsed.keys()) if isinstance(parsed, dict) else [],
-                finish_reason=choice.get("finish_reason", ""),
-                raw_preview=str(content)[:120],
-            )
-        return parsed
+                    return parsed
+        raise ProviderError("LLM did not return valid JSON")
 
     def chat_text(
         self,

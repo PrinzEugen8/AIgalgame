@@ -131,6 +131,24 @@ def has_fresh_opening_cache(
     ) is not None
 
 
+def has_fresh_proactive_opening_cache(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str,
+    local_time: datetime | None = None,
+) -> bool:
+    now_utc = _now(local_time)
+    for cache in session.execute(_fresh_cache_query(session, user_id, character_id, now_utc)).scalars():
+        if not _is_cache_fresh(cache, now_utc):
+            cache.status = "expired"
+            cache.updated_at = utc_now()
+            continue
+        if cache.kind == "proactive":
+            return True
+    return False
+
+
 def _store_opening_cache(
     session: Session,
     *,

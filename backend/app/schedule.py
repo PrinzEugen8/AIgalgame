@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .calendar_events import ensure_calendar_proactive_candidates
 from .diagnostics import diagnostic_span, write_diagnostic
 from .models import Character, Experience, Memory, Moment, MomentInteraction, ScheduleSlot
 from .proactive import create_schedule_proactive_event
@@ -196,6 +197,7 @@ def _npc_name(value: object, index: int) -> str:
 def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str, day: datetime) -> dict[str, int]:
     weather_snapshot = refresh_weather_snapshot(session, user_id=user_id, local_time=day, force=False)
     weather_event = ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=day) if weather_snapshot is not None else None
+    calendar_events = ensure_calendar_proactive_candidates(session, user_id=user_id, character_id=character_id, local_time=day)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     slots = session.execute(
         select(ScheduleSlot).where(
@@ -315,6 +317,7 @@ def _run_daily_cycle_inner(session: Session, *, user_id: str, character_id: str,
         "moments": created_moments,
         "proactive_events": created_proactive_events,
         "weather_events": 1 if weather_event is not None and weather_event.source_type == "weather" else 0,
+        "calendar_events": calendar_events,
         "skipped_moments": skipped_moments,
     }
 

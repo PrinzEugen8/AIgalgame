@@ -65,6 +65,36 @@ class Live2DConfigTest {
         }
         assertTrue(stageKt.contains("OfficialLive2DView"))
         assertTrue(stageKt.contains("CharacterStandee("))
+        assertTrue(File("src/main/java/com/aigalgame/demo/live2d/PersistentLive2DEngine.java").exists())
+    }
+
+    @Test
+    fun live2DHostStaysPersistentAcrossUiState() {
+        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
+        val mainKt = File("src/main/java/com/aigalgame/demo/MainActivity.kt").readText()
+        val viewJava = File("src/main/java/com/aigalgame/demo/live2d/OfficialLive2DView.java").readText()
+        val engineJava = File("src/main/java/com/aigalgame/demo/live2d/PersistentLive2DEngine.java").readText()
+
+        assertTrue(mainKt.contains("Live2DBootLoadingScreen"))
+        assertTrue(mainKt.contains("!vm.live2dBootReady || stageOnPrimaryScreens"))
+        assertTrue(mainKt.contains("modifier = Modifier\r\n                        .fillMaxSize()\r\n                        .zIndex(1f)") ||
+            mainKt.contains("modifier = Modifier\n                        .fillMaxSize()\n                        .zIndex(1f)"))
+        assertTrue(mainKt.contains("PlacementEditInputOverlay"))
+        assertTrue(mainKt.contains("editable = false"))
+        assertTrue(mainKt.contains("showEditBar = false"))
+        assertFalse(mainKt.contains("padding(start = 16.dp, top = 88.dp, end = 16.dp)"))
+        assertFalse(mainKt.contains("Color(0x22FFFFFF)"))
+        assertTrue(stageKt.contains("showCharacter"))
+        assertTrue(stageKt.contains("live2DVisible"))
+        assertTrue(stageKt.contains("clearStageListener()"))
+        assertFalse(stageKt.contains("releaseRenderer()"))
+        assertTrue(viewJava.contains("PersistentLive2DEngine.getInstance"))
+        assertTrue(viewJava.contains("engine.pauseFrames()"))
+        assertTrue(viewJava.contains("return false;"))
+        assertFalse(viewJava.contains("stopRenderThread"))
+        assertTrue(engineJava.contains("void pauseFrames()"))
+        assertTrue(engineJava.contains("void resumeFrames()"))
+        assertTrue(engineJava.contains("void detachSurface"))
     }
 
     @Test

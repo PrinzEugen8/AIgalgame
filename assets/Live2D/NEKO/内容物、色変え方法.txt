@@ -1,0 +1,143 @@
+
+
+
+──────　テクスチャ・内容物　──────
+
+
+
+nekoファイル　　　　　　　　　 　...　　ソフトにいれるモデルデータです。
+neko テクスチャファイル　　　　  ...　　色変え用のテクスチャが入ったフォルダです。
+変更方法＿How to change	　　　　 ...　　色変えやカスタム方法のPDFです。
+内容物、色変え方法 　　　　　　　...　　この.txtです。
+
+texture_00...肌など
+texture_01...表の髪色
+texture_05...裏の髪色
+texture_02...右目の瞳
+texture_04...左目の瞳
+texture_03...服色
+
+
+
+※テクスチャやモデルの名前を変更しないでください。エラーの原因になります。
+
+
+──────　色変え方法　──────
+
+
+
+
+１．テクスチャデータ［neko テクスチャ］から変更したい部位フォルダを選択し最下層にあるtextureファイルをコピーします。
+２．そのままモデルデータ［neko］内の［neko.4096］にペーストし、上書きを行います。
+３．Vtubestudioや使用ソフト内でモデルを起動しモデルのリロードを行ってください。（Vtubestudioの場合初期キーF1を押すとテクスチャ更新ができます）
+４.色が変わっていたら成功です。
+
+※フォルダではなくtextureファイルをコピーする様にしてください。
+
+
+
+──────　髪の長さやハイライト等の差分変更（Vtubestudio限定）　──────
+
+
+
+
+１．Vtubestudioを起動します。
+２.設定⚙から画面左上の４つ並んだアイコンから一番右を選択します。
+３.画面右側にある［表情ファイルエディター］を選択し、［新規表情ファイル作成］を選択します。
+４.表示された上部にある［髪長さ　サイド］［髪長さ　前髪］［髪長さ　後ろ］［耳しっぽなし］［頭リボンなし］［瞳孔白］［ちょろ毛なし］［ハイライトなし］［鈴なし］［チョーカーなし］［ヘアピンなし］のパラメータを調整し表情ファイル名をわかりやすいようにつけセーブしてください。
+５.2⃣の画面から下にスクロールしプラス＋ボタンを押します。
+６.アクションタイプを表情を切り替える(exp3)に
+　 表情を先程セーブした表情ファイルに
+　 キーコンビネーションは自由に設定してください。
+７.キーコンビネーションで設定したキーを押し④で変更したとおりに見た目が変われば成功です。
+
+
+
+※VtubestudioでなくてもLive2DViewerを用いれば変更が可能なケースがあります。
+
+
+──────　Tシャツの文字変更　──────
+
+
+１.変更したい服のtextureファイルを画像加工ソフトなどで読み込みます。（透過png保存ができるもの）
+２.texture内の枠内に好きな文字やイラスト、写真などを入れて元のデータとキャンバスサイズ、名前、テクスチャの位置が変わらないように上書き保存してください。
+３.Vtubestudio内で確認しTシャツがかわっていたら成功です。あとは微調整してお使いください。
+
+
+※自分で書いたものや許可を取ったものに限ります。権利関係のトラブルが起きた場合自己責任となります。
+
+
+
+
+
+
+
+────── Textures and Contents ──────
+
+
+
+neko file ...　　Model data to be included in the software.
+neko texture file ...　　Folder containing textures for color change.
+How to change ...　　PDF file of how to change colors and customize the model.
+Contents, how to change color ...　　This .txt.
+
+texture_00... Skin, etc.
+texture_01... Table hair color
+texture_05... Back hair color
+texture_02... Right eye
+texture_04... Left eye
+texture_03... Clothing color
+
+
+
+Do not change the names of the textures or models. It will cause errors.
+
+
+────── How to change colors ──────
+
+
+
+
+1) Select the folder of the part you want to change from the texture data [neko texture] and copy the texture file at the bottom of the folder. 2) Go into the model data [neko.40] and copy the texture file.
+Paste the file into [neko.4096] in the [neko] model data and overwrite it. 3.
+3. Start the model in Vtubestudio or the software used and reload the model. (In Vtubestudio, you can update the texture by pressing the initial F1 key.)
+4. If the colors have changed, you have succeeded.
+
+Make sure to copy the texture file, not the folder.
+
+
+
+────── Differential changes such as hair length, highlights, etc. (Vtubestudio only) ──────
+
+
+
+
+1. Start Vtubestudio. 2.
+2. From Settings⚙, select the rightmost of the four icons in the upper left corner of the screen.
+3. Select [Expression File Editor] on the right side of the screen, then select [Create New Expression File].
+4. Adjust the parameters at the top of the screen: [Hair Length Side], [Hair Length Front], [Hair Length Back], [No Ear Tail], [No Head Ribbon], [White Pupils], [No Choppy Hair], [No Highlights], [No Bell], [No Choker], [No Hair Pin], and save the expression file with a name that is easy to recognize. Save the file with a clear file name.
+5. Scroll down from the screen  2⃣ and press the plus + button.
+6. Set the Action Type to Switch Expression (exp3).
+　 Set the expression to the expression file you just saved.
+　 Set the key combination as you wish.
+7. Press the key set in the key combination, and if the appearance changes as described in step (4), you have succeeded.
+
+
+
+In some cases, Live2DViewer can be used without Vtubestudio.
+
+
+────── Changing the text on the T-shirt ──────
+
+
+1. Load the texture file of the garment you want to change into an image processing software. (If you can save the file as a transparent png file)
+2. Insert your favorite text, illustration, photo, etc. into the frame of the texture and save the file over the original data so that the canvas size, name, and texture position remain the same.
+Check the T-shirt in Vtubestudio and if the T-shirt has been changed, you have succeeded. If the T-shirt has changed, you have succeeded.
+
+
+Only the T-shirts written by you or with your permission can be used. You will be responsible for any rights-related problems that may arise.
+
+
+
+
+※We use DeepL translation.

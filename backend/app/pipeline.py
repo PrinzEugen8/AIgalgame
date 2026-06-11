@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .commitments import extract_user_commitment
 from .diagnostics import current_span_id, current_trace_id, diagnostic_point, diagnostic_span, new_span_id, write_diagnostic
 from .models import (
     Character,
@@ -1172,6 +1173,9 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             select(MomentInteraction).where(MomentInteraction.actor_id == event.user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
         ).scalars():
             interaction.reflected_in_chat = True
+        commitment = extract_user_commitment(session, event=event, text=text, local_time=_extract_local_time(event))
+        if commitment is not None:
+            saved_memory_count += 1
     _end_reply_stage(
         side_effects_stage,
         output={"saved_memory_count": saved_memory_count, "relation_delta": delta.model_dump()},

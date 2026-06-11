@@ -120,6 +120,9 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import com.aigalgame.demo.live2d.Live2DBootState
+import com.aigalgame.demo.live2d.OfficialLive2DRendererStatus
+import com.aigalgame.demo.live2d.PersistentLive2DEngine
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -228,6 +231,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var live2dReactionLine by mutableStateOf<DialogueLine?>(null)
         private set
+    var live2dBootStatus by mutableStateOf(OfficialLive2DRendererStatus.initial())
+        private set
     var outfitPlacements by mutableStateOf(defaultOutfitPlacements())
     var placementDraft by mutableStateOf<OutfitPlacement?>(null)
         private set
@@ -278,6 +283,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun currentLine(): DialogueLine? = lines.getOrNull(currentLineIndex)
     fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
+
+    val live2dBootReady: Boolean
+        get() = live2dBootStatus.bootState == Live2DBootState.Ready &&
+            live2dBootStatus.modelLoaded &&
+            live2dBootStatus.drawableCount > 0
+
+    fun updateLive2DBootStatus(status: OfficialLive2DRendererStatus) {
+        live2dBootStatus = status
+    }
+
+    fun retryLive2DBoot() {
+        live2dBootStatus = OfficialLive2DRendererStatus.initial()
+        PersistentLive2DEngine.getInstance(getApplication()).releaseForProcessExit()
+    }
 
     fun recordUserActivity() {
         lastUserActivityAt = System.currentTimeMillis()
@@ -902,69 +921,103 @@ fun AiGalgameApp(vm: MainViewModel) {
         if (vm.baseUrl.isBlank()) {
             ConnectionScreen(vm)
         } else {
-            Scaffold(bottomBar = { AppBottomBar(vm) }) { padding ->
-                Box(Modifier.padding(padding)) {
-                    val sharedStageActive = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
-                    val sharedLine = vm.live2dReactionLine ?: vm.currentLine() ?: vm.lines.lastOrNull()
-                    if (vm.screen == AppScreen.DressUp) {
+            Box(Modifier.fillMaxSize()) {
+                val sharedLine = vm.live2dReactionLine ?: vm.currentLine() ?: vm.lines.lastOrNull()
+                val stageOnPrimaryScreens = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
+                val stageShowsCharacter = !vm.live2dBootReady || stageOnPrimaryScreens
+                if (vm.live2dBootReady && vm.screen == AppScreen.DressUp) {
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFFFFF7F4))
+                            .zIndex(0f)
+                    )
+                }
+                Live2DStage(
+                    background = vm.selectedBackground,
+                    character = vm.selectedCharacter,
+                    emotion = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.emotion ?: "calm",
+                    pose = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.pose ?: "idle",
+                    placement = if (vm.screen == AppScreen.DressUp) vm.currentPlacement() else vm.visiblePlacement(),
+                    speechState = vm.live2dSpeechState,
+                    line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
+                    editable = false,
+                    onPlacementChange = { vm.updatePlacementDraft(it) },
+                    onReaction = { vm.applyLive2DReaction(it) },
+                    relation = vm.relation,
+                    stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
+                    showCharacter = stageShowsCharacter,
+                    live2DVisible = vm.selectedCharacter == "neko" && stageShowsCharacter,
+                    onRendererStatus = { vm.updateLive2DBootStatus(it) },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(1f)
+                )
+                if (!vm.live2dBootReady) {
+                    Live2DBootLoadingScreen(
+                        status = vm.live2dBootStatus,
+                        onRetry = { vm.retryLive2DBoot() },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(20f)
+                    )
+                } else {
+                    Scaffold(
+                        containerColor = Color.Transparent,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(2f),
+                        bottomBar = { AppBottomBar(vm) }
+                    ) { padding ->
                         Box(
                             Modifier
                                 .fillMaxSize()
-                                .background(Color(0xFFFFF7F4))
-                                .zIndex(0f)
-                        )
-                    }
-                    if (sharedStageActive) {
-                        Live2DStage(
-                            background = vm.selectedBackground,
-                            character = vm.selectedCharacter,
-                            emotion = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.emotion ?: "calm",
-                            pose = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.pose ?: "idle",
-                            placement = if (vm.screen == AppScreen.DressUp) vm.currentPlacement() else vm.visiblePlacement(),
-                            speechState = vm.live2dSpeechState,
-                            line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
-                            editable = vm.screen == AppScreen.Home && vm.standeeEditMode,
-                            onPlacementChange = { vm.updatePlacementDraft(it) },
-                            onReaction = { vm.applyLive2DReaction(it) },
-                            relation = vm.relation,
-                            stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
-                            modifier = if (vm.screen == AppScreen.DressUp) {
-                                Modifier
-                                    .align(Alignment.TopCenter)
-                                    .padding(start = 16.dp, top = 88.dp, end = 16.dp)
-                                    .fillMaxWidth()
-                                    .height(220.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .zIndex(1f)
-                            } else {
-                                Modifier
-                                    .fillMaxSize()
-                                    .zIndex(0f)
-                            }
-                        )
-                    }
-                    when (vm.screen) {
-                        AppScreen.Home -> HomeScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
-                        AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
-                        AppScreen.Settings -> SettingsScreen(vm)
-                        AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
-                        AppScreen.Moments -> MomentsScreen(vm)
-                        AppScreen.Calendar -> CalendarScreen(vm)
-                        AppScreen.Journal -> JournalScreen(vm)
-                    }
-                    if (vm.errorMessage.isNotBlank()) {
-                        Card(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .padding(12.dp)
-                                .zIndex(10f),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFECEF))
+                                .padding(padding)
                         ) {
-                            Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
+                            when (vm.screen) {
+                                AppScreen.Home -> HomeScreen(vm, showStage = false, showEditBar = false, modifier = Modifier.zIndex(2f))
+                                AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
+                                AppScreen.Settings -> SettingsScreen(vm)
+                                AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
+                                AppScreen.Moments -> MomentsScreen(vm)
+                                AppScreen.Calendar -> CalendarScreen(vm)
+                                AppScreen.Journal -> JournalScreen(vm)
+                            }
+                            if (vm.errorMessage.isNotBlank()) {
+                                Card(
+                                    modifier = Modifier
+                                        .align(Alignment.TopCenter)
+                                        .padding(12.dp)
+                                        .zIndex(10f),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFECEF))
+                                ) {
+                                    Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
+                                }
+                            }
+                            if (vm.isBusy) {
+                                LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
+                            }
                         }
                     }
-                    if (vm.isBusy) {
-                        LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
+                    if (vm.screen == AppScreen.Home && vm.standeeEditMode) {
+                        PlacementEditInputOverlay(
+                            placement = vm.visiblePlacement(),
+                            onPlacementChange = { vm.updatePlacementDraft(it) },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .zIndex(8f)
+                        )
+                    }
+                    if (vm.screen == AppScreen.Home) {
+                        HomeStandeeEditBar(
+                            editing = vm.standeeEditMode,
+                            onToggle = { vm.togglePlacementEdit() },
+                            onReset = { vm.resetPlacement() },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 104.dp, end = 18.dp)
+                                .zIndex(9f)
+                        )
                     }
                 }
             }
@@ -1061,6 +1114,46 @@ fun ConnectionScreen(vm: MainViewModel) {
 }
 
 @Composable
+fun Live2DBootLoadingScreen(
+    status: OfficialLive2DRendererStatus,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier
+            .background(Brush.verticalGradient(listOf(Color(0xFFFFF7F4), Color(0xFFDDF2FF))))
+            .clickable(enabled = true, onClick = {}),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 34.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text("Live2D 加载中", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text(
+                text = "状态：${status.bootState} / ${status.phase} / ${status.loadElapsedMs}ms",
+                color = Color(0xFF79545B),
+                textAlign = TextAlign.Center
+            )
+            if (status.bootState == Live2DBootState.Failed || status.lastError.isNotBlank()) {
+                Text(
+                    text = status.lastError.ifBlank { "Live2D 初始化失败" },
+                    color = Color(0xFF9A2E42),
+                    textAlign = TextAlign.Center
+                )
+                Button(onClick = onRetry) {
+                    Text("重试")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun AppBottomBar(vm: MainViewModel) {
     NavigationBar(containerColor = Color(0xF8FFFFFF), tonalElevation = 10.dp) {
         val items = listOf(
@@ -1091,6 +1184,7 @@ fun AppBottomBar(vm: MainViewModel) {
 fun HomeScreen(
     vm: MainViewModel,
     showStage: Boolean = true,
+    showEditBar: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     var input by remember { mutableStateOf("") }
@@ -1132,14 +1226,16 @@ fun HomeScreen(
                 .align(Alignment.TopCenter)
                 .padding(horizontal = 18.dp, vertical = 18.dp)
         )
-        HomeStandeeEditBar(
-            editing = vm.standeeEditMode,
-            onToggle = { vm.togglePlacementEdit() },
-            onReset = { vm.resetPlacement() },
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 104.dp, end = 18.dp)
-        )
+        if (showEditBar) {
+            HomeStandeeEditBar(
+                editing = vm.standeeEditMode,
+                onToggle = { vm.togglePlacementEdit() },
+                onReset = { vm.resetPlacement() },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 104.dp, end = 18.dp)
+            )
+        }
 
         HomeInteractionPanel(
             vm = vm,
@@ -1170,6 +1266,37 @@ fun HomeScreen(
             )
         }
     }
+}
+
+@Composable
+fun PlacementEditInputOverlay(
+    placement: OutfitPlacement,
+    onPlacementChange: (OutfitPlacement) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val density = LocalDensity.current
+    var gesturePlacement by remember { mutableStateOf(placement.coerceForStage()) }
+    LaunchedEffect(placement) {
+        gesturePlacement = placement.coerceForStage()
+    }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        val dx = with(density) { panChange.x.toDp().value }
+        val dy = with(density) { panChange.y.toDp().value }
+        val next = gesturePlacement.copy(
+            scale = gesturePlacement.scale * zoomChange,
+            offsetX = gesturePlacement.offsetX + dx,
+            offsetY = gesturePlacement.offsetY + dy
+        ).coerceForStage()
+        gesturePlacement = next
+        onPlacementChange(next)
+    }
+    Box(
+        modifier.transformable(
+            state = transformState,
+            lockRotationOnZoomPan = true,
+            enabled = true
+        )
+    )
 }
 
 @Composable
@@ -1667,10 +1794,6 @@ fun DressUpScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Column {
-            Text("装扮", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
-            Text("切换立绘、表情和场景预览。", color = Color(0xFF79545B))
-        }
         if (showStage) {
             Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBFA))) {
                 Live2DStage(
@@ -1688,52 +1811,72 @@ fun DressUpScreen(
                 )
             }
         } else {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(220.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0x22FFFFFF))
-            )
+            Spacer(Modifier.fillMaxWidth().height(220.dp))
         }
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(bottom = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            color = Color(0xFFFFFBFA),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, Color(0xFFEAD7D0)),
+            shadowElevation = 2.dp
         ) {
-            item {
-                Text("角色", fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SelectablePill("NEKO Live2D", vm.selectedCharacter == "neko") { vm.chooseCharacter("neko") }
-                    SelectablePill("小樱 静态", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
-                    SelectablePill("美月 静态", vm.selectedCharacter == "murasame") { vm.chooseCharacter("murasame") }
-                }
-            }
-            item {
-                Text("表情", fontWeight = FontWeight.Bold)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        "calm" to "平静",
-                        "happy" to "开心",
-                        "thinking" to "思考",
-                        "shy" to "害羞"
-                    ).forEach { (value, label) ->
-                        SelectablePill(label, vm.previewEmotion == value) { vm.choosePreviewEmotion(value) }
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                contentPadding = PaddingValues(bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                item {
+                    Column {
+                        Text("装扮", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
+                        Text("切换立绘、表情和场景预览。", color = Color(0xFF79545B))
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("sad" to "低落", "angry" to "生气", "sleep" to "休息").forEach { (value, label) ->
-                        SelectablePill(label, vm.previewEmotion == value) { vm.choosePreviewEmotion(value) }
+                item {
+                    Text("角色", fontWeight = FontWeight.Bold)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SelectablePill("NEKO Live2D", vm.selectedCharacter == "neko") { vm.chooseCharacter("neko") }
+                        SelectablePill("小樱 静态", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SelectablePill("美月 静态", vm.selectedCharacter == "murasame") { vm.chooseCharacter("murasame") }
                     }
                 }
-            }
-            item {
-                Text("场景", fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SelectablePill("教室", vm.selectedBackground == "classroom") { vm.chooseBackground("classroom") }
-                    SelectablePill("樱花街", vm.selectedBackground == "street") { vm.chooseBackground("street") }
-                    SelectablePill("房间", vm.selectedBackground == "room") { vm.chooseBackground("room") }
+                item {
+                    Text("表情", fontWeight = FontWeight.Bold)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(
+                            "calm" to "平静",
+                            "happy" to "开心",
+                            "thinking" to "思考"
+                        ).forEach { (value, label) ->
+                            SelectablePill(label, vm.previewEmotion == value) { vm.choosePreviewEmotion(value) }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("shy" to "害羞", "sad" to "低落", "angry" to "生气").forEach { (value, label) ->
+                            SelectablePill(label, vm.previewEmotion == value) { vm.choosePreviewEmotion(value) }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("sleep" to "休息").forEach { (value, label) ->
+                            SelectablePill(label, vm.previewEmotion == value) { vm.choosePreviewEmotion(value) }
+                        }
+                    }
+                }
+                item {
+                    Text("场景", fontWeight = FontWeight.Bold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SelectablePill("教室", vm.selectedBackground == "classroom") { vm.chooseBackground("classroom") }
+                        SelectablePill("樱花街", vm.selectedBackground == "street") { vm.chooseBackground("street") }
+                        SelectablePill("房间", vm.selectedBackground == "room") { vm.chooseBackground("room") }
+                    }
                 }
             }
         }

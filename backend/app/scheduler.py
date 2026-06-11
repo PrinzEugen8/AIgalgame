@@ -13,9 +13,11 @@ from .diagnostics import write_diagnostic
 from .models import User
 from .news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot
 from .online import is_online
-from .opening import has_fresh_opening_cache, prepare_due_openings
+from .opening import has_fresh_proactive_opening_cache, prepare_due_openings
+from .push import send_selected_background_push
 from .schedule import run_daily_cycle
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
+from .utils import load_json
 
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,9 @@ def _prewarm_once(session: Session, *, user_ids: set[str] | None = None) -> dict
         "skipped_online": 0,
         "skipped_cache": 0,
         "skipped_no_event": 0,
+        "push_sent": 0,
+        "push_failed": 0,
+        "push_skipped": 0,
     }
     write_diagnostic(
         "proactive_prewarm_scheduler_started",
@@ -161,14 +166,14 @@ def _prewarm_once(session: Session, *, user_ids: set[str] | None = None) -> dict
                 reason="user_online",
             )
             continue
-        if has_fresh_opening_cache(session, user_id=user.user_id, character_id=DEFAULT_CHARACTER_ID):
+        if has_fresh_proactive_opening_cache(session, user_id=user.user_id, character_id=DEFAULT_CHARACTER_ID):
             result["skipped_cache"] = int(result["skipped_cache"]) + 1
             write_diagnostic(
                 "proactive_prewarm_skipped",
                 feature="开场预热",
                 stage="_prewarm_job",
                 user_id=user.user_id,
-                reason="fresh_opening_cache",
+                reason="fresh_proactive_cache",
             )
             continue
         try:
@@ -196,5 +201,23 @@ def _prewarm_once(session: Session, *, user_ids: set[str] | None = None) -> dict
         result["prepared"] = int(result["prepared"]) + prepared_count
         result["failed"] = int(result["failed"]) + failed_count
         result["skipped_no_event"] = int(result["skipped_no_event"]) + skipped_count
+        judgement = load_json(user.proactive_judgement_json, {})
+        selected_event_id = str(judgement.get("selected_event_id") or "") if isinstance(judgement, dict) else ""
+        if prepared_count and selected_event_id:
+            try:
+                push_result = send_selected_background_push(session, selected_event_id)
+                result["push_sent"] = int(result["push_sent"]) + int(push_result.get("sent") or 0)
+                result["push_failed"] = int(result["push_failed"]) + int(push_result.get("failed") or 0)
+                result["push_skipped"] = int(result["push_skipped"]) + int(push_result.get("skipped") or 0)
+            except Exception as exc:  # noqa: BLE001
+                result["push_failed"] = int(result["push_failed"]) + 1
+                write_diagnostic(
+                    "proactive_push_failed",
+                    feature="开场预热",
+                    stage="_prewarm_job",
+                    user_id=user.user_id,
+                    proactive_event_id=selected_event_id,
+                    message=str(exc),
+                )
     write_diagnostic("proactive_prewarm_scheduler_finished", feature="开场预热", stage="_prewarm_job", **result)
     return result

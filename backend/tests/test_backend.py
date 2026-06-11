@@ -21,13 +21,14 @@ from app.config import secret_store  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.diagnostics import diagnostic_path, diagnostic_span, runtime_logs, write_diagnostic  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TrendRadarSnapshot, TtsVoiceProfile, User, UserLocation, WeatherSnapshot  # noqa: E402
+from app.models import CalendarEvent, Character, DeviceRegistration, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveDeliveryAttempt, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TrendRadarSnapshot, TtsVoiceProfile, User, UserCommitment, UserLocation, WeatherSnapshot  # noqa: E402
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
 from app.proactive import consume_proactive_event, create_proactive_event, ensure_news_candidate, pending_proactive_response  # noqa: E402
 from app.providers import ImageProvider, ProviderError, VolcArkWebSearchClient, VolcSeedTtsClient, get_enabled_provider, get_task_llm_provider, provider_presets, upsert_provider  # noqa: E402
+from app.push import register_device, send_proactive_push  # noqa: E402
 from app.schedule import ensure_schedule, mark_interruption, run_daily_cycle  # noqa: E402
 from app.schemas import EventIn, ProviderConfigIn  # noqa: E402
 from app.seed import ensure_seed  # noqa: E402
@@ -202,7 +203,7 @@ def test_prewarm_once_skips_online_and_fresh_cache() -> None:
                 cache_id=f"opening_cache_{suffix}",
                 user_id=cache_user_id,
                 character_id="sakura",
-                kind="greeting",
+                kind="proactive",
                 payload_json=dump_json({"lines": [], "relation_delta": {}}),
                 status="ready",
                 expires_at="2099-01-01T00:00:00+00:00",
@@ -220,6 +221,96 @@ def test_prewarm_once_skips_online_and_fresh_cache() -> None:
         assert cache_result["checked"] == 1
         assert cache_result["skipped_cache"] == 1
     clear_online_state()
+
+
+def test_prewarm_once_does_not_skip_judge_for_greeting_cache() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"prewarm_greeting_cache_{suffix}"
+    event_id = ""
+    judge_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal judge_calls
+        body = json.loads(request.content.decode())
+        if "Context JSON:" in body["messages"][1]["content"]:
+            judge_calls += 1
+            return _llm_json_response(
+                {
+                    "should_send": True,
+                    "selected_event_id": event_id,
+                    "reason": "普通开场缓存不能阻止主动消息判断。",
+                    "next_check_after_minutes": 60,
+                }
+            )
+        return _llm_json_response(
+            {
+                "reply_mode": "normal",
+                "lines": [{"text": "这条主动消息已经提前准备好了。", "emotion": "happy", "pose": "happy"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        clear_online_state()
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_prewarm_greeting_cache_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.tts_enabled = False
+            session.add(
+                OpeningCache(
+                    cache_id=f"greeting_cache_{suffix}",
+                    user_id=user_id,
+                    character_id="sakura",
+                    kind="greeting",
+                    payload_json=dump_json({"lines": [], "relation_delta": {}}),
+                    status="ready",
+                    expires_at="2099-01-01T00:00:00+00:00",
+                )
+            )
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"prewarm_greeting_memory_{suffix}",
+                title="小樱有话想说",
+                text="主动想告诉用户：普通开场缓存不应该挡住这个候选。",
+                priority=90,
+                scheduled_at=datetime.fromisoformat("2026-06-09T11:50:00+08:00"),
+            )
+            assert event is not None
+            event_id = event.proactive_event_id
+            session.commit()
+
+            result = scheduler_module._prewarm_once(session, user_ids={user_id})
+            assert result["checked"] == 1
+            assert result["skipped_cache"] == 0
+            assert result["prepared"] == 1
+            assert judge_calls == 1
+            session.refresh(event)
+            assert event.prepared_at
+    finally:
+        providers.HTTP_TRANSPORT = None
+        clear_online_state()
 
 
 def test_prewarm_once_offline_without_cache_runs_weather_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,6 +385,92 @@ def test_llm_diagnostic_records_request_and_response() -> None:
     assert llm_span["details"]["start"]["references"]["weather"]["used"] is True
     assert "天气" in llm_span["references_summary"]
     assert llm_span["details"]["end"]["response"]["reply"] == "recorded"
+
+
+def test_llm_json_request_enforces_deepseek_json_output_contract() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        bodies.append(body)
+        content = json.dumps({"ok": True}, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_deepseek_json_contract",
+                    kind="llm_task",
+                    provider="deepseek",
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-chat",
+                    secrets={"api_key": "deepseek-key"},
+                    metadata={"extra_body": {"response_format": {"type": "text"}, "max_tokens": 1, "top_p": 0.5}},
+                ),
+            )
+            result = providers.OpenAICompatibleClient(config).chat_json(
+                [{"role": "system", "content": "be concise"}, {"role": "user", "content": "return object"}],
+                max_tokens=80,
+            )
+            assert result["ok"] is True
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    body = bodies[0]
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["max_tokens"] >= 256
+    assert body["top_p"] == 0.5
+    assert body["messages"][1]["content"] == "return object"
+    system_prompt = body["messages"][0]["content"]
+    assert "json" in system_prompt.lower()
+    assert '{"ok": true}' in system_prompt
+
+
+def test_llm_json_retries_empty_content_from_json_output_mode() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(
+                200,
+                json={"choices": [{"finish_reason": "stop", "message": {"content": "", "reasoning_content": "thinking"}}]},
+            )
+        content = json.dumps({"ok": True, "reply": "retried"}, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_deepseek_json_empty_retry",
+                    kind="llm_task",
+                    provider="deepseek",
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-chat",
+                    secrets={"api_key": "deepseek-key"},
+                ),
+            )
+            result = providers.OpenAICompatibleClient(config).chat_json(
+                [{"role": "system", "content": "json only"}, {"role": "user", "content": "return json"}],
+                max_tokens=300,
+            )
+            assert result["reply"] == "retried"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    assert len(bodies) == 2
+    assert bodies[0]["response_format"] == {"type": "json_object"}
+    assert bodies[1]["max_tokens"] == 600
+    retry_prompt = bodies[1]["messages"][-1]["content"]
+    assert "previous response" in retry_prompt.lower()
+    assert "<empty content>" in retry_prompt
 
 
 def test_user_message_trace_records_reply_judgement() -> None:
@@ -1828,6 +2005,10 @@ def test_free_user_message_does_not_apply_relation_delta() -> None:
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
+            relation.affection = 85
+            relation.trust = 60
+            relation.dependency = 35
+            relation.mood = 12
             before = (relation.affection, relation.trust, relation.dependency, relation.mood)
             session.commit()
 
@@ -1887,6 +2068,10 @@ def test_option_selected_can_apply_relation_delta() -> None:
             ).scalar_one()
             user.story_completed = True
             user.tts_enabled = False
+            relation.affection = 85
+            relation.trust = 60
+            relation.dependency = 35
+            relation.mood = 12
             before = (relation.affection, relation.trust, relation.dependency, relation.mood)
             session.commit()
 
@@ -2578,7 +2763,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
         prompt = body["messages"][1]["content"]
-        context = json.loads(prompt.split("上下文 JSON：\n", 1)[1])
+        context = json.loads(prompt.split("Context JSON:", 1)[1])
         judge_contexts.append(context)
         return _llm_json_response(
             {
@@ -2607,6 +2792,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             user = session.get(User, user_id)
             user.story_completed = True
             user.notifications_enabled = True
+            user.proactive_daily_limit = "high"
             user.sleep_start = "00:30"
             user.sleep_end = "08:00"
             for index in range(3):
@@ -2784,12 +2970,79 @@ def test_proactive_next_check_skips_llm_until_due() -> None:
                 session,
                 user_id=user_id,
                 character_id="sakura",
-                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                local_time=datetime.fromisoformat("2026-06-09T12:06:00+08:00"),
                 generate_news=False,
                 generate_weather=False,
             )
             assert result["event"] is None
             assert calls == 0
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_error_next_check_retries_after_short_cooldown() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_error_retry_{suffix}"
+    selected_event_id = ""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _llm_json_response({"should_send": True, "selected_event_id": selected_event_id, "reason": "retry after error", "next_check_after_minutes": 10})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_error_retry_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_next_check_at = "2026-06-09T06:00:00+00:00"
+            user.proactive_judgement_json = dump_json(
+                {
+                    "status": "error",
+                    "reason": "previous model error",
+                    "decided_at": "2026-06-09T04:00:00+00:00",
+                    "next_check_at": user.proactive_next_check_at,
+                }
+            )
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_error_retry_{suffix}",
+                title="错误重试",
+                text="这条应该在短错误冷却后重新触发判断器。",
+                priority=90,
+                dedupe_key=f"pending_error_retry_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            assert event is not None
+            selected_event_id = event.proactive_event_id
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:06:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"]["proactive_event_id"] == selected_event_id
+            assert calls == 1
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -2908,7 +3161,7 @@ def test_proactive_judge_invalid_json_defaults_to_no_send() -> None:
             judgement = json.loads(user.proactive_judgement_json)
             assert judgement["status"] == "error"
             assert judgement["should_send"] is False
-            assert judgement["next_check_after_minutes"] == 30
+            assert judgement["next_check_after_minutes"] == 5
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -3087,6 +3340,412 @@ def test_proactive_consume_clears_widget_pending_event() -> None:
             providers.HTTP_TRANSPORT = None
 
 
+def test_proactive_daily_limit_blocks_new_judgement() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_daily_limit_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"daily limit should skip LLM: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_daily_limit = "low"
+            for index in range(2):
+                delivered = create_proactive_event(
+                    session,
+                    user_id=user_id,
+                    character_id="sakura",
+                    source_type="memory",
+                    source_id=f"delivered_limit_{suffix}_{index}",
+                    title="Delivered",
+                    text="Already delivered.",
+                    priority=50,
+                    dedupe_key=f"delivered_limit_{suffix}_{index}",
+                    scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+                )
+                delivered.status = "delivered"
+                delivered.delivered_at = f"2026-06-09T0{index}:00:00+00:00"
+            create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"pending_limit_{suffix}",
+                title="Pending",
+                text="Should wait because daily limit is reached.",
+                priority=95,
+                dedupe_key=f"pending_limit_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"] is None
+            session.refresh(user)
+            judgement = json.loads(user.proactive_judgement_json)
+            assert judgement["status"] == "limited"
+            assert judgement["should_send"] is False
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_unlimited_daily_limit_allows_judgement_after_stale_limited_state() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_unlimited_limit_{suffix}"
+    selected_event_id = ""
+    judge_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal judge_calls
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        assert "Context JSON:" in prompt
+        judge_calls += 1
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": selected_event_id,
+                "reason": "unlimited policy allows another proactive message.",
+                "next_check_after_minutes": 10,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_unlimited_limit_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_daily_limit = "unlimited"
+            user.proactive_next_check_at = "2026-06-09T06:00:00+00:00"
+            user.proactive_judgement_json = dump_json(
+                {
+                    "status": "limited",
+                    "reason": "daily limit reached: 4/2",
+                    "next_check_at": user.proactive_next_check_at,
+                }
+            )
+            for index in range(4):
+                delivered = create_proactive_event(
+                    session,
+                    user_id=user_id,
+                    character_id="sakura",
+                    source_type="memory",
+                    source_id=f"unlimited_delivered_{suffix}_{index}",
+                    title="Delivered",
+                    text="Already delivered.",
+                    priority=50,
+                    dedupe_key=f"unlimited_delivered_{suffix}_{index}",
+                    scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+                )
+                delivered.status = "delivered"
+                delivered.delivered_at = f"2026-06-09T0{index}:00:00+00:00"
+            pending = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"unlimited_pending_{suffix}",
+                title="Pending",
+                text="Should still be judged because policy is unlimited.",
+                priority=95,
+                dedupe_key=f"unlimited_pending_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            assert pending is not None
+            selected_event_id = pending.proactive_event_id
+            session.commit()
+
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"]["proactive_event_id"] == pending.proactive_event_id
+            assert judge_calls == 1
+            session.refresh(user)
+            judgement = json.loads(user.proactive_judgement_json)
+            assert judgement["status"] == "decided"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_foreground_check_prepares_and_consumes_dialogue() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"foreground_user_{suffix}"
+    selected_event_id = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        if "Context JSON:" in prompt:
+            return _llm_json_response({"should_send": True, "selected_event_id": selected_event_id, "reason": "idle foreground", "next_check_after_minutes": 10})
+        return _llm_json_response(
+            {
+                "reply_mode": "light",
+                "pace_reason": "foreground proactive",
+                "lines": [{"text": "差不多该提醒你啦。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_foreground_task_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-task",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_foreground_chat_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="appointment",
+                source_id=f"appointment_{suffix}",
+                title="Flight reminder",
+                text="Wake up for the flight.",
+                priority=95,
+                dedupe_key=f"appointment_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            selected_event_id = event.proactive_event_id
+            session.commit()
+        response = client.post(
+            "/api/proactive/foreground-check",
+            json={
+                "user_id": user_id,
+                "character_id": "sakura",
+                "device_id": f"device_{suffix}",
+                "screen": "home",
+                "idle_seconds": 45,
+                "input_active": False,
+                "local_time": "2026-06-09T12:00:00+08:00",
+            },
+        ).json()
+        assert response["event_type"] == "dialogue"
+        assert response["payload"]["proactive_event_id"] == selected_event_id
+        with SessionLocal() as session:
+            refreshed = session.get(ProactiveEvent, selected_event_id)
+            assert refreshed.status == "reflected"
+            attempt = session.execute(
+                select(ProactiveDeliveryAttempt).where(ProactiveDeliveryAttempt.proactive_event_id == selected_event_id)
+            ).scalar_one()
+            assert attempt.channel == "foreground"
+            assert attempt.status == "sent"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_fcm_push_sends_and_records_attempt() -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"fcm_user_{suffix}"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    service_account = {
+        "project_id": "test-project",
+        "client_email": "firebase-adminsdk@test-project.iam.gserviceaccount.com",
+        "private_key": private_pem,
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://oauth2.googleapis.com/token":
+            return httpx.Response(200, json={"access_token": "oauth-token"})
+        assert str(request.url) == "https://fcm.googleapis.com/v1/projects/test-project/messages:send"
+        assert request.headers.get("authorization") == "Bearer oauth-token"
+        body = json.loads(request.content.decode())
+        assert body["message"]["data"]["proactive_event_id"]
+        return httpx.Response(200, json={"name": "projects/test-project/messages/1"})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_fcm_{suffix}",
+                    kind="push",
+                    provider="fcm_http_v1",
+                    base_url="https://fcm.googleapis.com/v1",
+                    secrets={"service_account_json": json.dumps(service_account)},
+                ),
+            )
+            register_device(
+                session,
+                {
+                    "device_id": f"device_{suffix}",
+                    "user_id": user_id,
+                    "platform": "android",
+                    "push_token": "fcm-token",
+                    "notifications_enabled": True,
+                },
+            )
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="weather",
+                source_id=f"weather_{suffix}",
+                title="Rain tonight",
+                text="Remember to bring an umbrella.",
+                priority=88,
+                dedupe_key=f"weather_{suffix}",
+                scheduled_at=datetime.now(timezone.utc),
+            )
+            session.commit()
+            result = send_proactive_push(session, event)
+            assert result["sent"] == 1
+            refreshed = session.get(ProactiveEvent, event.proactive_event_id)
+            assert refreshed.status == "delivered"
+            attempt = session.execute(
+                select(ProactiveDeliveryAttempt).where(ProactiveDeliveryAttempt.proactive_event_id == event.proactive_event_id)
+            ).scalar_one()
+            assert attempt.status == "sent"
+            assert attempt.status_code == 200
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_user_message_extracts_appointment_commitment() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"commitment_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        if "Extract a future user commitment" in prompt:
+            return _llm_json_response(
+                {
+                    "has_commitment": True,
+                    "title": "赶飞机",
+                    "description": "明早 9 点要赶飞机，提前确认起床。",
+                    "event_at": "2026-06-10T09:00:00+08:00",
+                    "remind_at": "2026-06-10T08:00:00+08:00",
+                    "confidence": 0.92,
+                }
+            )
+        return _llm_json_response(
+            {
+                "reply_mode": "light",
+                "pace_reason": "remember commitment",
+                "lines": [{"text": "好，我会记得提醒你。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_commitment_chat_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_commitment_task_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-task",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="sakura",
+                    session_id=f"commitment_session_{suffix}",
+                    payload={"text": "我明天早上9点要赶飞机"},
+                    client_context={"local_time": "2026-06-09T20:00:00+08:00"},
+                ),
+            )
+            assert result.event_type == "dialogue"
+            commitment = session.execute(select(UserCommitment).where(UserCommitment.user_id == user_id)).scalar_one()
+            assert commitment.title == "赶飞机"
+            proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
+            assert proactive.source_type == "appointment"
+            assert proactive.scheduled_at == "2026-06-10T00:00:00+00:00"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_opening_prepare_and_ready_consumes_cached_greeting_with_tts() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"opening_greeting_user_{suffix}"
@@ -3174,7 +3833,7 @@ def test_prepare_due_openings_prewarms_proactive_cache() -> None:
         nonlocal llm_calls
         llm_calls += 1
         body = json.loads(request.content.decode())
-        if "上下文 JSON：" in body["messages"][1]["content"]:
+        if "Context JSON:" in body["messages"][1]["content"]:
             llm_calls -= 1
             return _llm_json_response(
                 {
@@ -3559,6 +4218,84 @@ def test_news_candidate_requires_verifiable_publish_time() -> None:
                 local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
             ) is None
             assert session.query(ProactiveEvent).filter(ProactiveEvent.user_id == "news_skip_user", ProactiveEvent.source_type == "news").count() == 0
+    finally:
+        providers.HTTP_TRANSPORT = None
+ 
+ 
+def test_admin_proactive_tools_generate_judge_and_schedule() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"admin_proactive_tools_{suffix}"
+    selected_event_id = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        assert "Context JSON:" in body["messages"][1]["content"]
+        return _llm_json_response(
+            {
+                "should_send": True,
+                "selected_event_id": selected_event_id,
+                "reason": "admin immediate judge selected the generated candidate.",
+                "next_check_after_minutes": 10,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_admin_proactive_tools_llm_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_daily_limit = "unlimited"
+            session.commit()
+
+        schedule = client.get("/api/admin/ai-schedule/today", params={"user_id": user_id, "character_id": "sakura"})
+        assert schedule.status_code == 200
+        assert schedule.json()["items"]
+
+        generated = client.post(
+            "/api/admin/proactive-events/generate",
+            json={
+                "user_id": user_id,
+                "character_id": "sakura",
+                "source_type": "schedule",
+                "manual_only": True,
+                "due_now": True,
+                "priority": 92,
+                "text": "后台测试：今天 AI 日程里有一件事想主动告诉用户。",
+            },
+        )
+        assert generated.status_code == 200
+        item = generated.json()["items"][0]
+        selected_event_id = item["proactive_event_id"]
+        assert item["source_type"] == "schedule"
+
+        judged = client.post(
+            "/api/admin/proactive-events/judge",
+            json={
+                "user_id": user_id,
+                "character_id": "sakura",
+                "ignore_next_check": True,
+                "generate_news": False,
+                "generate_weather": False,
+                "idle_seconds": 120,
+            },
+        )
+        assert judged.status_code == 200
+        payload = judged.json()
+        assert payload["pending"]["event"]["proactive_event_id"] == selected_event_id
+        assert payload["judgement"]["selected_event_id"] == selected_event_id
     finally:
         providers.HTTP_TRANSPORT = None
 

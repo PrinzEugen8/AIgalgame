@@ -95,6 +95,15 @@ tasks.register("verifyOfficialLive2DAssets") {
         if ("OfficialLive2DView" !in stageKt || "CharacterStandee(" !in stageKt) {
             throw GradleException("Live2DStage must use the official Android view and keep the static PNG fallback.")
         }
+        if ("Live2DBootLoadingScreen" !in layout.projectDirectory.file("src/main/java/com/aigalgame/demo/MainActivity.kt").asFile.readText()) {
+            throw GradleException("App startup must keep the Live2D boot loading screen.")
+        }
+        if ("PersistentLive2DEngine" !in layout.projectDirectory.file("src/main/java/com/aigalgame/demo/live2d/OfficialLive2DView.java").asFile.readText()) {
+            throw GradleException("OfficialLive2DView must attach to the persistent Live2D engine.")
+        }
+        if ("releaseRenderer()" in stageKt) {
+            throw GradleException("Live2DStage must not release the persistent renderer when Compose disposes.")
+        }
     }
 }
 

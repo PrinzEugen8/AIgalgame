@@ -58,33 +58,42 @@ fun Live2DStage(
     relation: RelationState = RelationState(),
     modifier: Modifier = Modifier,
     baseHeight: Dp = Live2DStageBaseHeight,
-    stageMode: String = "home"
+    stageMode: String = "home",
+    showCharacter: Boolean = true,
+    live2DVisible: Boolean = true,
+    onRendererStatus: (OfficialLive2DRendererStatus) -> Unit = {}
 ) {
     val context = LocalContext.current
     val controller = remember(character) { Live2DController(context, character) }
+    val nekoController = remember { Live2DController(context, Live2DCharacterConfigs.DefaultCharacter) }
     val state = controller.state
+    val nekoState = nekoController.state
     val density = LocalDensity.current
     val initialPlacement = placement.coerceForStage()
     var gesturePlacement by remember(character, initialPlacement) { mutableStateOf(initialPlacement) }
     val effectivePlacement = if (editable) gesturePlacement else initialPlacement
-    var live2dFailed by remember(character) { mutableStateOf(false) }
-    var live2dReady by remember(character) { mutableStateOf(false) }
-    var lastRendererError by remember(character) { mutableStateOf("") }
+    var live2dFailed by remember { mutableStateOf(false) }
+    var live2dReady by remember { mutableStateOf(false) }
+    var lastRendererError by remember { mutableStateOf("") }
 
     LaunchedEffect(character, line?.id, emotion, pose) {
         if (line != null) {
             controller.applyLine(line)
+            if (character != Live2DCharacterConfigs.DefaultCharacter) {
+                nekoController.applyLine(line)
+            }
         } else {
             controller.applyPreview(emotion, pose)
+            if (character != Live2DCharacterConfigs.DefaultCharacter) {
+                nekoController.applyPreview(emotion, pose)
+            }
         }
     }
     LaunchedEffect(speechState.active, speechState.mouthOpen) {
         controller.updateSpeech(speechState)
-    }
-    LaunchedEffect(state.modelAssetPath, state.rendererMode) {
-        live2dFailed = false
-        live2dReady = false
-        lastRendererError = ""
+        if (character != Live2DCharacterConfigs.DefaultCharacter) {
+            nekoController.updateSpeech(speechState)
+        }
     }
 
     val transformState = rememberTransformableState { zoomChange, panChange, _ ->
@@ -110,7 +119,18 @@ fun Live2DStage(
         if (reaction != null) onReaction(reaction)
     }
 
-    val useLive2D = state.canRenderLive2D && !live2dFailed && state.character == "neko"
+    val hostState = if (state.character == Live2DCharacterConfigs.DefaultCharacter && state.rendererMode == CharacterRendererMode.Live2D) {
+        state
+    } else {
+        nekoState
+    }
+    val hostPlacement = if (state.character == Live2DCharacterConfigs.DefaultCharacter) {
+        effectivePlacement
+    } else {
+        defaultOutfitPlacement(Live2DCharacterConfigs.DefaultCharacter).coerceForStage()
+    }
+    val hostCanRenderLive2D = hostState.canRenderLive2D && !live2dFailed
+    val showLive2DCharacter = showCharacter && live2DVisible && hostCanRenderLive2D && state.character == Live2DCharacterConfigs.DefaultCharacter
     val fallbackCharacter = if (state.rendererMode == CharacterRendererMode.Live2D) {
         state.staticFallbackCharacter
     } else {
@@ -119,16 +139,16 @@ fun Live2DStage(
 
     BoxWithConstraints(modifier) {
         SakuraSceneBackground(background)
-        if (useLive2D) {
-            val desiredLive2DHeight = baseHeight * effectivePlacement.scale + effectivePlacement.bottomInset.dp
-            val live2DViewportHeight = if (maxHeight < desiredLive2DHeight) maxHeight else desiredLive2DHeight
+        if (hostCanRenderLive2D) {
             OfficialLive2DAndroidStage(
-                command = state.toCommand(effectivePlacement, interactive = !editable),
+                command = hostState.toCommand(hostPlacement, interactive = showLive2DCharacter && !editable),
+                visible = showLive2DCharacter,
                 onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
                 onStatus = { status ->
                     if (status.modelLoaded && status.drawableCount > 0) {
                         live2dReady = true
                     }
+                    onRendererStatus(status)
                     Log.d(Live2DTag, "${stageMode}: ${status.summary()}")
                 },
                 onError = { error ->
@@ -137,12 +157,10 @@ fun Live2DStage(
                     Log.e(Live2DTag, error)
                 },
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(live2DViewportHeight)
+                    .fillMaxSize()
                     .zIndex(1f)
             )
-            if (live2dReady && !editable) {
+            if (stageMode == "home" && showLive2DCharacter && live2dReady && !editable) {
                 StageTapLayer(
                     onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
                     modifier = Modifier
@@ -151,7 +169,7 @@ fun Live2DStage(
                 )
             }
         }
-        if (useLive2D && !live2dReady && !live2dFailed) {
+        if (showLive2DCharacter && !live2dReady && !live2dFailed) {
             Live2DLoadingLayer(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -159,7 +177,7 @@ fun Live2DStage(
                     .zIndex(2f)
             )
         }
-        if (!useLive2D || live2dFailed) {
+        if (showCharacter && (!showLive2DCharacter || live2dFailed)) {
             StaticCharacterStageLayer(
                 character = fallbackCharacter,
                 emotion = expressionToEmotion(state.expression),
@@ -170,7 +188,7 @@ fun Live2DStage(
                 onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(if (useLive2D) 2f else 1f)
+                    .zIndex(if (hostCanRenderLive2D) 2f else 1f)
             )
             if (lastRendererError.isNotBlank() && (stageMode == "selftest" || stageMode == "home")) {
                 Text(
@@ -223,6 +241,7 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
         SakuraSceneBackground("classroom")
         OfficialLive2DAndroidStage(
             command = command,
+            visible = true,
             onTap = { _, _ -> },
             onStatus = { status = it },
             onError = { error = it },
@@ -260,6 +279,7 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
 @Composable
 private fun OfficialLive2DAndroidStage(
     command: Live2DRenderCommand,
+    visible: Boolean,
     onTap: (Float, Float) -> Unit,
     onStatus: (OfficialLive2DRendererStatus) -> Unit,
     onError: (String) -> Unit,
@@ -282,8 +302,7 @@ private fun OfficialLive2DAndroidStage(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            live2DViewRef.get()?.releaseRenderer()
-            live2DViewRef.get()?.onPause()
+            live2DViewRef.get()?.clearStageListener()
             live2DViewRef.set(null)
         }
     }
@@ -304,6 +323,7 @@ private fun OfficialLive2DAndroidStage(
                 if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                     onResume()
                 }
+                setStageVisible(visible)
             }
         },
         update = { view ->
@@ -318,6 +338,7 @@ private fun OfficialLive2DAndroidStage(
             })
             view.isClickable = false
             view.isFocusable = false
+            view.setStageVisible(visible)
             view.submitCommand(command)
         },
         modifier = modifier
