@@ -44,7 +44,79 @@ class Live2DConfigTest {
 
         assertTrue(stageJs.contains("live2d/models/Haru/Haru.model3.json"))
         assertFalse(stageJs.contains("live2d/samples/Haru"))
+        assertFalse(File("src/main/assets/live2d/samples").exists())
         assertFalse(stageJs.contains("setPixiBackground"))
+        assertTrue(stageJs.contains("getLocalBounds"))
+        assertTrue(stageJs.contains("pivot.set"))
+        assertTrue(stageJs.contains("pixi-cubism-runtime-v10-transparent-dom-fallback"))
+        assertTrue(stageJs.contains("transparent: true"))
+        assertTrue(stageJs.contains("backgroundAlpha: 0"))
+        assertTrue(stageJs.contains("app.renderer.backgroundAlpha = 0"))
+        assertTrue(stageJs.contains("webBackgroundDisabled: true"))
+        assertTrue(stageJs.contains("preferWebGLVersion: 1"))
+        assertTrue(stageJs.contains("PIXI.settings.PREFER_ENV"))
+        assertTrue(stageJs.contains("ENABLE_DOM_PRESENTER = true"))
+        assertTrue(stageJs.contains("MODEL_PIXEL_THRESHOLD"))
+        assertTrue(stageJs.contains("modelPixelReady"))
+        assertTrue(stageJs.contains("waiting-model-pixels"))
+        assertTrue(stageJs.contains("notifyPresented(\"dom-presenter\")"))
+        assertTrue(stageJs.contains("domPresenterEnabled"))
+        assertTrue(stageJs.contains("onPresented"))
+        assertFalse(stageJs.contains("modelBaseHeight"))
+        assertFalse(stageJs.contains("modelBaseWidth"))
+
+        val indexHtml = File("src/main/assets/live2d-web/index.html").readText()
+        assertTrue(indexHtml.contains("pixi-cubism-runtime-v10-transparent-dom-fallback"))
+        assertTrue(indexHtml.contains("fallback-image"))
+        assertTrue(indexHtml.contains("present-canvas"))
+        assertTrue(indexHtml.contains("present-image"))
+        assertTrue(indexHtml.contains("model-pixels"))
+        assertFalse(
+            Regex(
+                "#present-(canvas|image)\\s*\\{[^}]*display\\s*:\\s*none",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+            ).containsMatchIn(indexHtml)
+        )
+        assertTrue(indexHtml.contains("src=\"./fallbacks/haru-stage.png\""))
+        assertTrue(stageJs.contains("presentImage.removeAttribute(\"src\")"))
+        assertTrue(stageJs.contains("presentCanvas.style.display = \"block\""))
+        assertTrue(stageJs.contains("presentImage.style.display = \"block\""))
+        assertTrue(stageJs.contains("setFallbackVisible(true)"))
+        assertFalse(stageJs.contains("setFallbackVisible(false)"))
+        assertFalse(stageJs.contains("setFallbackVisible(!visible)"))
+        assertTrue(File("src/main/assets/live2d-web/fallbacks/haru-stage.png").exists())
+        assertTrue(File("src/main/res/drawable-nodpi/live2d_haru_fallback.png").exists())
+    }
+
+    @Test
+    fun webLive2DStageKeepsNativeVisibilityGuard() {
+        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
+
+        assertTrue(stageKt.contains("val useWebStage = state.canRenderLive2D && !webStageFailed"))
+        assertTrue(stageKt.contains("val useNativeVisibilityGuard = stageMode == \"home\""))
+        assertTrue(stageKt.contains("val showNativeFallback = !useWebStage || !webStagePresented || useNativeVisibilityGuard"))
+        assertTrue(stageKt.contains("pixi-cubism-runtime-v10-transparent-dom-fallback"))
+        assertTrue(stageKt.contains("private const val Live2DWebSurfaceColor = 0x00000000"))
+        assertTrue(stageKt.contains("Live2DWebStage("))
+        assertTrue(stageKt.contains("webStagePresented = true"))
+        assertTrue(stageKt.contains("delay(4500L)"))
+        assertTrue(stageKt.contains("NativeHaruLive2DFallback"))
+        assertTrue(stageKt.contains("if (showNativeFallback)"))
+        assertTrue(stageKt.contains("if (!editable && showNativeFallback)"))
+        assertTrue(stageKt.contains("R.drawable.live2d_haru_fallback_00"))
+        assertTrue(stageKt.contains("Log.d(Live2DWebTag, \"presented\")"))
+        assertTrue(stageKt.contains("onPresented = { Log.d(Live2DWebTag, \"selftest presented\") }"))
+        assertTrue(stageKt.contains("private fun NativeHaruLive2DFallback(\n    placement: OutfitPlacement = OutfitPlacement()"))
+        assertTrue(stageKt.contains("baseHeight * nativePlacement.scale"))
+        assertTrue(stageKt.contains(".offset(x = nativePlacement.offsetX.dp, y = nativePlacement.offsetY.dp)"))
+        assertFalse(stageKt.contains("CharacterStandee("))
+        assertTrue(stageKt.contains("NativeHaruFallbackFrames"))
+        assertTrue(stageKt.contains("R.drawable.live2d_haru_fallback_07"))
+        assertTrue(stageKt.contains("delay(160L)"))
+        assertEquals(3, Regex("NativeHaruLive2DFallback\\(").findAll(stageKt).count())
+        (0..7).forEach { index ->
+            assertTrue(File("src/main/res/drawable-nodpi/live2d_haru_fallback_%02d.png".format(index)).exists())
+        }
     }
 
     @Test

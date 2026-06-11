@@ -19,20 +19,45 @@
             touch-action: none;
         }
 
-        #live2d-canvas {
+        #live2d-canvas,
+        #fallback-image,
+        #present-canvas,
+        #present-image {
             position: absolute;
             inset: 0;
             width: 100vw;
             height: 100vh;
         }
 
-        #live2d-canvas {
+        #live2d-canvas,
+        #fallback-image,
+        #present-canvas,
+        #present-image {
             z-index: 1;
             display: block;
             background: transparent;
             object-fit: cover;
             touch-action: none;
             opacity: 1;
+        }
+
+        #fallback-image {
+            z-index: 2;
+            object-fit: contain;
+            object-position: center bottom;
+            pointer-events: none;
+        }
+
+        #present-canvas {
+            z-index: 3;
+            pointer-events: none;
+            visibility: hidden;
+        }
+
+        #present-image {
+            z-index: 4;
+            pointer-events: none;
+            visibility: hidden;
         }
 
         #diagnostics {
@@ -79,6 +104,16 @@
             white-space: nowrap;
         }
 
+        .status-wide {
+            grid-column: 1 / -1;
+        }
+
+        .status-wide .status-value {
+            overflow-wrap: anywhere;
+            text-align: right;
+            white-space: normal;
+        }
+
         .status-ok {
             color: #7df0a9;
         }
@@ -96,13 +131,21 @@
 </head>
 <body class="stage-home">
 <canvas id="live2d-canvas"></canvas>
+<img id="fallback-image" src="./fallbacks/haru-stage.png" alt="">
+<canvas id="present-canvas"></canvas>
+<img id="present-image" alt="">
 <div id="diagnostics" aria-live="polite">
     <div class="status-row"><span class="status-label">Core loaded</span><span id="core" class="status-value status-bad">no</span></div>
     <div class="status-row"><span class="status-label">Framework loaded</span><span id="framework" class="status-value status-bad">no</span></div>
     <div class="status-row"><span class="status-label">Model loaded</span><span id="model" class="status-value status-bad">no</span></div>
     <div class="status-row"><span class="status-label">Drawable count</span><span id="drawables" class="status-value">0</span></div>
     <div class="status-row"><span class="status-label">Pixel alpha</span><span id="pixel-alpha" class="status-value">0</span></div>
+    <div class="status-row"><span class="status-label">Model pixels</span><span id="model-pixels" class="status-value status-bad">0 / 0</span></div>
     <div class="status-row"><span class="status-label">Stage version</span><span id="version" class="status-value">boot</span></div>
+    <div class="status-row status-wide"><span class="status-label">Bounds</span><span id="bounds" class="status-value">0,0 1x1</span></div>
+    <div class="status-row status-wide"><span class="status-label">Pivot / scale</span><span id="fit" class="status-value">0,0 @ 0</span></div>
+    <div class="status-row status-wide"><span class="status-label">Stage / pos</span><span id="position" class="status-value">0x0 / 0,0</span></div>
+    <div class="status-row status-wide"><span class="status-label">Presenter</span><span id="presenter" class="status-value">0</span></div>
     <div id="error"></div>
 </div>
 <script src="./vendor/live2dcubismcore.min.js"></script>
@@ -111,6 +154,6 @@
     window.PIXI = PIXI;
 </script>
 <script src="./vendor/cubism4.min.js"></script>
-<script src="./stage.js"></script>
+<script src="./stage.js?v=pixi-cubism-runtime-v10-transparent-dom-fallback"></script>
 </body>
 </html>

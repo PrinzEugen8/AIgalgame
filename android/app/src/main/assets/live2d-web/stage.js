@@ -4,9 +4,15 @@
     var MODEL_BASE_URL = new URL("../", window.location.href).href;
     var DEFAULT_MODEL = MODEL_BASE_URL + "live2d/models/Haru/Haru.model3.json";
     var DEFAULT_BACKGROUND = "";
-    var STAGE_VERSION = "pixi-cubism-runtime-v4";
+    var STAGE_VERSION = "pixi-cubism-runtime-v10-transparent-dom-fallback";
+    var STAGE_BACKGROUND_COLOR = 0x000000;
+    var STAGE_BACKGROUND_CSS = "transparent";
+    var ENABLE_DOM_PRESENTER = true;
+    var MODEL_PIXEL_THRESHOLD = 64;
     var MAX_RESOLUTION = 2;
     var RENDER_BURST_FRAMES = 36;
+    var PRESENTER_FRAME_INTERVAL_MS = 33;
+    var PRESENT_IMAGE_INTERVAL_MS = 250;
     var motionAliases = {
         Idle: "Idle",
         Happy: "TapBody",
@@ -34,22 +40,43 @@
     };
 
     var canvas = document.getElementById("live2d-canvas");
+    var fallbackImage = document.getElementById("fallback-image");
+    var presentCanvas = document.getElementById("present-canvas");
+    var presentContext = ENABLE_DOM_PRESENTER && presentCanvas && presentCanvas.getContext
+        ? presentCanvas.getContext("2d", { alpha: true })
+        : null;
+    var presentImage = document.getElementById("present-image");
     var diagnostics = {
         core: document.getElementById("core"),
         framework: document.getElementById("framework"),
         model: document.getElementById("model"),
         drawables: document.getElementById("drawables"),
         pixelAlpha: document.getElementById("pixel-alpha"),
+        modelPixels: document.getElementById("model-pixels"),
         version: document.getElementById("version"),
+        bounds: document.getElementById("bounds"),
+        fit: document.getElementById("fit"),
+        position: document.getElementById("position"),
+        presenter: document.getElementById("presenter"),
         error: document.getElementById("error")
     };
     var app = null;
     var model = null;
+    var backgroundSprite = null;
     var modelSrc = "";
     var backgroundSrc = "";
     var backgroundLoaded = true;
-    var modelBaseWidth = 1;
-    var modelBaseHeight = 1;
+    var modelBounds = { x: 0, y: 0, width: 1, height: 1 };
+    var latestFit = {
+        bounds: modelBounds,
+        pivotX: 0,
+        pivotY: 0,
+        scale: 0,
+        modelX: 0,
+        modelY: 0,
+        stageWidth: 0,
+        stageHeight: 0
+    };
     var state = defaultState();
     var interactive = true;
     var lastMotion = "";
@@ -60,7 +87,19 @@
     var targetFocusY = 0;
     var blinkUntilMs = 0;
     var nextBlinkMs = performance.now() + 1600;
-    var latestPixelProbe = { supported: false, alphaHits: 0, colorHits: 0 };
+    var latestPixelProbe = { supported: false, alphaHits: 0, colorHits: 0, modelHits: 0, brightHits: 0 };
+    var presenterReadBuffer = null;
+    var presenterImageData = null;
+    var presenterWidth = 0;
+    var presenterHeight = 0;
+    var presenterFrames = 0;
+    var presenterImageFrames = 0;
+    var presenterReported = false;
+    var presenterLastError = "";
+    var presenterLoopId = 0;
+    var presenterLastCopyAt = 0;
+    var presenterLastImageAt = 0;
+    var presenterLastDiagnosticsAt = 0;
     var status = {
         coreLoaded: !!window.Live2DCubismCore,
         frameworkLoaded: false,
@@ -109,13 +148,45 @@
         node.classList.toggle("status-bad", ok === false);
     }
 
+    function fmt(value) {
+        return Math.round((Number(value) || 0) * 100) / 100;
+    }
+
     function renderDiagnostics() {
         setText(diagnostics.core, status.coreLoaded ? "yes" : "no", status.coreLoaded);
         setText(diagnostics.framework, status.frameworkLoaded ? "yes" : "no", status.frameworkLoaded);
         setText(diagnostics.model, status.modelLoaded ? "yes" : "no", status.modelLoaded);
         setText(diagnostics.drawables, status.drawableCount || 0);
         setText(diagnostics.pixelAlpha, latestPixelProbe.alphaHits || 0, (latestPixelProbe.alphaHits || 0) > 0);
+        setText(
+            diagnostics.modelPixels,
+            (latestPixelProbe.modelHits || 0) + " / " + (latestPixelProbe.brightHits || 0),
+            (latestPixelProbe.modelHits || 0) >= MODEL_PIXEL_THRESHOLD
+        );
         setText(diagnostics.version, STAGE_VERSION);
+        setText(
+            diagnostics.bounds,
+            fmt(modelBounds.x) + "," + fmt(modelBounds.y) + " " + fmt(modelBounds.width) + "x" + fmt(modelBounds.height)
+        );
+        setText(
+            diagnostics.fit,
+            fmt(latestFit.pivotX) + "," + fmt(latestFit.pivotY) + " @ " + fmt(latestFit.scale)
+        );
+        setText(
+            diagnostics.position,
+            fmt(latestFit.stageWidth) + "x" + fmt(latestFit.stageHeight) + " / " + fmt(latestFit.modelX) + "," + fmt(latestFit.modelY)
+        );
+        setText(
+            diagnostics.presenter,
+            ENABLE_DOM_PRESENTER
+                ? presenterFrames + "/" + presenterImageFrames + " px " + (latestPixelProbe.modelHits || 0) +
+                    (presenterLastError ? " err " + presenterLastError : "")
+                : "raw-webgl",
+            ENABLE_DOM_PRESENTER
+                ? presenterFrames > 0 && presenterImageFrames > 0 && !presenterLastError &&
+                    (latestPixelProbe.modelHits || 0) >= MODEL_PIXEL_THRESHOLD
+                : true
+        );
         if (diagnostics.error) diagnostics.error.textContent = status.lastError || "";
     }
 
@@ -140,25 +211,38 @@
         return 0;
     }
 
-    function readModelSize(nextModel) {
-        var internal = nextModel && nextModel.internalModel;
-        var size = internal && typeof internal.getSize === "function" ? internal.getSize() : null;
-        var width = Math.max(
-            Number(internal && internal.originalWidth) || 0,
-            Number(nextModel && nextModel.width) || 0,
-            Number(size && size[0]) || 0,
-            1
-        );
-        var height = Math.max(
-            Number(internal && internal.originalHeight) || 0,
-            Number(nextModel && nextModel.height) || 0,
-            Number(size && size[1]) || 0,
-            1
-        );
-        return {
-            width: Math.max(1, width),
-            height: Math.max(1, height)
-        };
+    function resetModelTransform() {
+        if (!model) return;
+        if (model.anchor && typeof model.anchor.set === "function") model.anchor.set(0, 0);
+        if (model.pivot && typeof model.pivot.set === "function") model.pivot.set(0, 0);
+        if (model.scale && typeof model.scale.set === "function") model.scale.set(1, 1);
+        if (model.position && typeof model.position.set === "function") {
+            model.position.set(0, 0);
+        } else {
+            model.x = 0;
+            model.y = 0;
+        }
+        model.rotation = 0;
+        if (model.skew && typeof model.skew.set === "function") model.skew.set(0, 0);
+    }
+
+    function refreshModelBounds() {
+        if (!model) return modelBounds;
+        resetModelTransform();
+        try {
+            if (typeof model.update === "function") model.update(0);
+            var bounds = typeof model.getLocalBounds === "function" ? model.getLocalBounds() : null;
+            modelBounds = {
+                x: Number(bounds && bounds.x) || 0,
+                y: Number(bounds && bounds.y) || 0,
+                width: Math.max(1, Number(bounds && bounds.width) || 1),
+                height: Math.max(1, Number(bounds && bounds.height) || 1)
+            };
+        } catch (error) {
+            debug("getLocalBounds failed: " + (error && error.message ? error.message : String(error)));
+            modelBounds = { x: 0, y: 0, width: 1, height: 1 };
+        }
+        return modelBounds;
     }
 
     function debug(message) {
@@ -169,7 +253,7 @@
         post("onDebug", message);
     }
 
-    function reportError(error) {
+    function reportError(error, fatal) {
         var message = error && error.message ? error.message : String(error);
         status.lastError = message;
         renderDiagnostics();
@@ -177,7 +261,11 @@
             console.error("[AiriLive2D] " + message);
         } catch (_) {
         }
-        post("onError", message);
+        if (fatal) {
+            post("onError", message);
+        } else {
+            post("onDebug", "nonfatal error: " + message);
+        }
     }
 
     function canonicalHitArea(name) {
@@ -196,20 +284,67 @@
     }
 
     function normalizeBackgroundSrc(src) {
-        if (!src) return DEFAULT_BACKGROUND;
-        if (/^(file|https?):\/\//i.test(src)) return src;
-        return MODEL_BASE_URL + src.replace(/^\/+/, "");
+        return DEFAULT_BACKGROUND;
     }
 
     function setBackground(nextSrc) {
         var resolvedSrc = normalizeBackgroundSrc(nextSrc);
+        if (!app || !window.PIXI) {
+            backgroundSrc = resolvedSrc;
+            backgroundLoaded = true;
+            renderDiagnostics();
+            return;
+        }
+        if (backgroundSprite && resolvedSrc === backgroundSrc) {
+            fitBackground();
+            renderDiagnostics();
+            return;
+        }
+        if (backgroundSprite) {
+            app.stage.removeChild(backgroundSprite);
+            backgroundSprite.destroy({ children: true });
+            backgroundSprite = null;
+        }
         backgroundSrc = resolvedSrc;
-        backgroundLoaded = true;
+        backgroundLoaded = !resolvedSrc;
+        if (resolvedSrc) {
+            try {
+                backgroundSprite = PIXI.Sprite.from(resolvedSrc);
+                backgroundSprite.zIndex = -100;
+                backgroundSprite.alpha = 1;
+                backgroundSprite.visible = true;
+                app.stage.addChild(backgroundSprite);
+                if (backgroundSprite.texture && backgroundSprite.texture.baseTexture) {
+                    backgroundSprite.texture.baseTexture.on("loaded", function () {
+                        backgroundLoaded = true;
+                        fitBackground();
+                        requestRenderBurst(8);
+                    });
+                    backgroundSprite.texture.baseTexture.on("error", function (error) {
+                        backgroundLoaded = false;
+                        debug("background failed: " + (error && error.message ? error.message : String(error)));
+                    });
+                    backgroundLoaded = !!backgroundSprite.texture.baseTexture.valid;
+                }
+                fitBackground();
+            } catch (error) {
+                backgroundLoaded = false;
+                debug("background failed: " + (error && error.message ? error.message : String(error)));
+            }
+        }
         renderDiagnostics();
     }
 
     function fitBackground() {
-        return;
+        if (!app || !backgroundSprite) return;
+        var size = screenSize();
+        var texture = backgroundSprite.texture;
+        var width = texture && texture.width ? texture.width : 1;
+        var height = texture && texture.height ? texture.height : 1;
+        var scale = Math.max(size.width / width, size.height / height);
+        backgroundSprite.scale.set(scale);
+        backgroundSprite.x = (size.width - width * scale) * 0.5;
+        backgroundSprite.y = (size.height - height * scale) * 0.5;
     }
 
     function resolveMotion(name) {
@@ -227,10 +362,39 @@
         if (!window.PIXI) {
             throw new Error("PIXI is not available");
         }
+        if (window.PIXI.settings && window.PIXI.ENV) {
+            window.PIXI.settings.PREFER_ENV = window.PIXI.ENV.WEBGL;
+            window.PIXI.settings.FAIL_IF_MAJOR_PERFORMANCE_CAVEAT = false;
+        }
         status.coreLoaded = !!window.Live2DCubismCore;
         canvas.style.width = "100vw";
         canvas.style.height = "100vh";
         canvas.style.opacity = "1";
+        canvas.style.background = STAGE_BACKGROUND_CSS;
+        if (fallbackImage) {
+            fallbackImage.style.opacity = "1";
+            fallbackImage.style.visibility = "visible";
+            fallbackImage.style.background = STAGE_BACKGROUND_CSS;
+        }
+        if (presentCanvas) {
+            presentCanvas.style.width = "100vw";
+            presentCanvas.style.height = "100vh";
+            presentCanvas.style.opacity = "0";
+            presentCanvas.style.background = STAGE_BACKGROUND_CSS;
+            presentCanvas.style.display = ENABLE_DOM_PRESENTER ? "block" : "none";
+            presentCanvas.style.visibility = "hidden";
+        }
+        if (presentImage) {
+            presentImage.style.width = "100vw";
+            presentImage.style.height = "100vh";
+            presentImage.style.opacity = "0";
+            presentImage.style.background = STAGE_BACKGROUND_CSS;
+            presentImage.style.visibility = "hidden";
+            presentImage.style.display = ENABLE_DOM_PRESENTER ? "block" : "none";
+            presentImage.removeAttribute("src");
+        }
+        document.documentElement.style.background = STAGE_BACKGROUND_CSS;
+        document.body.style.background = STAGE_BACKGROUND_CSS;
         app = new PIXI.Application({
             view: canvas,
             resizeTo: window,
@@ -238,17 +402,21 @@
             resolution: Math.min(window.devicePixelRatio || 1, MAX_RESOLUTION),
             antialias: true,
             transparent: true,
-            backgroundColor: 0x000000,
+            backgroundColor: STAGE_BACKGROUND_COLOR,
             backgroundAlpha: 0,
             clearBeforeRender: true,
             preserveDrawingBuffer: true,
-            powerPreference: "high-performance"
+            powerPreference: "high-performance",
+            preferWebGLVersion: 1
         });
         app.stage.sortableChildren = true;
         app.stage.visible = true;
         app.stage.alpha = 1;
         if (app.renderer) {
             app.renderer.backgroundAlpha = 0;
+            if (app.renderer.background && app.renderer.background.color) {
+                app.renderer.background.color = STAGE_BACKGROUND_COLOR;
+            }
         }
         status.frameworkLoaded = !!(window.PIXI.live2d && window.PIXI.live2d.Live2DModel);
         renderDiagnostics();
@@ -258,8 +426,7 @@
             try {
                 originalRender();
             } catch (error) {
-                reportError(error);
-                app.stop();
+                reportError(error, false);
             }
         };
 
@@ -267,8 +434,7 @@
             try {
                 tick();
             } catch (error) {
-                reportError(error);
-                app.stop();
+                reportError(error, false);
             }
         });
         if (typeof app.start === "function") app.start();
@@ -282,7 +448,168 @@
             requestAnimationFrame(applyFit);
             requestAnimationFrame(fitBackground);
             requestRenderBurst(8);
+            if (ENABLE_DOM_PRESENTER) {
+                requestAnimationFrame(function () { copyWebGlFrameToPresenter(true); });
+            }
         });
+        if (ENABLE_DOM_PRESENTER) startPresenterLoop();
+    }
+
+    function notifyPresented(mode) {
+        if (presenterReported) return;
+        presenterReported = true;
+        setFallbackVisible(true);
+        post("onPresented", JSON.stringify({
+            mode: mode || "raw-webgl",
+            presenterFrames: presenterFrames,
+            presenterImageFrames: presenterImageFrames
+        }));
+        renderDiagnostics();
+    }
+
+    function isModelPixel(r, g, b, a) {
+        return a > 8;
+    }
+
+    function analyzePixelBuffer(pixels, width, height, stride) {
+        var totalPixels = Math.max(1, width * height);
+        var step = Math.max(1, stride || Math.floor(totalPixels / 4096));
+        var sampled = 0;
+        var alphaHits = 0;
+        var colorHits = 0;
+        var modelHits = 0;
+        var brightHits = 0;
+        var minX = width;
+        var minY = height;
+        var maxX = -1;
+        var maxY = -1;
+        for (var pixel = 0; pixel < totalPixels; pixel += step) {
+            var offset = pixel * 4;
+            var r = pixels[offset];
+            var g = pixels[offset + 1];
+            var b = pixels[offset + 2];
+            var a = pixels[offset + 3];
+            sampled += 1;
+            if (a > 8) alphaHits += 1;
+            if (r > 8 || g > 8 || b > 8) colorHits += 1;
+            if (r > 80 || g > 80 || b > 80) brightHits += 1;
+            if (isModelPixel(r, g, b, a)) {
+                var x = pixel % width;
+                var y = Math.floor(pixel / width);
+                modelHits += 1;
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+            }
+        }
+        return {
+            supported: true,
+            width: width,
+            height: height,
+            sampled: sampled,
+            alphaHits: alphaHits,
+            colorHits: colorHits,
+            modelHits: modelHits,
+            brightHits: brightHits,
+            modelPixelThreshold: MODEL_PIXEL_THRESHOLD,
+            modelPixelReady: modelHits >= MODEL_PIXEL_THRESHOLD,
+            modelBBox: modelHits > 0 ? { minX: minX, minY: minY, maxX: maxX, maxY: maxY } : null
+        };
+    }
+
+    function setFallbackVisible(visible) {
+        if (!fallbackImage) return;
+        fallbackImage.style.opacity = visible ? "1" : "0";
+        fallbackImage.style.visibility = visible ? "visible" : "hidden";
+    }
+
+    function setPresenterVisible(visible) {
+        if (presentCanvas) {
+            presentCanvas.style.display = "block";
+            presentCanvas.style.opacity = visible ? "1" : "0";
+            presentCanvas.style.visibility = visible ? "visible" : "hidden";
+        }
+        if (presentImage) {
+            presentImage.style.display = "block";
+            presentImage.style.opacity = visible ? "1" : "0";
+            presentImage.style.visibility = visible ? "visible" : "hidden";
+        }
+        setFallbackVisible(true);
+    }
+
+    function ensurePresenterBuffers(width, height) {
+        if (!presentCanvas || !presentContext || width <= 0 || height <= 0) return false;
+        if (presenterWidth === width && presenterHeight === height && presenterReadBuffer && presenterImageData) {
+            return true;
+        }
+        presenterWidth = width;
+        presenterHeight = height;
+        presentCanvas.width = width;
+        presentCanvas.height = height;
+        presenterReadBuffer = new Uint8Array(width * height * 4);
+        presenterImageData = presentContext.createImageData(width, height);
+        return true;
+    }
+
+    function copyWebGlFrameToPresenter(force) {
+        if (!ENABLE_DOM_PRESENTER || !app || !app.renderer || !app.renderer.gl || !presentContext) return;
+        try {
+            var now = performance.now();
+            if (!force && presenterFrames > 0 && now - presenterLastCopyAt < PRESENTER_FRAME_INTERVAL_MS) return;
+            presenterLastCopyAt = now;
+            var gl = app.renderer.gl;
+            var width = Math.max(1, app.renderer.width || canvas.width || 1);
+            var height = Math.max(1, app.renderer.height || canvas.height || 1);
+            if (!ensurePresenterBuffers(width, height)) return;
+            gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, presenterReadBuffer);
+            latestPixelProbe = Object.assign(
+                analyzePixelBuffer(presenterReadBuffer, width, height, Math.max(1, Math.floor(width * height / 4096))),
+                { glError: gl.getError() }
+            );
+            if (!latestPixelProbe.modelPixelReady) {
+                presenterLastError = "waiting-model-pixels";
+                setPresenterVisible(false);
+                renderDiagnostics();
+                return;
+            }
+
+            var target = presenterImageData.data;
+            var rowLength = width * 4;
+            for (var y = 0; y < height; y += 1) {
+                var sourceOffset = (height - y - 1) * rowLength;
+                var targetOffset = y * rowLength;
+                target.set(presenterReadBuffer.subarray(sourceOffset, sourceOffset + rowLength), targetOffset);
+            }
+            presentContext.putImageData(presenterImageData, 0, 0);
+            presenterFrames += 1;
+            presenterLastError = "";
+            if (presentImage && now - presenterLastImageAt >= PRESENT_IMAGE_INTERVAL_MS) {
+                presenterLastImageAt = now;
+                presentImage.src = presentCanvas.toDataURL("image/png");
+                presentImage.style.visibility = "visible";
+                setPresenterVisible(true);
+                presenterImageFrames += 1;
+                notifyPresented("dom-presenter");
+            }
+            if (now - presenterLastDiagnosticsAt > 500) {
+                presenterLastDiagnosticsAt = now;
+                renderDiagnostics();
+            }
+        } catch (error) {
+            presenterLastError = error && error.message ? error.message : String(error);
+            debug("presenter failed: " + presenterLastError);
+            renderDiagnostics();
+        }
+    }
+
+    function startPresenterLoop() {
+        if (presenterLoopId) return;
+        function step() {
+            copyWebGlFrameToPresenter();
+            presenterLoopId = requestAnimationFrame(step);
+        }
+        presenterLoopId = requestAnimationFrame(step);
     }
 
     async function loadModel(nextSrc) {
@@ -320,14 +647,13 @@
             autoInteract: true,
             idleMotionGroup: "Idle"
         });
-        model.anchor.set(0.5, 0.5);
+        resetModelTransform();
         model.interactive = interactive;
         model.visible = true;
         model.alpha = 1;
         model.zIndex = 10;
-        var modelSize = readModelSize(model);
-        modelBaseWidth = modelSize.width;
-        modelBaseHeight = modelSize.height;
+        app.stage.addChild(model);
+        refreshModelBounds();
         status.modelLoaded = true;
         status.drawableCount = getDrawableCount();
         renderDiagnostics();
@@ -335,16 +661,28 @@
             debug("hit:" + JSON.stringify(hitAreas || []));
         });
 
-        app.stage.addChild(model);
         applyFit();
         applyExpression(state.expression, true);
         playMotion(state.motion, true);
         requestRenderBurst(RENDER_BURST_FRAMES);
+        requestAnimationFrame(function () {
+            try {
+                app.render();
+                var probe = sampleCanvasPixels();
+                if (ENABLE_DOM_PRESENTER) {
+                    copyWebGlFrameToPresenter(true);
+                } else if (probe && probe.modelPixelReady) {
+                    notifyPresented("raw-webgl");
+                }
+            } catch (error) {
+                reportError(error, false);
+            }
+        });
         debug("model loaded " + resolvedSrc);
         post("onModelLoaded", JSON.stringify({
             modelSrc: resolvedSrc,
-            width: modelBaseWidth,
-            height: modelBaseHeight
+            bounds: modelBounds,
+            fit: latestFit
         }));
     }
 
@@ -361,21 +699,43 @@
         var size = screenSize();
         var placement = state.placement || {};
         var userScale = clamp(Number(placement.scale || 1), 0.7, 1.35);
-        var offsetX = Number(placement.offsetX || 0);
-        var offsetY = Number(placement.offsetY || 0);
+        var offsetX = clamp(Number(placement.offsetX || 0), -size.width * 0.25, size.width * 0.25);
+        var offsetY = clamp(Number(placement.offsetY || 0), -size.height * 0.20, size.height * 0.08);
         var bottomInset = clamp(Number(placement.bottomInset || 0), 0, size.height * 0.28);
+        var bounds = modelBounds && modelBounds.width > 1 && modelBounds.height > 1
+            ? modelBounds
+            : refreshModelBounds();
+        var pivotX = bounds.x + bounds.width * 0.5;
+        var pivotY = bounds.y + bounds.height;
         var heightRatio = state.stageMode === "dress" ? 0.78 : 0.72;
         var widthRatio = state.stageMode === "dress" ? 0.86 : 0.82;
+        var availableHeight = Math.max(1, size.height - bottomInset);
         var fitScale = Math.min(
-            size.height * heightRatio / modelBaseHeight,
-            size.width * widthRatio / modelBaseWidth
+            availableHeight * heightRatio / bounds.height,
+            size.width * widthRatio / bounds.width
         );
         var finalScale = Math.max(0.001, fitScale * userScale);
-        var renderedHeight = modelBaseHeight * finalScale;
 
+        if (model.pivot && typeof model.pivot.set === "function") model.pivot.set(pivotX, pivotY);
         model.scale.set(finalScale);
         model.x = size.width * 0.5 + offsetX;
-        model.y = size.height - bottomInset - renderedHeight * 0.5 + offsetY;
+        model.y = size.height - bottomInset + offsetY;
+        latestFit = {
+            bounds: {
+                x: bounds.x,
+                y: bounds.y,
+                width: bounds.width,
+                height: bounds.height
+            },
+            pivotX: pivotX,
+            pivotY: pivotY,
+            scale: finalScale,
+            modelX: model.x,
+            modelY: model.y,
+            stageWidth: size.width,
+            stageHeight: size.height
+        };
+        renderDiagnostics();
     }
 
     function requestRenderBurst(frames) {
@@ -390,8 +750,9 @@
                     model.update(16);
                 }
                 app.render();
+                copyWebGlFrameToPresenter();
             } catch (error) {
-                reportError(error);
+                reportError(error, false);
                 return;
             }
             requestAnimationFrame(renderStep);
@@ -557,14 +918,25 @@
             }
             setBackground(state.backgroundSrc);
             setInteractive(!state.editable);
+        } catch (error) {
+            reportError(error, false);
+        }
+
+        try {
             await loadModel(state.modelSrc);
+        } catch (error) {
+            reportError(error, true);
+            return;
+        }
+
+        try {
             fitBackground();
             applyFit();
             applyExpression(state.expression, false);
             playMotion(state.motion, false);
             requestRenderBurst(4);
         } catch (error) {
-            reportError(error);
+            reportError(error, false);
         }
     }
 
@@ -580,31 +952,21 @@
             var pixels = new Uint8Array(width * height * 4);
             gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
             var totalPixels = width * height;
-            var stride = Math.max(1, Math.floor(totalPixels / 4096));
-            var sampled = 0;
-            var alphaHits = 0;
-            var colorHits = 0;
-            for (var pixel = 0; pixel < totalPixels; pixel += stride) {
-                var offset = pixel * 4;
-                sampled += 1;
-                if (pixels[offset + 3] > 8) alphaHits += 1;
-                if (pixels[offset] > 8 || pixels[offset + 1] > 8 || pixels[offset + 2] > 8) {
-                    colorHits += 1;
-                }
-            }
-            latestPixelProbe = {
-                supported: true,
-                width: width,
-                height: height,
-                sampled: sampled,
-                alphaHits: alphaHits,
-                colorHits: colorHits,
-                glError: gl.getError()
-            };
+            latestPixelProbe = Object.assign(
+                analyzePixelBuffer(pixels, width, height, Math.max(1, Math.floor(totalPixels / 4096))),
+                { glError: gl.getError() }
+            );
             renderDiagnostics();
             return latestPixelProbe;
         } catch (error) {
-            latestPixelProbe = { supported: false, alphaHits: 0, colorHits: 0, reason: error.message || String(error) };
+            latestPixelProbe = {
+                supported: false,
+                alphaHits: 0,
+                colorHits: 0,
+                modelHits: 0,
+                brightHits: 0,
+                reason: error.message || String(error)
+            };
             renderDiagnostics();
             return latestPixelProbe;
         }
@@ -634,20 +996,31 @@
                 backgroundSrc: backgroundSrc,
                 backgroundLoaded: backgroundLoaded,
                 webBackgroundDisabled: true,
+                opaqueWebGlSurface: false,
                 stageWidth: app ? app.screen.width : 0,
                 stageHeight: app ? app.screen.height : 0,
                 rendererWidth: app && app.renderer ? app.renderer.width : 0,
                 rendererHeight: app && app.renderer ? app.renderer.height : 0,
                 canvasWidth: canvas ? canvas.width : 0,
                 canvasHeight: canvas ? canvas.height : 0,
-                modelWidth: modelBaseWidth,
-                modelHeight: modelBaseHeight,
+                modelBounds: modelBounds,
+                fit: latestFit,
                 modelX: model ? model.x : 0,
                 modelY: model ? model.y : 0,
                 modelScaleX: model ? model.scale.x : 0,
                 modelScaleY: model ? model.scale.y : 0,
+                modelPivotX: model && model.pivot ? model.pivot.x : 0,
+                modelPivotY: model && model.pivot ? model.pivot.y : 0,
                 modelAlpha: model ? model.alpha : 0,
                 modelVisible: model ? model.visible : false,
+                domPresenterEnabled: ENABLE_DOM_PRESENTER,
+                presenterCanvas: !!presentCanvas,
+                presenterImage: !!presentImage,
+                presenterFrames: presenterFrames,
+                presenterImageFrames: presenterImageFrames,
+                presenterLastError: presenterLastError,
+                presenterWidth: presenterWidth,
+                presenterHeight: presenterHeight,
                 modelTransform: {
                     x: model ? model.x : 0,
                     y: model ? model.y : 0,
@@ -671,6 +1044,6 @@
         setState(state);
         post("onReady", "");
     } catch (error) {
-        reportError(error);
+        reportError(error, true);
     }
 })();

@@ -158,7 +158,7 @@ fun normalizeBackendUrl(value: String): String {
         return cleaned
     }
     if (cleaned.startsWith("http://", ignoreCase = true)) {
-        return "https://" + cleaned.substringAfter("://")
+        return cleaned
     }
     return "https://$cleaned"
 }
