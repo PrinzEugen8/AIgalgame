@@ -22,6 +22,7 @@ DEFAULT_EXPIRY = timedelta(days=2)
 PROACTIVE_JUDGE_CANDIDATE_LIMIT = 8
 DEFAULT_JUDGE_NEXT_CHECK_MINUTES = 30
 MAX_JUDGE_NEXT_CHECK_MINUTES = 24 * 60
+MAX_SEND_NEXT_CHECK_MINUTES = 30
 JUDGE_TEXT_LIMIT = 180
 
 
@@ -416,7 +417,11 @@ def _ark_search_candidates(session: Session, primary: ProviderConfig | None) -> 
         candidates.append(primary)
     for item in session.execute(
         select(ProviderConfig)
-        .where(ProviderConfig.kind == "search", ProviderConfig.provider == "volc_ark_web_search")
+        .where(
+            ProviderConfig.kind == "search",
+            ProviderConfig.provider == "volc_ark_web_search",
+            ProviderConfig.enabled == True,  # noqa: E712
+        )
         .order_by(ProviderConfig.enabled.desc(), ProviderConfig.updated_at.desc())
     ).scalars():
         if all(existing.provider_id != item.provider_id for existing in candidates):
@@ -539,6 +544,21 @@ def _due_pending_events(
             if len(due) >= limit:
                 break
     return due
+
+
+def _unread_selected_event(session: Session, user: User, *, character_id: str) -> ProactiveEvent | None:
+    judgement = load_json(user.proactive_judgement_json, {})
+    selected_event_id = str(judgement.get("selected_event_id") or "").strip() if isinstance(judgement, dict) else ""
+    if selected_event_id:
+        event = session.get(ProactiveEvent, selected_event_id)
+        if (
+            event is not None
+            and event.user_id == user.user_id
+            and event.character_id == character_id
+            and event.status in {"pending", "delivered"}
+        ):
+            return event
+    return None
 
 
 def _next_check_at(user: User) -> datetime | None:
@@ -793,6 +813,8 @@ def _judge_proactive_delivery(
     selected_event_id = str(result.get("selected_event_id") or "").strip()
     reason = str(result.get("reason") or "").strip()
     next_check_after_minutes = _judge_next_check_minutes(result.get("next_check_after_minutes"))
+    if should_send:
+        next_check_after_minutes = min(next_check_after_minutes, MAX_SEND_NEXT_CHECK_MINUTES)
     selected = {event.proactive_event_id: event for event in events}.get(selected_event_id)
     if should_send and selected is None:
         error_reason = f"invalid selected_event_id: {selected_event_id}"
@@ -910,6 +932,19 @@ def pending_proactive_response(
     if generate_weather:
         ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     _expire_old_pending(session, user_id, now_utc)
+    unread_event = _unread_selected_event(session, user, character_id=character_id)
+    if unread_event is not None:
+        write_diagnostic(
+            "proactive_unread_retained",
+            user_id=user_id,
+            character_id=character_id,
+            proactive_event_id=unread_event.proactive_event_id,
+            status=unread_event.status,
+            next_check_at=user.proactive_next_check_at,
+        )
+        session.commit()
+        event_payload = proactive_event_payload(unread_event) if unread_event.status == "pending" else None
+        return {"ok": True, "event": event_payload, "widget": proactive_widget_payload(unread_event, character)}
     if _next_check_pending(user, now_utc):
         write_diagnostic(
             "proactive_judge_skipped",

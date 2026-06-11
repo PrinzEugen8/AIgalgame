@@ -11,7 +11,7 @@ from .config import settings
 from .database import SessionLocal
 from .diagnostics import write_diagnostic
 from .models import User
-from .news import sync_trend_radar_snapshot
+from .news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot
 from .online import is_online
 from .opening import has_fresh_opening_cache, prepare_due_openings
 from .schedule import run_daily_cycle
@@ -36,6 +36,7 @@ def start_scheduler() -> None:
     if _scheduler is not None and _scheduler.running:
         return
     scheduler = BackgroundScheduler(timezone="Asia/Hong_Kong")
+    scheduler.add_job(_trend_radar_dispatch_job, "cron", hour=3, minute=0, id="trend_radar_dispatch", replace_existing=True)
     scheduler.add_job(_daily_job, "cron", hour=4, minute=0, id="daily_cycle", replace_existing=True)
     scheduler.add_job(
         _prewarm_job,
@@ -50,7 +51,7 @@ def start_scheduler() -> None:
     scheduler.start()
     _scheduler = scheduler
     logger.info(
-        "scheduler started daily_cycle=04:00 proactive_prewarm=%sm first_run=120s Asia/Hong_Kong",
+        "scheduler started trend_radar_dispatch=03:00 daily_cycle=04:00 proactive_prewarm=%sm first_run=120s Asia/Hong_Kong",
         _prewarm_interval_minutes(),
     )
 
@@ -61,6 +62,22 @@ def stop_scheduler() -> None:
         _scheduler.shutdown(wait=False)
         logger.info("scheduler stopped")
     _scheduler = None
+
+
+def _trend_radar_dispatch_job() -> None:
+    logger.info("trend radar dispatch job started")
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, DEFAULT_USER_ID, DEFAULT_CHARACTER_ID)
+            snapshot = dispatch_trend_radar_workflow(session, local_time=datetime.now())
+            result = {
+                "trend_radar_snapshot_id": snapshot.snapshot_id if snapshot is not None else "",
+                "trend_radar_status": snapshot.status if snapshot is not None else "skipped",
+            }
+    except Exception:
+        logger.exception("trend radar dispatch job failed")
+        raise
+    logger.info("trend radar dispatch job completed result=%s", result)
 
 
 def _daily_job() -> None:

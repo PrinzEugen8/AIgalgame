@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -245,6 +245,11 @@ def provider_presets() -> dict[str, Any]:
                     ),
                     _field("cache_minutes", "Cache minutes", "metadata", type_="number", default=15),
                     _field("max_titles", "Max related titles", "metadata", type_="number", default=3),
+                    _field("github_token", "GitHub workflow token", "secret", placeholder="Fine-grained PAT with Actions: write"),
+                    _field("github_workflow_id", "GitHub workflow id", "metadata", default="crawler.yml"),
+                    _field("github_ref", "GitHub ref", "metadata", default="master"),
+                    _field("github_dispatch_poll_seconds", "GitHub dispatch poll seconds", "metadata", type_="number", default=15),
+                    _field("github_dispatch_timeout_minutes", "GitHub dispatch timeout minutes", "metadata", type_="number", default=25),
                     _field("timeout", "Timeout seconds", "metadata", type_="number", default=20),
                 ],
             },
@@ -1188,6 +1193,9 @@ class TrendRadarClient:
         branch = "master"
         if len(parts) >= 4 and parts[2] in {"tree", "blob", "raw"}:
             branch = parts[3]
+        metadata_ref = str(self.metadata.get("github_ref") or "").strip()
+        if metadata_ref:
+            branch = metadata_ref
         return owner, repo, branch
 
     def endpoint_for_date(self, local_date: date) -> str:
@@ -1196,6 +1204,139 @@ class TrendRadarClient:
             return self._url()
         owner, repo, branch = parts
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/output/news/{local_date.isoformat()}.db"
+
+    def github_token_configured(self) -> bool:
+        return bool(_secret(self.config, "github_token"))
+
+    def _github_workflow_id(self) -> str:
+        return str(self.metadata.get("github_workflow_id") or "crawler.yml").strip() or "crawler.yml"
+
+    def _github_headers(self, *, require_token: bool = False) -> dict[str, str]:
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "AIgalgame"}
+        token = _secret(self.config, "github_token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        elif require_token:
+            raise ProviderError("TrendRadar GitHub workflow token is not configured")
+        return headers
+
+    @staticmethod
+    def _parse_github_time(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _latest_workflow_run_since(
+        self,
+        client: httpx.Client,
+        *,
+        owner: str,
+        repo: str,
+        workflow_id: str,
+        branch: str,
+        started_at: datetime,
+    ) -> dict[str, Any] | None:
+        url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs"
+        response = client.get(
+            url,
+            headers=self._github_headers(),
+            params={"branch": branch, "event": "workflow_dispatch", "per_page": 10},
+        )
+        response.raise_for_status()
+        runs = response.json().get("workflow_runs") or []
+        candidates: list[dict[str, Any]] = []
+        floor = started_at.astimezone(timezone.utc)
+        for item in runs:
+            if not isinstance(item, dict):
+                continue
+            created_at = self._parse_github_time(item.get("created_at"))
+            if created_at is None or created_at < floor:
+                continue
+            candidates.append(item)
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: str(item.get("created_at") or ""), reverse=True)[0]
+
+    def dispatch_and_fetch_for_date(self, local_date: date) -> tuple[dict[str, Any], dict[str, Any]]:
+        parts = self._github_repo_parts()
+        if parts is None:
+            raise ProviderError("TrendRadar GitHub repository URL is invalid")
+        owner, repo, branch = parts
+        workflow_id = self._github_workflow_id()
+        poll_seconds = max(0.0, _as_float(self.metadata.get("github_dispatch_poll_seconds"), 15.0))
+        timeout_seconds = max(30.0, _as_float(self.metadata.get("github_dispatch_timeout_minutes"), 25.0) * 60.0)
+        started_at = datetime.now(timezone.utc)
+        dispatch_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+        span_id = new_span_id("trendradar")
+        started = time.monotonic()
+        write_diagnostic(
+            "trend_radar_dispatch",
+            phase="start",
+            status="running",
+            span_id=span_id,
+            feature="TrendRadar",
+            stage="github_workflow_dispatch",
+            provider_id=self.config.provider_id,
+            endpoint=dispatch_url,
+            owner=owner,
+            repo=repo,
+            workflow_id=workflow_id,
+            ref=branch,
+            local_date=local_date.isoformat(),
+        )
+        with _client(float(self.metadata.get("timeout", 20.0))) as client:
+            response = client.post(
+                dispatch_url,
+                headers=self._github_headers(require_token=True),
+                json={"ref": branch},
+            )
+            response.raise_for_status()
+            deadline = time.monotonic() + timeout_seconds
+            selected_run: dict[str, Any] | None = None
+            while True:
+                selected_run = self._latest_workflow_run_since(
+                    client,
+                    owner=owner,
+                    repo=repo,
+                    workflow_id=workflow_id,
+                    branch=branch,
+                    started_at=started_at,
+                )
+                if selected_run is not None and selected_run.get("status") == "completed":
+                    conclusion = str(selected_run.get("conclusion") or "")
+                    if conclusion != "success":
+                        raise ProviderError(f"TrendRadar workflow completed with conclusion={conclusion or 'unknown'}")
+                    break
+                if time.monotonic() >= deadline:
+                    raise ProviderError("TrendRadar workflow dispatch timed out")
+                time.sleep(poll_seconds)
+        payload = self.fetch_for_date(local_date)
+        run_info = {
+            "run_id": selected_run.get("id") if selected_run is not None else "",
+            "run_url": selected_run.get("html_url") if selected_run is not None else "",
+            "dispatch_endpoint": dispatch_url,
+            "workflow_id": workflow_id,
+            "ref": branch,
+        }
+        write_diagnostic(
+            "trend_radar_dispatch",
+            phase="end",
+            status="ok",
+            span_id=span_id,
+            provider_id=self.config.provider_id,
+            endpoint=dispatch_url,
+            local_date=local_date.isoformat(),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            **run_info,
+        )
+        return payload, run_info
 
     @staticmethod
     def _format_time_info(first_time: str, last_time: str) -> str:

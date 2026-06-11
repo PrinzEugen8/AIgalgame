@@ -20,6 +20,12 @@ import androidx.work.WorkerParameters
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 
+private const val SakuraNotificationChannelId = "sakura"
+
+internal fun shouldMarkProactiveDelivered(pendingEventId: String, notificationPosted: Boolean): Boolean {
+    return pendingEventId.isNotBlank() && notificationPosted
+}
+
 class NotificationWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val prefs = applicationContext.settingsDataStore.data.first()
@@ -30,7 +36,8 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             val state = api.proactivePending()
             val widget = state.optObject("widget")
             val event = state.optObject("event")
-            val eventId = event.optString("proactive_event_id", widget.optString("proactive_event_id"))
+            val pendingEventId = event.optString("proactive_event_id")
+            val widgetEventId = widget.optString("proactive_event_id", pendingEventId)
             val chibiUrl = widget.optString("chibi_url")
             val chibi = if (chibiUrl.isNotBlank()) {
                 try {
@@ -48,17 +55,21 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
                 widget.optString("status", "想聊天"),
                 widget.optString("bubble", "今天也想听你说说话。"),
                 widget.optInt("unread_count", 0),
-                eventId,
+                widgetEventId,
                 chibi
             )
-            if (eventId.isNotBlank()) {
-                if (prefs[booleanPreferencesKey("notifications_enabled")] ?: true) {
+            if (pendingEventId.isNotBlank()) {
+                val notificationPosted = if (prefs[booleanPreferencesKey("notifications_enabled")] ?: true) {
                     notify(event)
+                } else {
+                    false
                 }
-                api.markProactiveDelivered(eventId)
+                if (shouldMarkProactiveDelivered(pendingEventId, notificationPosted)) {
+                    api.markProactiveDelivered(pendingEventId)
+                }
             }
             try {
-                api.prepareOpening(eventId)
+                api.prepareOpening(widgetEventId)
             } catch (_: Exception) {
             }
             Result.success()
@@ -67,14 +78,14 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
         }
     }
 
-    private fun notify(state: JSONObject) {
+    private fun notify(state: JSONObject): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel("sakura", "小樱主动消息", NotificationManager.IMPORTANCE_DEFAULT)
+            val channel = NotificationChannel(SakuraNotificationChannelId, "小樱主动消息", NotificationManager.IMPORTANCE_DEFAULT)
             channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             applicationContext.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            return
+        if (!canPostNotifications()) {
+            return false
         }
         val eventId = state.optString("proactive_event_id")
         val title = state.optString("title", "小樱想和你说话")
@@ -89,7 +100,7 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val notification = NotificationCompat.Builder(applicationContext, "sakura")
+        val notification = NotificationCompat.Builder(applicationContext, SakuraNotificationChannelId)
             .setSmallIcon(R.drawable.ic_stat_sakura)
             .setLargeIcon(largeIcon)
             .setContentTitle(title)
@@ -101,6 +112,29 @@ class NotificationWorker(context: Context, params: WorkerParameters) : Coroutine
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
             .build()
-        NotificationManagerCompat.from(applicationContext).notify(1001, notification)
+        return try {
+            NotificationManagerCompat.from(applicationContext).notify(1001, notification)
+            true
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    private fun canPostNotifications(): Boolean {
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            return false
+        }
+        val compat = NotificationManagerCompat.from(applicationContext)
+        if (!compat.areNotificationsEnabled()) {
+            return false
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = applicationContext.getSystemService(NotificationManager::class.java)
+            val channel = manager.getNotificationChannel(SakuraNotificationChannelId)
+            if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) {
+                return false
+            }
+        }
+        return true
     }
 }

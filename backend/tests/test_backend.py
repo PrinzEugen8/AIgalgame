@@ -22,7 +22,7 @@ from app.database import SessionLocal, init_db  # noqa: E402
 from app.diagnostics import diagnostic_path, diagnostic_span, runtime_logs, write_diagnostic  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import CalendarEvent, Character, Experience, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TrendRadarSnapshot, TtsVoiceProfile, User, UserLocation, WeatherSnapshot  # noqa: E402
-from app.news import sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
+from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
 from app.pipeline import _tts_for_line, handle_event  # noqa: E402
@@ -382,7 +382,7 @@ def test_provider_presets() -> None:
     search_by_provider = {item["provider"]: item for item in payload["search"]}
     assert {"trend_radar", "volc_ark_web_search"}.issubset(search_by_provider)
     trend_fields = {item["name"] for item in search_by_provider["trend_radar"]["fields"]}
-    assert {"cache_minutes", "max_titles", "timeout"}.issubset(trend_fields)
+    assert {"cache_minutes", "max_titles", "github_token", "github_workflow_id", "github_ref", "timeout"}.issubset(trend_fields)
     assert search_by_provider["trend_radar"]["supports_models"] is False
     search_fields = {item["name"] for item in search_by_provider["volc_ark_web_search"]["fields"]}
     assert {"max_keyword", "limit", "max_tool_calls", "user_location"}.issubset(search_fields)
@@ -592,6 +592,204 @@ def test_trend_radar_snapshot_sync_uses_dated_github_raw_db() -> None:
             assert snapshot.local_date == "2026-06-10"
             assert snapshot.generated_at == "2026-06-10T13:00:00+08:00"
             assert calls == ["https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"]
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_dispatch_runs_workflow_and_records_snapshot() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    db_bytes = _trend_radar_sqlite_bytes()
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url)))
+        url = str(request.url)
+        if request.method == "POST":
+            assert url == "https://api.github.com/repos/PrinzEugen8/AI_news/actions/workflows/crawler.yml/dispatches"
+            assert request.headers.get("authorization") == "Bearer github-token"
+            assert json.loads(request.content.decode()) == {"ref": "master"}
+            return httpx.Response(204)
+        if "actions/workflows/crawler.yml/runs" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "workflow_runs": [
+                        {
+                            "id": 27307232211,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "html_url": "https://github.com/PrinzEugen8/AI_news/actions/runs/27307232211",
+                        }
+                    ]
+                },
+            )
+        assert url == "https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db"
+        return httpx.Response(200, content=db_bytes)
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_dispatch_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    secrets={"github_token": "github-token"},
+                    metadata={"cache_minutes": 0, "timeout": 10, "github_dispatch_poll_seconds": 0},
+                ),
+            )
+            snapshot = dispatch_trend_radar_workflow(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T03:00:00+08:00"),
+            )
+            assert snapshot is not None
+            assert snapshot.status == "ok"
+            assert snapshot.local_date == "2026-06-10"
+            assert snapshot.endpoint.endswith("/output/news/2026-06-10.db")
+            assert any(method == "POST" and url.endswith("/dispatches") for method, url in calls)
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_dispatch_missing_token_skips_without_http() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"dispatch without token must not call GitHub: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_dispatch_no_token_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            assert dispatch_trend_radar_workflow(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T03:00:00+08:00"),
+            ) is None
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_404_is_pending_and_can_retry() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    db_bytes = _trend_radar_sqlite_bytes()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(404, text="Not Found")
+        return httpx.Response(200, content=db_bytes)
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_404_retry_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            first = sync_trend_radar_snapshot(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T04:00:00+08:00"),
+                force=True,
+            )
+            second = sync_trend_radar_snapshot(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-10T04:05:00+08:00"),
+                force=False,
+            )
+            assert first is None
+            assert second is not None
+            assert second.status == "ok"
+            assert len(calls) == 2
+            errors = session.execute(
+                select(TrendRadarSnapshot).where(
+                    TrendRadarSnapshot.provider_id == config.provider_id,
+                    TrendRadarSnapshot.local_date == "2026-06-10",
+                    TrendRadarSnapshot.status == "error",
+                )
+            ).scalars().all()
+            assert errors == []
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_trend_radar_news_retries_old_404_and_falls_back_to_latest_ok() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404, text="Not Found")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            config = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_trend_old_404_fallback_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    metadata={"cache_minutes": 0, "timeout": 10},
+                ),
+            )
+            session.add(
+                TrendRadarSnapshot(
+                    snapshot_id=f"trend_old_ok_{suffix}",
+                    provider_id=config.provider_id,
+                    local_date="2026-06-10",
+                    status="ok",
+                    generated_at="2026-06-10T12:00:00+08:00",
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                    endpoint="https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-10.db",
+                    payload_json=json.dumps(_trend_radar_payload(), ensure_ascii=False),
+                )
+            )
+            session.add(
+                TrendRadarSnapshot(
+                    snapshot_id=f"trend_old_404_{suffix}",
+                    provider_id=config.provider_id,
+                    local_date="2026-06-11",
+                    status="error",
+                    generated_at="",
+                    fetched_at=datetime.now(timezone.utc).isoformat(),
+                    endpoint="https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-11.db",
+                    error_message="404 Not Found",
+                    payload_json="{}",
+                )
+            )
+            session.commit()
+            payload = trend_radar_payload_for_news(
+                session,
+                config=config,
+                local_time=datetime.fromisoformat("2026-06-11T04:10:00+08:00"),
+            )
+            assert payload is not None
+            assert payload["generated_at"] == "2026-06-10T12:00:00+08:00"
+            assert calls == ["https://raw.githubusercontent.com/PrinzEugen8/AI_news/master/output/news/2026-06-11.db"]
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -2471,7 +2669,7 @@ def test_proactive_judge_selects_event_without_hard_daily_gap_or_sleep_blocks() 
             session.refresh(user)
             judgement = json.loads(user.proactive_judgement_json)
             assert judgement["selected_event_id"] == selected_event_id
-            assert judgement["next_check_after_minutes"] == 120
+            assert judgement["next_check_after_minutes"] == 30
             assert user.proactive_next_check_at
     finally:
         providers.HTTP_TRANSPORT = None
@@ -2592,6 +2790,69 @@ def test_proactive_next_check_skips_llm_until_due() -> None:
             )
             assert result["event"] is None
             assert calls == 0
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_proactive_next_check_keeps_selected_pending_unread_visible() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"proactive_unread_pending_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"selected unread event should bypass LLM: {request.url}")
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="sakura")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_proactive_unread_pending_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.notifications_enabled = True
+            user.proactive_next_check_at = "2026-06-09T05:00:00+00:00"
+            event = create_proactive_event(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                source_type="memory",
+                source_id=f"selected_pending_{suffix}",
+                title="Unread message",
+                text="Already selected and should keep the widget unread badge.",
+                priority=90,
+                dedupe_key=f"selected_pending_{suffix}",
+                scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+            )
+            user.proactive_judgement_json = json.dumps(
+                {
+                    "status": "decided",
+                    "should_send": True,
+                    "selected_event_id": event.proactive_event_id,
+                    "next_check_after_minutes": 30,
+                },
+                ensure_ascii=False,
+            )
+            session.commit()
+            result = pending_proactive_response(
+                session,
+                user_id=user_id,
+                character_id="sakura",
+                local_time=datetime.fromisoformat("2026-06-09T12:00:00+08:00"),
+                generate_news=False,
+                generate_weather=False,
+            )
+            assert result["event"]["proactive_event_id"] == event.proactive_event_id
+            assert result["widget"]["proactive_event_id"] == event.proactive_event_id
+            assert result["widget"]["unread_count"] == 1
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -2745,6 +3006,12 @@ def test_proactive_pending_and_delivered_routes() -> None:
             assert payload["widget"]["chibi_url"] == "/media/asset_chibi_sakura_widget"
             delivered = client.post(f"/api/proactive/{event_id}/delivered").json()
             assert delivered["event"]["status"] == "delivered"
+            retained = client.get(
+                f"/api/proactive/pending?user_id={user_id}&character_id=sakura&local_time=2026-06-09T12:10:00%2B08:00"
+            ).json()
+            assert retained["event"] is None
+            assert retained["widget"]["proactive_event_id"] == event_id
+            assert retained["widget"]["unread_count"] == 1
         finally:
             providers.HTTP_TRANSPORT = None
 
@@ -3185,7 +3452,7 @@ def test_news_candidate_skips_deduped_trend_radar_topic() -> None:
         providers._TREND_RADAR_CACHE.clear()
 
 
-def test_news_candidate_falls_back_to_ark_when_trend_radar_has_no_match() -> None:
+def test_news_candidate_does_not_call_disabled_ark_when_trend_radar_has_no_match() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     calls: list[str] = []
     providers._TREND_RADAR_CACHE.clear()
@@ -3255,11 +3522,8 @@ def test_news_candidate_falls_back_to_ark_when_trend_radar_has_no_match() -> Non
                 character_id="sakura",
                 local_time=datetime.fromisoformat("2026-06-10T14:00:00+08:00"),
             )
-            assert event is not None
-            payload = json.loads(event.payload_json)
-            assert payload["topic"] == "AI 游戏"
-            assert payload["sources"][0]["published_at"] == "2026-06-10T11:00:00+08:00"
-            assert any(url.endswith("/responses") for url in calls)
+            assert event is None
+            assert calls == ["https://trend.example/api/trends.json"]
     finally:
         providers.HTTP_TRANSPORT = None
         providers._TREND_RADAR_CACHE.clear()
