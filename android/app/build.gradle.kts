@@ -4,14 +4,17 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val aigalgameCompileSdk: Int = (findProperty("aigalgame.compileSdkOverride") as? String)?.toInt() ?: 36
+val aigalgameTargetSdk: Int = (findProperty("aigalgame.targetSdkOverride") as? String)?.toInt() ?: 36
+
 android {
     namespace = "com.aigalgame.demo"
-    compileSdk = 35
+    compileSdk = aigalgameCompileSdk
 
     defaultConfig {
         applicationId = "com.aigalgame.demo"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = aigalgameTargetSdk
         versionCode = 1
         versionName = "0.1.0"
     }
@@ -43,144 +46,65 @@ android {
     }
 }
 
-val requiredLive2DAssets = listOf(
-    "src/main/assets/live2d-web/index.html",
-    "src/main/assets/live2d-web/stage.js",
-    "src/main/assets/live2d-web/vendor/live2dcubismcore.min.js",
+val officialLive2DRequiredFiles = listOf(
+    "libs/Live2DCubismCore.aar",
+    "src/main/java/com/live2d/sdk/cubism/framework/CubismFramework.java",
+    "src/main/java/com/live2d/sdk/cubism/framework/rendering/android/CubismRendererAndroid.java",
+    "src/main/assets/com/live2d/sdk/cubism/framework/shaders/standardES/VertShaderSrc.vert",
+    "src/main/assets/com/live2d/sdk/cubism/framework/shaders/standardES/FragShaderSrc.frag",
+    "src/main/assets/live2d/models/neko/neko.model3.json",
+    "src/main/assets/live2d/models/neko/neko.moc3",
+    "src/main/assets/live2d/models/neko/neko.physics3.json",
+    "src/main/assets/live2d/models/neko/neko.cdi3.json",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_00.png",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_01.png",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_02.png",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_03.png",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_04.png",
+    "src/main/assets/live2d/models/neko/neko.4096/texture_05.png",
+    "src/main/res/drawable-nodpi/character_atri_idle.png",
+    "src/main/res/drawable-nodpi/character_murasame_idle.png"
+)
+
+val obsoleteLive2DPaths = listOf(
+    "src/main/assets/live2d-web",
+    "src/main/assets/live2d/models/Haru",
     "src/main/assets/live2d-web/vendor/pixi.min.js",
-    "src/main/assets/live2d-web/vendor/cubism4.min.js",
-    "src/main/assets/live2d/models/Haru/Haru.model3.json",
-    "src/main/assets/live2d/models/Haru/Haru.moc3",
-    "src/main/assets/live2d/models/Haru/Haru.physics3.json",
-    "src/main/assets/live2d/models/Haru/Haru.pose3.json",
-    "src/main/assets/live2d/models/Haru/Haru.2048/texture_00.png",
-    "src/main/assets/live2d/models/Haru/Haru.2048/texture_01.png",
-    "src/main/assets/live2d/models/Haru/expressions/F01.exp3.json",
-    "src/main/assets/live2d/models/Haru/motions/haru_g_idle.motion3.json",
-    "src/main/assets/live2d/models/Haru/motions/haru_g_m26.motion3.json"
+    "src/main/assets/live2d-web/vendor/cubism4.min.js"
 )
 
-val forbiddenLive2DAssets = listOf(
-    "src/main/assets/live2d-web/official/index.html",
-    "src/main/assets/live2d-web/official/official-stage.js",
-    "src/main/assets/live2d/sdk/live2dcubismcore.min.js",
-    "src/main/assets/live2d/samples",
-    "src/main/assets/live2d-web/fallbacks",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_00.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_01.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_02.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_03.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_04.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_05.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_06.png",
-    "src/main/res/drawable-nodpi/live2d_haru_fallback_07.png"
-)
-
-tasks.register("verifyLive2DAssets") {
+tasks.register("verifyOfficialLive2DAssets") {
     group = "verification"
-    description = "Checks that the offline Live2D Web runtime and fallback model are packaged."
+    description = "Checks the official Android Live2D runtime, NEKO model, and static PNG fallback assets."
     doLast {
-        val missing = requiredLive2DAssets.filterNot { layout.projectDirectory.file(it).asFile.exists() }
+        val missing = officialLive2DRequiredFiles.filterNot { layout.projectDirectory.file(it).asFile.exists() }
         if (missing.isNotEmpty()) {
-            throw GradleException("Missing Live2D assets: ${missing.joinToString()}")
+            throw GradleException("Missing official Live2D assets: ${missing.joinToString()}")
         }
-        val forbidden = forbiddenLive2DAssets.filter { layout.projectDirectory.file(it).asFile.exists() }
-        if (forbidden.isNotEmpty()) {
-            throw GradleException("Remove obsolete Live2D renderer assets: ${forbidden.joinToString()}")
-        }
-        val stageJs = layout.projectDirectory.file("src/main/assets/live2d-web/stage.js").asFile.readText()
-        if ("live2d/samples/" in stageJs) {
-            throw GradleException("Live2D stage.js must default to live2d/models, not live2d/samples")
-        }
-        if ("getLocalBounds" !in stageJs || "pivot.set" !in stageJs) {
-            throw GradleException("Live2D stage.js must use bounds-based pivot fitting")
-        }
-        if ("modelBaseHeight" in stageJs || "modelBaseWidth" in stageJs) {
-            throw GradleException("Live2D stage.js must not use the obsolete modelBase width/height fit")
-        }
-        if (
-            "transparent: true" !in stageJs ||
-            "backgroundAlpha: 0" !in stageJs ||
-            "app.renderer.backgroundAlpha = 0" !in stageJs ||
-            "webBackgroundDisabled: true" !in stageJs
-        ) {
-            throw GradleException("Live2D stage.js must keep the WebView/WebGL surface transparent and let Compose own the background")
-        }
-        if ("preferWebGLVersion: 1" !in stageJs || "PIXI.settings.PREFER_ENV" !in stageJs) {
-            throw GradleException("Live2D stage.js must force Pixi onto the WebGL1 path for Android WebView")
-        }
-        if ("ENABLE_DOM_PRESENTER = true" !in stageJs || "notifyPresented(\"dom-presenter\")" !in stageJs) {
-            throw GradleException("Live2D stage.js must present verified model frames through the guarded DOM presenter")
-        }
-        if ("MODEL_PIXEL_THRESHOLD" !in stageJs || "waiting-model-pixels" !in stageJs || "modelPixelReady" !in stageJs) {
-            throw GradleException("Live2D stage.js must gate presentation on real model pixels, not opaque background alpha")
-        }
-        if ("onPresented" !in stageJs) {
-            throw GradleException("Live2D stage.js must notify Android when WebGL is presented")
-        }
-        val indexHtml = layout.projectDirectory.file("src/main/assets/live2d-web/index.html").asFile.readText()
-        if ("present-canvas" !in indexHtml || "present-image" !in indexHtml) {
-            throw GradleException("Live2D index.html must keep presenter elements for diagnostics")
-        }
-        val hiddenPresenterPattern = Regex(
-            "#present-(canvas|image)\\s*\\{[^}]*display\\s*:\\s*none",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        )
-        if ("#present-canvas" !in indexHtml || "#present-image" !in indexHtml || hiddenPresenterPattern.containsMatchIn(indexHtml)) {
-            throw GradleException("Live2D presenter layers must stay displayable and hide only with visibility/opacity")
-        }
-        if ("fallback-image" in indexHtml || "src=\"./fallbacks/haru-stage.png\"" in indexHtml) {
-            throw GradleException("Live2D Web stage must not use a static PNG character fallback")
-        }
-        if ("presentCanvas.style.display = \"block\"" !in stageJs || "presentImage.style.display = \"block\"" !in stageJs) {
-            throw GradleException("Live2D presenter JS must restore display:block when exposing verified model frames")
-        }
-        if ("setFallbackVisible" in stageJs || "presentCanvas.toDataURL" in stageJs) {
-            throw GradleException("Live2D presenter must make the high-resolution canvas primary and stop using image snapshots as the main display")
-        }
-        if (
-            "presenterCanvasFrames" !in stageJs ||
-            "modelPixelHits" !in stageJs ||
-            "stageVersion: STAGE_VERSION" !in stageJs
-        ) {
-            throw GradleException("Live2D presenter must send trusted canvas/model-pixel diagnostics to Android")
-        }
-        if ("idleMotionEnabled" !in stageJs || "stopAllMotions(\"idle-disabled\")" !in stageJs) {
-            throw GradleException("Live2D stage.js must disable looping body idle motion by default")
-        }
-        if ("model-pixels" !in indexHtml) {
-            throw GradleException("Live2D self-test must expose model pixel diagnostics")
+        val obsolete = obsoleteLive2DPaths.filter { layout.projectDirectory.file(it).asFile.exists() }
+        if (obsolete.isNotEmpty()) {
+            throw GradleException("Remove obsolete Web/Pixi/Haru Live2D assets: ${obsolete.joinToString()}")
         }
         val stageKt = layout.projectDirectory.file("src/main/java/com/aigalgame/demo/Live2DStage.kt").asFile.readText()
-        if ("val useNativeVisibilityGuard = stageMode == \"home\"" in stageKt) {
-            throw GradleException("Home must not permanently pin the native PNG fallback above the WebView")
+        val configKt = layout.projectDirectory.file("src/main/java/com/aigalgame/demo/Live2DConfig.kt").asFile.readText()
+        val forbiddenStageTokens = listOf("WebView", "android.webkit", "live2d-web", "pixi", "Pixi", "Haru")
+        val offenders = forbiddenStageTokens.filter { it in stageKt || it in configKt }
+        if (offenders.isNotEmpty()) {
+            throw GradleException("Official renderer source still references obsolete Live2D Web/Haru tokens: ${offenders.joinToString()}")
         }
-        if (
-            "Live2DPresentationReport" !in stageKt ||
-            "report.isTrusted" !in stageKt
-        ) {
-            throw GradleException("Home must trust only verified Web presenter reports")
-        }
-        if (
-            "NativeHaruLive2DFallback" in stageKt ||
-            "R.drawable.live2d_haru_fallback" in stageKt ||
-            "showNativeFallback" in stageKt ||
-            "NativeHaruFallbackFrames" in stageKt ||
-            "R.drawable.live2d_haru_fallback_00" in stageKt ||
-            "delay(160L)" in stageKt
-        ) {
-            throw GradleException("Home must not use PNG character fallbacks")
+        if ("OfficialLive2DView" !in stageKt || "CharacterStandee(" !in stageKt) {
+            throw GradleException("Live2DStage must use the official Android view and keep the static PNG fallback.")
         }
     }
 }
 
 tasks.named("preBuild") {
-    dependsOn("verifyLive2DAssets")
+    dependsOn("verifyOfficialLive2DAssets")
 }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    implementation(platform("com.google.firebase:firebase-bom:34.0.0"))
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
@@ -191,9 +115,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.media3:media3-datasource-okhttp:1.5.1")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
-    implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation("com.google.firebase:firebase-messaging")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation(files("libs/Live2DCubismCore.aar"))
 
     testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")

@@ -1,50 +1,47 @@
 package com.aigalgame.demo
 
-import android.annotation.SuppressLint
-import android.content.Context
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.view.View
-import android.webkit.ConsoleMessage
-import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
-import androidx.webkit.WebViewAssetLoader
-import kotlinx.coroutines.delay
-import org.json.JSONObject
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.aigalgame.demo.live2d.OfficialLive2DRendererStatus
+import com.aigalgame.demo.live2d.OfficialLive2DView
+import java.util.concurrent.atomic.AtomicReference
 
 private val Live2DStageBaseHeight = 650.dp
-private const val Live2DWebTag = "Live2DWebStage"
-private const val Live2DWebStageVersion = "pixi-cubism-runtime-v11-presenter-primary"
-private const val Live2DWebStageUrl = "https://appassets.androidplatform.net/assets/live2d-web/index.html?v=pixi-cubism-runtime-v11-presenter-primary"
-private const val Live2DWebClassroomBackground = "live2d-web/backgrounds/classroom.png"
-private const val Live2DDefaultModelAssetPath = "live2d/models/Haru/Haru.model3.json"
-private const val Live2DWebSurfaceColor = 0x00000000
-private const val Live2DPresenterModelPixelThreshold = 64
+private const val Live2DTag = "OfficialLive2DStage"
 
 @Composable
 fun Live2DStage(
@@ -67,10 +64,12 @@ fun Live2DStage(
     val controller = remember(character) { Live2DController(context, character) }
     val state = controller.state
     val density = LocalDensity.current
-    val stagePlacement = placement.coerceForStage()
-    var gesturePlacement by remember(stagePlacement) { mutableStateOf(stagePlacement) }
-    var webStageFailed by remember(character) { mutableStateOf(false) }
-    var webStagePresented by remember(character) { mutableStateOf(false) }
+    val initialPlacement = placement.coerceForStage()
+    var gesturePlacement by remember(character, initialPlacement) { mutableStateOf(initialPlacement) }
+    val effectivePlacement = if (editable) gesturePlacement else initialPlacement
+    var live2dFailed by remember(character) { mutableStateOf(false) }
+    var live2dReady by remember(character) { mutableStateOf(false) }
+    var lastRendererError by remember(character) { mutableStateOf("") }
 
     LaunchedEffect(character, line?.id, emotion, pose) {
         if (line != null) {
@@ -82,18 +81,12 @@ fun Live2DStage(
     LaunchedEffect(speechState.active, speechState.mouthOpen) {
         controller.updateSpeech(speechState)
     }
-    LaunchedEffect(state.modelAssetPath) {
-        webStageFailed = false
-        webStagePresented = false
+    LaunchedEffect(state.modelAssetPath, state.rendererMode) {
+        live2dFailed = false
+        live2dReady = false
+        lastRendererError = ""
     }
-    LaunchedEffect(state.canRenderLive2D, state.modelAssetPath, webStagePresented) {
-        if (state.canRenderLive2D && !webStagePresented) {
-            delay(4500L)
-            if (!webStagePresented) {
-                Log.e(Live2DWebTag, "Live2D presenter trust timed out; keeping WebView visible")
-            }
-        }
-    }
+
     val transformState = rememberTransformableState { zoomChange, panChange, _ ->
         if (!editable || onPlacementChange == null) return@rememberTransformableState
         val dx = with(density) { panChange.x.toDp().value }
@@ -117,33 +110,81 @@ fun Live2DStage(
         if (reaction != null) onReaction(reaction)
     }
 
-    val useWebStage = state.canRenderLive2D && !webStageFailed
+    val useLive2D = state.canRenderLive2D && !live2dFailed && state.character == "neko"
+    val fallbackCharacter = if (state.rendererMode == CharacterRendererMode.Live2D) {
+        state.staticFallbackCharacter
+    } else {
+        state.character
+    }
 
-    Box(modifier) {
+    BoxWithConstraints(modifier) {
         SakuraSceneBackground(background)
-        if (useWebStage) {
-            Live2DWebStage(
-                state = state,
-                background = background,
-                placement = stagePlacement,
-                editable = editable,
-                stageMode = stageMode,
+        if (useLive2D) {
+            val desiredLive2DHeight = baseHeight * effectivePlacement.scale + effectivePlacement.bottomInset.dp
+            val live2DViewportHeight = if (maxHeight < desiredLive2DHeight) maxHeight else desiredLive2DHeight
+            OfficialLive2DAndroidStage(
+                command = state.toCommand(effectivePlacement, interactive = !editable),
                 onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
-                onError = {
-                    Log.e(Live2DWebTag, it)
-                    webStageFailed = true
+                onStatus = { status ->
+                    if (status.modelLoaded && status.drawableCount > 0) {
+                        live2dReady = true
+                    }
+                    Log.d(Live2DTag, "${stageMode}: ${status.summary()}")
                 },
-                onPresented = { report ->
-                    webStagePresented = true
-                    Log.d(
-                        Live2DWebTag,
-                        "presented ${report.mode} frames=${report.presenterCanvasFrames} pixels=${report.modelPixelHits}"
-                    )
+                onError = { error ->
+                    lastRendererError = error
+                    live2dFailed = true
+                    Log.e(Live2DTag, error)
                 },
                 modifier = Modifier
-                    .fillMaxSize()
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(live2DViewportHeight)
                     .zIndex(1f)
             )
+            if (live2dReady && !editable) {
+                StageTapLayer(
+                    onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(1.2f)
+                )
+            }
+        }
+        if (useLive2D && !live2dReady && !live2dFailed) {
+            Live2DLoadingLayer(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 110.dp)
+                    .zIndex(2f)
+            )
+        }
+        if (!useLive2D || live2dFailed) {
+            StaticCharacterStageLayer(
+                character = fallbackCharacter,
+                emotion = expressionToEmotion(state.expression),
+                pose = pose,
+                placement = effectivePlacement,
+                baseHeight = baseHeight,
+                interactive = !editable,
+                onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(if (useLive2D) 2f else 1f)
+            )
+            if (lastRendererError.isNotBlank() && (stageMode == "selftest" || stageMode == "home")) {
+                Text(
+                    text = lastRendererError,
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(10.dp)
+                        .background(Color(0x99000000))
+                        .padding(8.dp)
+                        .zIndex(3f)
+                )
+            }
         }
         if (editable && onPlacementChange != null) {
             Box(
@@ -162,372 +203,196 @@ fun Live2DStage(
 
 @Composable
 fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
-    val state = remember {
-        Live2DRenderState(
-            character = "selftest",
-            modelAssetPath = Live2DDefaultModelAssetPath,
-            modelAssetPresent = true,
-            rendererAvailable = true,
-            statusMessage = "Live2D Pixi runtime self test"
+    var status by remember { mutableStateOf<OfficialLive2DRendererStatus?>(null) }
+    var error by remember { mutableStateOf("") }
+    val command = remember {
+        Live2DRenderCommand(
+            characterId = "neko",
+            emotion = "happy",
+            motion = "selftest",
+            mouthOpen = 0.55f,
+            speaking = true,
+            lookX = 0.25f,
+            lookY = 0.05f,
+            placement = OutfitPlacement(scale = 1.08f, offsetY = -10f, bottomInset = 24f),
+            interactive = true,
+            commandNonce = 1L
         )
     }
     Box(modifier) {
-        Live2DWebStage(
-            state = state,
-            background = "classroom",
-            placement = OutfitPlacement(scale = 1.0f, offsetY = 0f, bottomInset = 0f),
-            editable = false,
-            stageMode = "selftest",
+        SakuraSceneBackground("classroom")
+        OfficialLive2DAndroidStage(
+            command = command,
             onTap = { _, _ -> },
-            onError = { Log.e(Live2DWebTag, it) },
-            onPresented = { report ->
-                Log.d(
-                    Live2DWebTag,
-                    "selftest presented ${report.mode} frames=${report.presenterCanvasFrames} pixels=${report.modelPixelHits}"
-                )
-            },
+            onStatus = { status = it },
+            onError = { error = it },
             modifier = Modifier
                 .fillMaxSize()
                 .zIndex(1f)
         )
+        Text(
+            text = status?.summary() ?: "SDK/Core loaded=false, model loaded=false, drawable count=0, GL lifecycle=booting",
+            color = Color.White,
+            fontSize = 12.sp,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(10.dp)
+                .background(Color(0x99000000))
+                .padding(8.dp)
+                .zIndex(2f)
+        )
+        if (error.isNotBlank()) {
+            CharacterStandee(
+                character = "atri",
+                emotion = "calm",
+                pose = "idle",
+                placement = OutfitPlacement(scale = 1.0f, bottomInset = 20f),
+                baseHeight = Live2DStageBaseHeight,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .zIndex(1.5f)
+            )
+        }
     }
 }
 
-@SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun Live2DWebStage(
-    state: Live2DRenderState,
-    background: String,
-    placement: OutfitPlacement,
-    editable: Boolean,
-    stageMode: String,
+private fun OfficialLive2DAndroidStage(
+    command: Live2DRenderCommand,
     onTap: (Float, Float) -> Unit,
+    onStatus: (OfficialLive2DRendererStatus) -> Unit,
     onError: (String) -> Unit,
-    onPresented: (Live2DPresentationReport) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var ready by remember { mutableStateOf(false) }
-    val latestOnTap = rememberUpdatedState(onTap)
-    val latestOnError = rememberUpdatedState(onError)
-    val latestOnPresented = rememberUpdatedState(onPresented)
-    val backgroundAssetPath = remember(background) { live2DWebBackgroundAssetPath(background) }
-    val webState = remember(state, placement, editable, stageMode, backgroundAssetPath) {
-        state.toLive2DWebStateJson(
-            placement = placement,
-            editable = editable,
-            stageMode = stageMode,
-            backgroundAssetPath = backgroundAssetPath
-        )
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val live2DViewRef = remember { AtomicReference<OfficialLive2DView?>() }
+
+    DisposableEffect(lifecycleOwner) {
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            live2DViewRef.get()?.onResume()
+        }
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> live2DViewRef.get()?.onResume()
+                Lifecycle.Event.ON_PAUSE -> live2DViewRef.get()?.onPause()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            live2DViewRef.get()?.releaseRenderer()
+            live2DViewRef.get()?.onPause()
+            live2DViewRef.set(null)
+        }
     }
 
     AndroidView(
         factory = { context ->
-            if (BuildConfig.DEBUG) {
-                WebView.setWebContentsDebuggingEnabled(true)
-            }
-            val assetLoader = WebViewAssetLoader.Builder()
-                .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
-                .build()
-            Live2DStageWebView(context).apply {
-                setBackgroundColor(Live2DWebSurfaceColor)
-                this.background?.alpha = 0
-                setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                alpha = 1f
-                visibility = View.VISIBLE
-                setWillNotDraw(false)
-                clipToOutline = false
-                clearCache(true)
-                isVerticalScrollBarEnabled = false
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                isLongClickable = false
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.allowFileAccess = true
-                settings.allowContentAccess = true
-                settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?
-                    ): WebResourceResponse? {
-                        return request?.url?.let { assetLoader.shouldInterceptRequest(it) }
+            OfficialLive2DView(context).apply {
+                live2DViewRef.set(this)
+                setStageListener(object : OfficialLive2DView.StageListener {
+                    override fun onStatus(status: OfficialLive2DRendererStatus) {
+                        onStatus(status)
                     }
 
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        Log.i(Live2DWebTag, "page finished: ${url.orEmpty()}")
-                        (view as? Live2DStageWebView)?.retryLastStateAfterPageFinished()
+                    override fun onError(error: String) {
+                        onError(error)
                     }
-
-                    override fun onReceivedError(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                        error: WebResourceError?
-                    ) {
-                        if (request?.isForMainFrame == true) {
-                            latestOnError.value(
-                                error?.description?.toString().orEmpty()
-                                    .ifBlank { "WebView load error" }
-                            )
-                        }
-                    }
+                })
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    onResume()
                 }
-                webChromeClient = object : WebChromeClient() {
-                    override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                        consoleMessage?.let {
-                            Log.d(
-                                Live2DWebTag,
-                                "${it.message()} @ ${it.sourceId()}:${it.lineNumber()}"
-                            )
-                        }
-                        return true
-                    }
-                }
-                addJavascriptInterface(
-                    Live2DWebBridge(
-                        onReady = { ready = true },
-                        onTap = { normalizedX, normalizedY -> latestOnTap.value(normalizedX, normalizedY) },
-                        onError = { latestOnError.value(it) },
-                        onPresented = { report -> latestOnPresented.value(report) },
-                        onDebug = { Log.d(Live2DWebTag, it) }
-                    ),
-                    "AndroidLive2D"
-                )
-                loadUrl(Live2DWebStageUrl)
             }
         },
-        update = { webView ->
-            webView.alpha = 1f
-            webView.visibility = View.VISIBLE
-            webView.setBackgroundColor(Live2DWebSurfaceColor)
-            webView.background?.alpha = 0
-            webView.invalidate()
-            webView.isClickable = !editable
-            val setStateScript = "window.AiriLive2D && window.AiriLive2D.setState($webState);"
-            (webView as Live2DStageWebView).submitLive2DState(setStateScript)
-            if (ready) {
-                webView.evaluateJavascript(
-                    "window.AiriLive2D && window.AiriLive2D.setInteractive(${(!editable).toString()});",
-                    null
-                )
-            }
+        update = { view ->
+            view.setStageListener(object : OfficialLive2DView.StageListener {
+                override fun onStatus(status: OfficialLive2DRendererStatus) {
+                    onStatus(status)
+                }
+
+                override fun onError(error: String) {
+                    onError(error)
+                }
+            })
+            view.isClickable = false
+            view.isFocusable = false
+            view.submitCommand(command)
         },
         modifier = modifier
     )
 }
 
-private class Live2DStageWebView(context: Context) : WebView(context) {
-    private var lastStateScript: String = ""
-    private var bootRetriesScheduled = false
-
-    fun submitLive2DState(script: String) {
-        lastStateScript = script
-        evaluateJavascript(script, null)
-        if (!bootRetriesScheduled) {
-            bootRetriesScheduled = true
-            scheduleStateRetry(250L)
-            scheduleStateRetry(1000L)
-            scheduleStateRetry(2000L)
-            scheduleStateRetry(4000L)
-        }
-    }
-
-    fun retryLastStateAfterPageFinished() {
-        scheduleStateRetry(0L)
-        scheduleStateRetry(250L)
-        scheduleStateRetry(1000L)
-        scheduleDebugStateProbe(1500L)
-        scheduleDebugStateProbe(5000L)
-        scheduleDebugStateProbe(9000L)
-    }
-
-    private fun scheduleStateRetry(delayMs: Long) {
-        postDelayed(
-            {
-                if (lastStateScript.isNotBlank()) {
-                    evaluateJavascript(lastStateScript, null)
-                }
-            },
-            delayMs
-        )
-    }
-
-    private fun scheduleDebugStateProbe(delayMs: Long) {
-        postDelayed(
-            {
-                evaluateJavascript(
-                    "window.AiriLive2D && JSON.stringify(window.AiriLive2D.getDebugState && window.AiriLive2D.getDebugState());"
-                ) { result ->
-                    Log.i(Live2DWebTag, "debug state ${delayMs}ms: $result")
-                }
-            },
-            delayMs
+@Composable
+private fun Live2DLoadingLayer(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .background(Color(0x66000000), RoundedCornerShape(999.dp))
+            .padding(12.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(28.dp),
+            color = Color.White,
+            strokeWidth = 2.dp
         )
     }
 }
 
-private class Live2DWebBridge(
-    private val onReady: () -> Unit,
-    private val onTap: (Float, Float) -> Unit,
-    private val onError: (String) -> Unit,
-    private val onPresented: (Live2DPresentationReport) -> Unit,
-    private val onDebug: (String) -> Unit
+@Composable
+private fun StageTapLayer(
+    onTap: (Float, Float) -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun onReady(payload: String?) {
-        mainHandler.post {
-            onDebug("ready")
-            onReady()
-        }
-    }
-
-    @JavascriptInterface
-    fun onModelLoaded(payload: String?) {
-        mainHandler.post { onDebug("model loaded: ${payload.orEmpty()}") }
-    }
-
-    @JavascriptInterface
-    fun onError(message: String?) {
-        mainHandler.post { onError(message.orEmpty().ifBlank { "Live2D Web stage error" }) }
-    }
-
-    @JavascriptInterface
-    fun onPresented(payload: String?) {
-        mainHandler.post {
-            onDebug("presented: ${payload.orEmpty()}")
-            val report = Live2DPresentationReport.fromPayload(payload)
-            if (report.isTrusted) {
-                onPresented(report)
-            } else {
-                onDebug("presented ignored: ${report.reason}")
+    Box(
+        modifier.pointerInput(Unit) {
+            detectTapGestures { offset ->
+                onTap(
+                    offset.x / size.width.coerceAtLeast(1).toFloat(),
+                    offset.y / size.height.coerceAtLeast(1).toFloat()
+                )
             }
         }
-    }
-
-    @JavascriptInterface
-    fun onDebug(message: String?) {
-        mainHandler.post { onDebug(message.orEmpty()) }
-    }
-
-    @JavascriptInterface
-    fun onTap(payload: String?) {
-        val json = runCatching { JSONObject(payload.orEmpty()) }.getOrNull() ?: return
-        val normalizedX = json.optDouble("normalizedX", 0.5).toFloat()
-        val normalizedY = json.optDouble("normalizedY", 0.5).toFloat()
-        mainHandler.post { onTap(normalizedX, normalizedY) }
-    }
+    )
 }
 
-private data class Live2DPresentationReport(
-    val mode: String,
-    val stageVersion: String,
-    val presenterCanvasFrames: Int,
-    val presenterImageFrames: Int,
-    val modelPixelHits: Int,
-    val modelPixelReady: Boolean,
-    val presenterWidth: Int,
-    val presenterHeight: Int,
-    val stageWidth: Int,
-    val stageHeight: Int,
-    val reason: String
-) {
-    val isTrusted: Boolean
-        get() = reason.isBlank()
-
-    companion object {
-        fun fromPayload(payload: String?): Live2DPresentationReport {
-            val json = runCatching { JSONObject(payload.orEmpty()) }.getOrNull()
-                ?: return invalid("invalid-json")
-            val pixelProbe = json.optJSONObject("pixelProbe")
-            val report = Live2DPresentationReport(
-                mode = json.optString("mode"),
-                stageVersion = json.optString("stageVersion"),
-                presenterCanvasFrames = json.optInt(
-                    "presenterCanvasFrames",
-                    json.optInt("presenterFrames", 0)
-                ),
-                presenterImageFrames = json.optInt("presenterImageFrames", 0),
-                modelPixelHits = json.optInt(
-                    "modelPixelHits",
-                    pixelProbe?.optInt("modelHits", 0) ?: 0
-                ),
-                modelPixelReady = json.optBoolean(
-                    "modelPixelReady",
-                    pixelProbe?.optBoolean("modelPixelReady", false) ?: false
-                ),
-                presenterWidth = json.optInt("presenterWidth", 0),
-                presenterHeight = json.optInt("presenterHeight", 0),
-                stageWidth = json.optInt("stageWidth", 0),
-                stageHeight = json.optInt("stageHeight", 0),
-                reason = ""
-            )
-            return report.copy(reason = report.validationFailure())
-        }
-
-        private fun invalid(reason: String): Live2DPresentationReport {
-            return Live2DPresentationReport(
-                mode = "",
-                stageVersion = "",
-                presenterCanvasFrames = 0,
-                presenterImageFrames = 0,
-                modelPixelHits = 0,
-                modelPixelReady = false,
-                presenterWidth = 0,
-                presenterHeight = 0,
-                stageWidth = 0,
-                stageHeight = 0,
-                reason = reason
-            )
-        }
-    }
-
-    private fun validationFailure(): String {
-        return when {
-            stageVersion != Live2DWebStageVersion -> "stage-version-$stageVersion"
-            mode != "dom-presenter" -> "mode-$mode"
-            presenterCanvasFrames <= 0 -> "no-presenter-canvas-frame"
-            !modelPixelReady -> "model-pixels-not-ready"
-            modelPixelHits < Live2DPresenterModelPixelThreshold -> "model-pixels-$modelPixelHits"
-            presenterWidth <= 0 || presenterHeight <= 0 -> "presenter-size-${presenterWidth}x$presenterHeight"
-            stageWidth <= 0 || stageHeight <= 0 -> "stage-size-${stageWidth}x$stageHeight"
-            else -> ""
-        }
-    }
-}
-
-private fun Live2DRenderState.toLive2DWebStateJson(
+@Composable
+private fun StaticCharacterStageLayer(
+    character: String,
+    emotion: String,
+    pose: String,
     placement: OutfitPlacement,
-    editable: Boolean,
-    stageMode: String,
-    backgroundAssetPath: String
-): String {
-    val placementJson = JSONObject()
-        .put("scale", placement.scale.toDouble())
-        .put("offsetX", placement.offsetX.toDouble())
-        .put("offsetY", placement.offsetY.toDouble())
-        .put("bottomInset", placement.bottomInset.toDouble())
-    val focusJson = JSONObject()
-        .put("x", lookX.toDouble())
-        .put("y", lookY.toDouble())
-    return JSONObject()
-        .put("stageVersion", Live2DWebStageVersion)
-        .put("modelSrc", modelAssetPath)
-        .put("backgroundSrc", backgroundAssetPath)
-        .put("expression", expression)
-        .put("motion", motion)
-        .put("commandNonce", commandNonce)
-        .put("idleMotionEnabled", false)
-        .put("nowSpeaking", nowSpeaking)
-        .put("mouthOpenSize", mouthOpen.toDouble())
-        .put("focusAt", focusJson)
-        .put("placement", placementJson)
-        .put("stageMode", stageMode)
-        .put("editable", editable)
-        .toString()
-}
-
-private fun live2DWebBackgroundAssetPath(background: String): String {
-    return ""
+    baseHeight: Dp,
+    interactive: Boolean,
+    onTap: (Float, Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier.then(
+            if (interactive) {
+                Modifier.pointerInput(character, emotion, pose) {
+                    detectTapGestures { offset ->
+                        onTap(
+                            offset.x / size.width.coerceAtLeast(1).toFloat(),
+                            offset.y / size.height.coerceAtLeast(1).toFloat()
+                        )
+                    }
+                }
+            } else {
+                Modifier
+            }
+        )
+    ) {
+        CharacterStandee(
+            character = character,
+            emotion = emotion,
+            pose = pose,
+            placement = placement,
+            baseHeight = baseHeight,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+        )
+    }
 }

@@ -1,3 +1,1 @@
--keepclassmembers class * {
-    @android.webkit.JavascriptInterface <methods>;
-}
+# Official Live2D Android rendering uses the native Cubism Java renderer.

@@ -8,138 +8,101 @@ import org.junit.Test
 
 class Live2DConfigTest {
     @Test
-    fun charactersUseHaruAsFallbackModel() {
-        assertEquals(
-            "live2d/models/Haru/Haru.model3.json",
-            Live2DCharacterConfigs.forCharacter("atri").fallbackModelAssetPath
-        )
-        assertEquals(
-            "live2d/models/Haru/Haru.model3.json",
-            Live2DCharacterConfigs.forCharacter("murasame").fallbackModelAssetPath
-        )
+    fun defaultCharacterIsNekoLive2D() {
+        assertEquals("neko", Live2DCharacterConfigs.DefaultCharacter)
+
+        val config = Live2DCharacterConfigs.forCharacter("missing")
+
+        assertEquals("neko", config.character)
+        assertEquals(CharacterRendererMode.Live2D, config.rendererMode)
+        assertEquals("atri", config.staticFallbackCharacter)
+        assertEquals("live2d/models/neko/neko.model3.json", config.modelAssetPath)
     }
 
     @Test
-    fun modelConfigUsesOfflineHaruSample() {
-        val config = Live2DCharacterConfigs.forCharacter("atri").modelConfig
+    fun nekoRequiredAssetsArePackaged() {
+        val required = Live2DCharacterConfigs.NekoRequiredModelAssetPaths +
+            Live2DCharacterConfigs.OfficialShaderAssetPath
 
-        assertEquals("Haru", config.name)
-        assertEquals("live2d/models/Haru/Haru.model3.json", config.assetPath)
-        assertEquals("Idle", config.idleMotionGroupName)
-        assertTrue(config.emotionMap.containsKey("happy"))
-        assertTrue(config.tapMotions.any { it.hitArea == "head" })
-    }
-
-    @Test
-    fun runtimeUsesPackagedPixiStageAssets() {
-        assertEquals("live2d-web/index.html", Live2DCharacterConfigs.OfficialStageAssetPath)
-        assertEquals("live2d-web/vendor/live2dcubismcore.min.js", Live2DCharacterConfigs.OfficialCoreAssetPath)
-        assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/pixi.min.js"))
-        assertTrue(Live2DCharacterConfigs.RequiredRuntimeAssetPaths.contains("live2d-web/vendor/cubism4.min.js"))
-    }
-
-    @Test
-    fun webStageUsesSinglePackagedModelEntry() {
-        val stageJs = File("src/main/assets/live2d-web/stage.js").readText()
-
-        assertTrue(stageJs.contains("live2d/models/Haru/Haru.model3.json"))
-        assertFalse(stageJs.contains("live2d/samples/Haru"))
-        assertFalse(File("src/main/assets/live2d/samples").exists())
-        assertFalse(stageJs.contains("setPixiBackground"))
-        assertTrue(stageJs.contains("getLocalBounds"))
-        assertTrue(stageJs.contains("pivot.set"))
-        assertTrue(stageJs.contains("pixi-cubism-runtime-v11-presenter-primary"))
-        assertTrue(stageJs.contains("transparent: true"))
-        assertTrue(stageJs.contains("backgroundAlpha: 0"))
-        assertTrue(stageJs.contains("app.renderer.backgroundAlpha = 0"))
-        assertTrue(stageJs.contains("webBackgroundDisabled: true"))
-        assertTrue(stageJs.contains("preferWebGLVersion: 1"))
-        assertTrue(stageJs.contains("PIXI.settings.PREFER_ENV"))
-        assertTrue(stageJs.contains("ENABLE_DOM_PRESENTER = true"))
-        assertTrue(stageJs.contains("MODEL_PIXEL_THRESHOLD"))
-        assertTrue(stageJs.contains("modelPixelReady"))
-        assertTrue(stageJs.contains("waiting-model-pixels"))
-        assertTrue(stageJs.contains("notifyPresented(\"dom-presenter\")"))
-        assertTrue(stageJs.contains("domPresenterEnabled"))
-        assertTrue(stageJs.contains("onPresented"))
-        assertFalse(stageJs.contains("modelBaseHeight"))
-        assertFalse(stageJs.contains("modelBaseWidth"))
-
-        val indexHtml = File("src/main/assets/live2d-web/index.html").readText()
-        assertTrue(indexHtml.contains("pixi-cubism-runtime-v11-presenter-primary"))
-        assertFalse(indexHtml.contains("fallback-image"))
-        assertFalse(indexHtml.contains("src=\"./fallbacks/haru-stage.png\""))
-        assertTrue(indexHtml.contains("present-canvas"))
-        assertTrue(indexHtml.contains("present-image"))
-        assertTrue(indexHtml.contains("model-pixels"))
-        assertFalse(
-            Regex(
-                "#present-(canvas|image)\\s*\\{[^}]*display\\s*:\\s*none",
-                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-            ).containsMatchIn(indexHtml)
-        )
-        assertTrue(stageJs.contains("presentImage.removeAttribute(\"src\")"))
-        assertTrue(stageJs.contains("presentCanvas.style.display = \"block\""))
-        assertTrue(stageJs.contains("presentImage.style.display = \"block\""))
-        assertFalse(stageJs.contains("setFallbackVisible"))
-        assertFalse(stageJs.contains("presentCanvas.toDataURL"))
-        assertTrue(stageJs.contains("presenterCanvasFrames"))
-        assertTrue(stageJs.contains("modelPixelHits"))
-        assertTrue(stageJs.contains("idleMotionEnabled"))
-        assertTrue(stageJs.contains("stopAllMotions(\"idle-disabled\")"))
-        assertFalse(File("src/main/assets/live2d-web/fallbacks/haru-stage.png").exists())
-        assertFalse(File("src/main/res/drawable-nodpi/live2d_haru_fallback.png").exists())
-    }
-
-    @Test
-    fun webLive2DStageDoesNotUsePngCharacterFallback() {
-        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
-
-        assertTrue(stageKt.contains("val useWebStage = state.canRenderLive2D && !webStageFailed"))
-        assertFalse(stageKt.contains("showNativeFallback"))
-        assertFalse(stageKt.contains("val useNativeVisibilityGuard = stageMode == \"home\""))
-        assertFalse(stageKt.contains("useNativeVisibilityGuard"))
-        assertTrue(stageKt.contains("pixi-cubism-runtime-v11-presenter-primary"))
-        assertTrue(stageKt.contains("private const val Live2DWebSurfaceColor = 0x00000000"))
-        assertTrue(stageKt.contains("Live2DWebStage("))
-        assertTrue(stageKt.contains("webStagePresented = true"))
-        assertTrue(stageKt.contains("delay(4500L)"))
-        assertTrue(stageKt.contains("Live2DPresentationReport"))
-        assertTrue(stageKt.contains("report.isTrusted"))
-        assertTrue(stageKt.contains("presenterCanvasFrames"))
-        assertTrue(stageKt.contains("modelPixelHits"))
-        assertTrue(stageKt.contains(".put(\"idleMotionEnabled\", false)"))
-        assertFalse(stageKt.contains("NativeHaruLive2DFallback"))
-        assertFalse(stageKt.contains("R.drawable.live2d_haru_fallback"))
-        assertTrue(stageKt.contains("presented ${'$'}{report.mode}"))
-        assertFalse(stageKt.contains("CharacterStandee("))
-        assertFalse(stageKt.contains("NativeHaruFallbackFrames"))
-        assertFalse(stageKt.contains("R.drawable.live2d_haru_fallback_00"))
-        assertFalse(stageKt.contains("delay(160L)"))
-        assertEquals(0, Regex("NativeHaruLive2DFallback\\(").findAll(stageKt).count())
-        (0..7).forEach { index ->
-            assertFalse(File("src/main/res/drawable-nodpi/live2d_haru_fallback_%02d.png".format(index)).exists())
+        required.forEach { path ->
+            assertTrue("Missing asset $path", File("src/main/assets/$path").exists())
         }
+        assertTrue(File("libs/Live2DCubismCore.aar").exists())
+        assertTrue(File("src/main/java/com/live2d/sdk/cubism/framework/CubismFramework.java").exists())
+        assertTrue(File("src/main/java/com/live2d/sdk/cubism/framework/rendering/android/CubismRendererAndroid.java").exists())
     }
 
     @Test
-    fun hitAreasCoverExpectedTouchRegions() {
-        val config = Live2DCharacterConfigs.forCharacter("atri")
+    fun staticCharactersStayStaticPng() {
+        val atri = Live2DCharacterConfigs.forCharacter("atri")
+        val murasame = Live2DCharacterConfigs.forCharacter("murasame")
+
+        assertEquals(CharacterRendererMode.StaticPng, atri.rendererMode)
+        assertEquals(CharacterRendererMode.StaticPng, murasame.rendererMode)
+        assertEquals(R.drawable.character_atri_idle, characterImageRes("atri", "calm", "idle"))
+        assertEquals(R.drawable.character_murasame_happy, characterImageRes("murasame", "happy", "idle"))
+    }
+
+    @Test
+    fun obsoleteWebRendererAssetsAreGone() {
+        assertFalse(File("src/main/assets/live2d-web").exists())
+        assertFalse(File("src/main/assets/live2d/models/Haru").exists())
+        assertFalse(File("src/main/assets/live2d-web/vendor/pixi.min.js").exists())
+        assertFalse(File("src/main/assets/live2d-web/vendor/cubism4.min.js").exists())
+    }
+
+    @Test
+    fun live2DStageUsesOfficialRendererAndPngFallback() {
+        val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
+        val configKt = File("src/main/java/com/aigalgame/demo/Live2DConfig.kt").readText()
+
+        listOf(stageKt, configKt).forEach { source ->
+            assertFalse(source.contains("WebView"))
+            assertFalse(source.contains("android.webkit"))
+            assertFalse(source.contains("live2d-web"))
+            assertFalse(source.contains("pixi", ignoreCase = true))
+            assertFalse(source.contains("Haru"))
+        }
+        assertTrue(stageKt.contains("OfficialLive2DView"))
+        assertTrue(stageKt.contains("CharacterStandee("))
+    }
+
+    @Test
+    fun renderCommandFieldsMatchRendererContract() {
+        val command = Live2DRenderCommand(
+            characterId = "neko",
+            emotion = "happy",
+            motion = "TapHead",
+            mouthOpen = 0.4f,
+            speaking = true,
+            lookX = 0.2f,
+            lookY = -0.1f,
+            placement = OutfitPlacement(scale = 1.1f),
+            interactive = true,
+            commandNonce = 42L
+        )
+
+        assertEquals("neko", command.characterId)
+        assertEquals("happy", command.emotion)
+        assertEquals("TapHead", command.motion)
+        assertEquals(0.4f, command.mouthOpen, 0.001f)
+        assertTrue(command.speaking)
+        assertEquals(0.2f, command.lookX, 0.001f)
+        assertEquals(-0.1f, command.lookY, 0.001f)
+        assertEquals(1.1f, command.placement.scale, 0.001f)
+        assertTrue(command.interactive)
+        assertEquals(42L, command.commandNonce)
+    }
+
+    @Test
+    fun hitAreasAndReactionsStayConfigDriven() {
+        val config = Live2DCharacterConfigs.forCharacter("neko")
 
         assertEquals("head", config.hitAreas.first { it.contains(0.5f, 0.2f) }.id)
         assertEquals("chest", config.hitAreas.first { it.contains(0.5f, 0.4f) }.id)
         assertEquals("hand", config.hitAreas.first { it.contains(0.2f, 0.5f) }.id)
-    }
-
-    @Test
-    fun sensitiveAreaReactionsStayConfigDriven() {
-        val reactions = Live2DCharacterConfigs.forCharacter("atri")
-            .reactions
-            .filter { it.hitArea == "chest" }
-
-        assertTrue(reactions.any { it.intensity == Live2DReactionIntensity.Flirty })
-        assertTrue(reactions.any { it.intensity == Live2DReactionIntensity.Boundary })
-        assertTrue(reactions.all { it.localTextCandidates.isNotEmpty() })
+        assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Flirty })
+        assertTrue(config.reactions.any { it.hitArea == "chest" && it.intensity == Live2DReactionIntensity.Boundary })
     }
 
     @Test

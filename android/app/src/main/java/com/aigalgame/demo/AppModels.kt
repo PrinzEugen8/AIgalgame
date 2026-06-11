@@ -61,6 +61,11 @@ data class OutfitPlacement(
     val bottomInset: Float = 48f
 )
 
+enum class CharacterRendererMode {
+    Live2D,
+    StaticPng
+}
+
 enum class Live2DReactionIntensity(val wireName: String) {
     Soft("soft"),
     Flirty("flirty"),
@@ -106,6 +111,19 @@ data class Live2DEmotionBinding(
     val motion: String = ""
 )
 
+data class Live2DRenderCommand(
+    val characterId: String,
+    val emotion: String,
+    val motion: String,
+    val mouthOpen: Float,
+    val speaking: Boolean,
+    val lookX: Float,
+    val lookY: Float,
+    val placement: OutfitPlacement,
+    val interactive: Boolean,
+    val commandNonce: Long
+)
+
 data class Live2DHitArea(
     val id: String,
     val label: String,
@@ -121,6 +139,8 @@ data class Live2DHitArea(
 
 data class Live2DCharacterConfig(
     val character: String,
+    val rendererMode: CharacterRendererMode = CharacterRendererMode.StaticPng,
+    val staticFallbackCharacter: String = character,
     val modelAssetPath: String,
     val fallbackModelAssetPath: String = "",
     val modelConfig: Live2DModelConfig = Live2DModelConfig(

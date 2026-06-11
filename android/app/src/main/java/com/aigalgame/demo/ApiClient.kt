@@ -43,6 +43,40 @@ class ApiClient(private val baseUrl: String) {
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
     suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
+    suspend fun registerDevice(deviceId: String, pushToken: String, notificationsEnabled: Boolean): JSONObject {
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("platform", "android")
+            .put("push_token", pushToken)
+            .put("notifications_enabled", notificationsEnabled)
+            .put("timezone", java.time.ZoneId.systemDefault().id)
+            .put("locale", java.util.Locale.getDefault().toLanguageTag())
+            .put("app_version", BuildConfig.VERSION_NAME)
+        return post("/api/devices/register", body)
+    }
+
+    suspend fun heartbeat(deviceId: String, appState: String, screen: String, idleSeconds: Long, inputActive: Boolean): JSONObject {
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("app_state", appState)
+            .put("screen", screen)
+            .put("idle_seconds", idleSeconds)
+            .put("input_active", inputActive)
+            .put("local_time", OffsetDateTime.now().toString())
+        return post("/api/presence/heartbeat", body)
+    }
+
+    suspend fun foregroundCheck(deviceId: String, screen: String, idleSeconds: Long, inputActive: Boolean): JSONObject {
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("screen", screen)
+            .put("idle_seconds", idleSeconds)
+            .put("input_active", inputActive)
+            .put("session_id", "android")
+            .put("local_time", OffsetDateTime.now().toString())
+        return post("/api/proactive/foreground-check", body)
+    }
+
     suspend fun updateLocation(latitude: Double, longitude: Double, accuracyM: Float, provider: String): JSONObject {
         val body = JSONObject()
             .put("latitude", latitude)

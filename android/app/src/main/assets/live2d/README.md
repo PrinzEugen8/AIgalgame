@@ -1,28 +1,26 @@
 Live2D model assets live here.
 
-Expected layout:
+Expected runtime layout:
 
 live2d/
+  models/
+    neko/
+      neko.model3.json
+      neko.moc3
+      neko.physics3.json
+      neko.cdi3.json
+      neko.4096/
+        texture_00.png
+        texture_01.png
+        texture_02.png
+        texture_03.png
+        texture_04.png
+        texture_05.png
   atri/
-    atri.model3.json
-    atri.moc3
-    textures/
-    motions/
-    expressions/
-    physics.json
+    .gitkeep
   murasame/
-    murasame.model3.json
-    murasame.moc3
-    textures/
-    motions/
-    expressions/
-    physics.json
+    .gitkeep
 
-The app first looks for the configured character model. If it is missing, the
-current configs fall back to the packaged official Cubism SDK sample model:
-
-live2d/models/Haru/Haru.model3.json
-
-The Live2D runtime is packaged as a local WebView/Pixi stage under
-live2d-web/. If both the configured model and fallback model are missing, the
-app falls back to the PNG standee.
+NEKO is rendered through the official Cubism SDK for Java Android renderer.
+ATRI and Murasame stay as PNG standees in res/drawable-nodpi and are also used
+as the fallback path when the Live2D renderer or model fails to initialize.

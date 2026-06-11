@@ -103,6 +103,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -119,6 +120,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -180,8 +182,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        viewModel.recordUserActivity()
         viewModel.syncLocation()
         viewModel.resumeFromForeground()
+    }
+
+    override fun onPause() {
+        viewModel.sendBackgroundHeartbeat()
+        super.onPause()
     }
 }
 
@@ -197,6 +205,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastLocationUploadedAt = 0L
     private var lastLocationUploadLoaded = false
     private var locationUploadInFlight = false
+    private var lastUserActivityAt = System.currentTimeMillis()
+    private var foregroundCheckInFlight = false
 
     var baseUrl by mutableStateOf("")
         private set
@@ -209,7 +219,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var isBusy by mutableStateOf(false)
     var errorMessage by mutableStateOf("")
     var storyCompleted by mutableStateOf(false)
-    var selectedCharacter by mutableStateOf("atri")
+    var selectedCharacter by mutableStateOf("neko")
     var selectedBackground by mutableStateOf("classroom")
     var previewEmotion by mutableStateOf("calm")
     var ttsEnabled by mutableStateOf(true)
@@ -220,6 +230,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var outfitPlacements by mutableStateOf(defaultOutfitPlacements())
     var placementDraft by mutableStateOf<OutfitPlacement?>(null)
+        private set
+    var standeeEditMode by mutableStateOf(false)
         private set
 
     val lines = mutableStateListOf<DialogueLine>()
@@ -242,6 +254,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (saved.isNotBlank()) {
                     api = ApiClient(saved)
                     syncLocation()
+                    registerPushTokenIfAvailable()
                     refreshBootstrap(openAfterBootstrap = pendingProactiveEventId.isBlank())
                     openPendingProactive()
                 } else {
@@ -257,6 +270,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ttsEnabled = saved.ttsEnabled
                 notificationsEnabled = saved.notificationsEnabled
                 outfitPlacements = saved.placements
+                if (notificationsEnabled) registerPushTokenIfAvailable()
             }
         }
     }
@@ -264,6 +278,57 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun currentLine(): DialogueLine? = lines.getOrNull(currentLineIndex)
     fun currentPlacement(): OutfitPlacement = (outfitPlacements[selectedCharacter] ?: defaultOutfitPlacement(selectedCharacter)).coerceForStage()
     fun visiblePlacement(): OutfitPlacement = placementDraft ?: currentPlacement()
+
+    fun recordUserActivity() {
+        lastUserActivityAt = System.currentTimeMillis()
+    }
+
+    private fun idleSeconds(): Long {
+        return ((System.currentTimeMillis() - lastUserActivityAt) / 1000L).coerceAtLeast(0L)
+    }
+
+    private fun registerPushTokenIfAvailable() {
+        if (baseUrl.isBlank() || !notificationsEnabled) return
+        try {
+            FirebaseMessaging.getInstance().token
+                .addOnSuccessListener { token -> registerPushToken(getApplication(), token) }
+                .addOnFailureListener { }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun checkForegroundProactive(inputActive: Boolean = false) {
+        val client = api ?: return
+        if (!storyCompleted || screen != AppScreen.Home || dialogueEventInFlight || foregroundCheckInFlight) return
+        val idle = idleSeconds()
+        if (idle < 30L) return
+        foregroundCheckInFlight = true
+        viewModelScope.launch {
+            try {
+                val deviceId = androidDeviceId(getApplication())
+                client.heartbeat(deviceId, "foreground", screen.name.lowercase(Locale.US), idle, inputActive)
+                val result = client.foregroundCheck(deviceId, screen.name.lowercase(Locale.US), idle, inputActive)
+                if (result.optString("event_type") == "dialogue") {
+                    applyEvent(result)
+                    SakuraWidgetProvider.clearUnread(getApplication())
+                    recordUserActivity()
+                }
+            } catch (_: Exception) {
+            } finally {
+                foregroundCheckInFlight = false
+            }
+        }
+    }
+
+    fun sendBackgroundHeartbeat() {
+        val client = api ?: return
+        viewModelScope.launch {
+            try {
+                client.heartbeat(androidDeviceId(getApplication()), "background", screen.name.lowercase(Locale.US), idleSeconds(), false)
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     fun updateLive2DSpeech(active: Boolean, mouthOpen: Float) {
         live2dSpeechState = Live2DSpeechState(active = active, mouthOpen = mouthOpen.coerceIn(0f, 1f))
@@ -408,6 +473,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun advanceLine() {
+        recordUserActivity()
         if (currentLineIndex < lines.lastIndex) {
             currentLineIndex += 1
         } else if (lines.isNotEmpty()) {
@@ -416,6 +482,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectReply(option: ReplyOption) {
+        recordUserActivity()
         val client = api ?: return
         launchDialogueEvent {
             val type = if (option.type == "key") "option_selected" else "user_message"
@@ -425,6 +492,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendUserMessage(text: String) {
         if (text.isBlank()) return
+        recordUserActivity()
         val client = api ?: return
         launchDialogueEvent {
             applyEvent(client.postEvent("user_message", text = text.trim()))
@@ -555,6 +623,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         placementDraft = currentPlacement()
     }
 
+    fun togglePlacementEdit() {
+        if (standeeEditMode) {
+            commitPlacementEdit()
+            standeeEditMode = false
+        } else {
+            beginPlacementEdit()
+            standeeEditMode = true
+        }
+    }
+
     fun updatePlacementDraft(value: OutfitPlacement) {
         val character = placementDraftCharacter.ifBlank { selectedCharacter }
         val next = value.coerceForStage()
@@ -583,7 +661,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateNotificationsEnabled(value: Boolean) {
         notificationsEnabled = value
-        viewModelScope.launch { settings.saveNotificationsEnabled(value) }
+        viewModelScope.launch {
+            settings.saveNotificationsEnabled(value)
+            if (value) registerPushTokenIfAvailable()
+        }
     }
 
     fun syncLocation(force: Boolean = false) {
@@ -798,13 +879,18 @@ fun GalgameTheme(content: @Composable () -> Unit) {
 
 fun defaultOutfitPlacement(character: String): OutfitPlacement {
     return when (character) {
+        "neko" -> OutfitPlacement(scale = 1.10f, offsetY = -10f, bottomInset = 30f)
         "murasame" -> OutfitPlacement(scale = 1.08f, offsetY = -6f, bottomInset = 42f)
         else -> OutfitPlacement(scale = 1.14f, offsetY = -12f, bottomInset = 34f)
     }
 }
 
 fun defaultOutfitPlacements(): Map<String, OutfitPlacement> {
-    return mapOf("atri" to defaultOutfitPlacement("atri"), "murasame" to defaultOutfitPlacement("murasame"))
+    return mapOf(
+        "neko" to defaultOutfitPlacement("neko"),
+        "atri" to defaultOutfitPlacement("atri"),
+        "murasame" to defaultOutfitPlacement("murasame")
+    )
 }
 
 private val CharacterStageBaseHeight = 650.dp
@@ -818,9 +904,48 @@ fun AiGalgameApp(vm: MainViewModel) {
         } else {
             Scaffold(bottomBar = { AppBottomBar(vm) }) { padding ->
                 Box(Modifier.padding(padding)) {
+                    val sharedStageActive = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
+                    val sharedLine = vm.live2dReactionLine ?: vm.currentLine() ?: vm.lines.lastOrNull()
+                    if (vm.screen == AppScreen.DressUp) {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .background(Color(0xFFFFF7F4))
+                                .zIndex(0f)
+                        )
+                    }
+                    if (sharedStageActive) {
+                        Live2DStage(
+                            background = vm.selectedBackground,
+                            character = vm.selectedCharacter,
+                            emotion = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.emotion ?: "calm",
+                            pose = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.pose ?: "idle",
+                            placement = if (vm.screen == AppScreen.DressUp) vm.currentPlacement() else vm.visiblePlacement(),
+                            speechState = vm.live2dSpeechState,
+                            line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
+                            editable = vm.screen == AppScreen.Home && vm.standeeEditMode,
+                            onPlacementChange = { vm.updatePlacementDraft(it) },
+                            onReaction = { vm.applyLive2DReaction(it) },
+                            relation = vm.relation,
+                            stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
+                            modifier = if (vm.screen == AppScreen.DressUp) {
+                                Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(start = 16.dp, top = 88.dp, end = 16.dp)
+                                    .fillMaxWidth()
+                                    .height(220.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .zIndex(1f)
+                            } else {
+                                Modifier
+                                    .fillMaxSize()
+                                    .zIndex(0f)
+                            }
+                        )
+                    }
                     when (vm.screen) {
-                        AppScreen.Home -> HomeScreen(vm)
-                        AppScreen.DressUp -> DressUpScreen(vm)
+                        AppScreen.Home -> HomeScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
+                        AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
                         AppScreen.Settings -> SettingsScreen(vm)
                         AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
                         AppScreen.Moments -> MomentsScreen(vm)
@@ -831,14 +956,15 @@ fun AiGalgameApp(vm: MainViewModel) {
                         Card(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
-                                .padding(12.dp),
+                                .padding(12.dp)
+                                .zIndex(10f),
                             colors = CardDefaults.cardColors(containerColor = Color(0xFFFFECEF))
                         ) {
                             Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
                         }
                     }
                     if (vm.isBusy) {
-                        LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
+                        LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
                     }
                 }
             }
@@ -962,10 +1088,13 @@ fun AppBottomBar(vm: MainViewModel) {
 }
 
 @Composable
-fun HomeScreen(vm: MainViewModel) {
+fun HomeScreen(
+    vm: MainViewModel,
+    showStage: Boolean = true,
+    modifier: Modifier = Modifier
+) {
     var input by remember { mutableStateOf("") }
     var historyExpanded by remember { mutableStateOf(false) }
-    var standeeEditMode by remember { mutableStateOf(false) }
     val line = vm.currentLine()
     val visibleLine = vm.live2dReactionLine ?: line
     val lastLine = visibleLine ?: vm.lines.lastOrNull()
@@ -973,21 +1102,29 @@ fun HomeScreen(vm: MainViewModel) {
     val keyboardLift = with(density) {
         (WindowInsets.ime.getBottom(this) - WindowInsets.navigationBars.getBottom(this)).coerceAtLeast(0).toDp()
     }
-    Box(Modifier.fillMaxSize()) {
-        Live2DStage(
-            background = vm.selectedBackground,
-            character = vm.selectedCharacter,
-            emotion = lastLine?.emotion ?: "calm",
-            pose = lastLine?.pose ?: "idle",
-            placement = vm.visiblePlacement(),
-            speechState = vm.live2dSpeechState,
-            line = lastLine,
-            editable = standeeEditMode,
-            onPlacementChange = { vm.updatePlacementDraft(it) },
-            onReaction = { vm.applyLive2DReaction(it) },
-            relation = vm.relation,
-            modifier = Modifier.fillMaxSize()
-        )
+    LaunchedEffect(vm.baseUrl, vm.storyCompleted, vm.screen, input) {
+        while (true) {
+            delay(30_000)
+            vm.checkForegroundProactive(inputActive = input.isNotBlank())
+        }
+    }
+    Box(modifier.fillMaxSize()) {
+        if (showStage) {
+            Live2DStage(
+                background = vm.selectedBackground,
+                character = vm.selectedCharacter,
+                emotion = lastLine?.emotion ?: "calm",
+                pose = lastLine?.pose ?: "idle",
+                placement = vm.visiblePlacement(),
+                speechState = vm.live2dSpeechState,
+                line = lastLine,
+                editable = vm.standeeEditMode,
+                onPlacementChange = { vm.updatePlacementDraft(it) },
+                onReaction = { vm.applyLive2DReaction(it) },
+                relation = vm.relation,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         HomeHeader(
             vm = vm,
@@ -996,16 +1133,8 @@ fun HomeScreen(vm: MainViewModel) {
                 .padding(horizontal = 18.dp, vertical = 18.dp)
         )
         HomeStandeeEditBar(
-            editing = standeeEditMode,
-            onToggle = {
-                if (standeeEditMode) {
-                    vm.commitPlacementEdit()
-                    standeeEditMode = false
-                } else {
-                    vm.beginPlacementEdit()
-                    standeeEditMode = true
-                }
-            },
+            editing = vm.standeeEditMode,
+            onToggle = { vm.togglePlacementEdit() },
             onReset = { vm.resetPlacement() },
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -1016,7 +1145,10 @@ fun HomeScreen(vm: MainViewModel) {
             vm = vm,
             line = visibleLine,
             input = input,
-            onInputChange = { input = it },
+            onInputChange = {
+                input = it
+                vm.recordUserActivity()
+            },
             onSend = {
                 vm.sendUserMessage(input)
                 input = ""
@@ -1522,12 +1654,16 @@ fun expressionToEmotion(expression: String): String {
 }
 
 @Composable
-fun DressUpScreen(vm: MainViewModel) {
+fun DressUpScreen(
+    vm: MainViewModel,
+    showStage: Boolean = true,
+    modifier: Modifier = Modifier
+) {
     val placement = vm.currentPlacement()
     Column(
-        Modifier
+        modifier
             .fillMaxSize()
-            .background(Color(0xFFFFF7F4))
+            .then(if (showStage) Modifier.background(Color(0xFFFFF7F4)) else Modifier)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -1535,19 +1671,29 @@ fun DressUpScreen(vm: MainViewModel) {
             Text("装扮", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF4A2A2B))
             Text("切换立绘、表情和场景预览。", color = Color(0xFF79545B))
         }
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBFA))) {
-            Live2DStage(
-                background = vm.selectedBackground,
-                character = vm.selectedCharacter,
-                emotion = vm.previewEmotion,
-                pose = vm.previewEmotion,
-                placement = placement,
-                relation = vm.relation,
-                stageMode = "dress",
+        if (showStage) {
+            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBFA))) {
+                Live2DStage(
+                    background = vm.selectedBackground,
+                    character = vm.selectedCharacter,
+                    emotion = vm.previewEmotion,
+                    pose = vm.previewEmotion,
+                    placement = placement,
+                    relation = vm.relation,
+                    stageMode = "dress",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(220.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                )
+            }
+        } else {
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(220.dp)
                     .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0x22FFFFFF))
             )
         }
         LazyColumn(
@@ -1558,8 +1704,9 @@ fun DressUpScreen(vm: MainViewModel) {
             item {
                 Text("角色", fontWeight = FontWeight.Bold)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SelectablePill("小樱 校园装", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
-                    SelectablePill("美月 和风", vm.selectedCharacter == "murasame") { vm.chooseCharacter("murasame") }
+                    SelectablePill("NEKO Live2D", vm.selectedCharacter == "neko") { vm.chooseCharacter("neko") }
+                    SelectablePill("小樱 静态", vm.selectedCharacter == "atri") { vm.chooseCharacter("atri") }
+                    SelectablePill("美月 静态", vm.selectedCharacter == "murasame") { vm.chooseCharacter("murasame") }
                 }
             }
             item {
@@ -2286,7 +2433,7 @@ fun Live2DSelfTestScreen(vm: MainViewModel) {
             Spacer(Modifier.width(64.dp))
         }
         Text(
-            "The panel below is rendered inside the same WebView runtime used by Home. Core/model/frame status is shown on-screen, no ADB required.",
+            "Official Android renderer diagnostics: SDK/Core loaded, model loaded, drawable count, GL lifecycle, and last error are shown on-screen.",
             color = Color(0xCCDDE7F5),
             fontSize = 12.sp,
             lineHeight = 16.sp

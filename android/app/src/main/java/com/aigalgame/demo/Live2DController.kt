@@ -8,12 +8,14 @@ import java.io.IOException
 import kotlin.math.max
 
 data class Live2DRenderState(
-    val character: String = "atri",
+    val character: String = Live2DCharacterConfigs.DefaultCharacter,
+    val rendererMode: CharacterRendererMode = CharacterRendererMode.Live2D,
+    val staticFallbackCharacter: String = "atri",
     val modelAssetPath: String = "",
     val modelAssetPresent: Boolean = false,
     val rendererAvailable: Boolean = false,
-    val expression: String = "Neutral",
-    val motion: String = "Idle",
+    val expression: String = "calm",
+    val motion: String = "idle",
     val nowSpeaking: Boolean = false,
     val mouthOpen: Float = 0f,
     val lookX: Float = 0f,
@@ -23,12 +25,27 @@ data class Live2DRenderState(
     val statusMessage: String = ""
 ) {
     val canRenderLive2D: Boolean
-        get() = modelAssetPresent && rendererAvailable
+        get() = rendererMode == CharacterRendererMode.Live2D && modelAssetPresent && rendererAvailable
+
+    fun toCommand(placement: OutfitPlacement, interactive: Boolean): Live2DRenderCommand {
+        return Live2DRenderCommand(
+            characterId = character,
+            emotion = expression,
+            motion = motion,
+            mouthOpen = mouthOpen,
+            speaking = nowSpeaking,
+            lookX = lookX,
+            lookY = lookY,
+            placement = placement,
+            interactive = interactive,
+            commandNonce = commandNonce
+        )
+    }
 }
 
-class Live2DController(context: Context, initialCharacter: String = "atri") {
+class Live2DController(context: Context, initialCharacter: String = Live2DCharacterConfigs.DefaultCharacter) {
     private val appContext = context.applicationContext
-    private var config: Live2DCharacterConfig = Live2DCharacterConfigs.forCharacter("atri")
+    private var config: Live2DCharacterConfig = Live2DCharacterConfigs.forCharacter(Live2DCharacterConfigs.DefaultCharacter)
     private val cooldownUntilByHitArea = mutableMapOf<String, Long>()
     private var commandNonce = 0L
 
@@ -41,27 +58,27 @@ class Live2DController(context: Context, initialCharacter: String = "atri") {
 
     fun load(character: String) {
         config = Live2DCharacterConfigs.forCharacter(character)
-        val present = appContext.assetExists(config.modelAssetPath)
-        val fallbackPresent = appContext.assetExists(config.fallbackModelAssetPath)
-        val missingRuntimeAssets = Live2DCharacterConfigs.RequiredRuntimeAssetPaths
-            .filterNot { appContext.assetExists(it) }
-        val runtimeAvailable = missingRuntimeAssets.isEmpty()
-        val resolvedModelPath = when {
-            present -> config.modelAssetPath
-            fallbackPresent -> config.fallbackModelAssetPath
-            else -> config.modelAssetPath
+        val live2DMode = config.rendererMode == CharacterRendererMode.Live2D
+        val present = live2DMode && appContext.assetExists(config.modelAssetPath)
+        val missingRuntimeAssets = if (live2DMode) {
+            Live2DCharacterConfigs.RequiredRuntimeAssetPaths.filterNot { appContext.assetExists(it) }
+        } else {
+            emptyList()
         }
-        val rendererAvailable = (present || fallbackPresent) && runtimeAvailable
+        val runtimeAvailable = missingRuntimeAssets.isEmpty()
+        val rendererAvailable = live2DMode && present && runtimeAvailable
         val status = when {
-            present && rendererAvailable -> "Live2D Pixi model ready"
-            fallbackPresent && rendererAvailable -> "Live2D Pixi fallback sample model ready"
-            !runtimeAvailable -> "Live2D Web runtime missing (${missingRuntimeAssets.joinToString()}), using PNG fallback"
-            else -> "Live2D model asset missing, using PNG fallback"
+            !live2DMode -> "Static PNG character mode"
+            present && rendererAvailable -> "Official Live2D renderer assets ready"
+            !runtimeAvailable -> "Official Live2D assets missing (${missingRuntimeAssets.joinToString()}), using PNG fallback"
+            else -> "NEKO model asset missing, using PNG fallback"
         }
         state = state.copy(
             character = config.character,
-            modelAssetPath = resolvedModelPath,
-            modelAssetPresent = present || fallbackPresent,
+            rendererMode = config.rendererMode,
+            staticFallbackCharacter = config.staticFallbackCharacter,
+            modelAssetPath = config.modelAssetPath,
+            modelAssetPresent = present,
             rendererAvailable = rendererAvailable,
             statusMessage = status
         )
@@ -125,9 +142,9 @@ class Live2DController(context: Context, initialCharacter: String = "atri") {
     ) {
         val emotionBinding = config.emotionBindings[emotion] ?: config.emotionBindings["calm"]
         val mappedPoseMotion = config.poseMotionMap[pose].orEmpty()
-        val nextExpression = explicitExpression.ifBlank { emotionBinding?.expression.orEmpty().ifBlank { "Neutral" } }
+        val nextExpression = explicitExpression.ifBlank { emotionBinding?.expression.orEmpty().ifBlank { "calm" } }
         val nextMotion = explicitMotion.ifBlank {
-            mappedPoseMotion.ifBlank { emotionBinding?.motion.orEmpty().ifBlank { "Idle" } }
+            mappedPoseMotion.ifBlank { emotionBinding?.motion.orEmpty().ifBlank { "idle" } }
         }
         state = state.copy(
             expression = nextExpression,

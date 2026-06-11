@@ -31,12 +31,13 @@ class SettingsStore(private val context: Context) {
 
     val uiSettings: Flow<LocalUiSettings> = context.settingsDataStore.data.map { prefs ->
         LocalUiSettings(
-            selectedCharacter = prefs[Keys.SelectedCharacter] ?: "atri",
+            selectedCharacter = prefs[Keys.SelectedCharacter] ?: "neko",
             selectedBackground = prefs[Keys.SelectedBackground] ?: "classroom",
             previewEmotion = prefs[Keys.PreviewEmotion] ?: "calm",
             ttsEnabled = prefs[Keys.TtsEnabled] ?: true,
             notificationsEnabled = prefs[Keys.NotificationsEnabled] ?: true,
             placements = mapOf(
+                "neko" to readPlacement(prefs, "neko", OutfitPlacement(scale = 1.10f, offsetY = -10f, bottomInset = 30f)),
                 "atri" to readPlacement(prefs, "atri", OutfitPlacement(scale = 1.14f, offsetY = -12f, bottomInset = 34f)),
                 "murasame" to readPlacement(prefs, "murasame", OutfitPlacement(scale = 1.08f, offsetY = -6f, bottomInset = 42f))
             )
