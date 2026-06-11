@@ -20,7 +20,6 @@
         }
 
         #live2d-canvas,
-        #fallback-image,
         #present-canvas,
         #present-image {
             position: absolute;
@@ -30,7 +29,6 @@
         }
 
         #live2d-canvas,
-        #fallback-image,
         #present-canvas,
         #present-image {
             z-index: 1;
@@ -41,21 +39,14 @@
             opacity: 1;
         }
 
-        #fallback-image {
-            z-index: 2;
-            object-fit: contain;
-            object-position: center bottom;
-            pointer-events: none;
-        }
-
         #present-canvas {
-            z-index: 3;
+            z-index: 4;
             pointer-events: none;
             visibility: hidden;
         }
 
         #present-image {
-            z-index: 4;
+            z-index: 3;
             pointer-events: none;
             visibility: hidden;
         }
@@ -131,7 +122,6 @@
 </head>
 <body class="stage-home">
 <canvas id="live2d-canvas"></canvas>
-<img id="fallback-image" src="./fallbacks/haru-stage.png" alt="">
 <canvas id="present-canvas"></canvas>
 <img id="present-image" alt="">
 <div id="diagnostics" aria-live="polite">
@@ -154,6 +144,6 @@
     window.PIXI = PIXI;
 </script>
 <script src="./vendor/cubism4.min.js"></script>
-<script src="./stage.js?v=pixi-cubism-runtime-v10-transparent-dom-fallback"></script>
+<script src="./stage.js?v=pixi-cubism-runtime-v11-presenter-primary"></script>
 </body>
 </html>

@@ -15,16 +15,10 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -32,13 +26,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -49,21 +39,12 @@ import org.json.JSONObject
 
 private val Live2DStageBaseHeight = 650.dp
 private const val Live2DWebTag = "Live2DWebStage"
-private const val Live2DWebStageVersion = "pixi-cubism-runtime-v10-transparent-dom-fallback"
-private const val Live2DWebStageUrl = "https://appassets.androidplatform.net/assets/live2d-web/index.html?v=pixi-cubism-runtime-v10-transparent-dom-fallback"
+private const val Live2DWebStageVersion = "pixi-cubism-runtime-v11-presenter-primary"
+private const val Live2DWebStageUrl = "https://appassets.androidplatform.net/assets/live2d-web/index.html?v=pixi-cubism-runtime-v11-presenter-primary"
 private const val Live2DWebClassroomBackground = "live2d-web/backgrounds/classroom.png"
 private const val Live2DDefaultModelAssetPath = "live2d/models/Haru/Haru.model3.json"
 private const val Live2DWebSurfaceColor = 0x00000000
-private val NativeHaruFallbackFrames = intArrayOf(
-    R.drawable.live2d_haru_fallback_00,
-    R.drawable.live2d_haru_fallback_01,
-    R.drawable.live2d_haru_fallback_02,
-    R.drawable.live2d_haru_fallback_03,
-    R.drawable.live2d_haru_fallback_04,
-    R.drawable.live2d_haru_fallback_05,
-    R.drawable.live2d_haru_fallback_06,
-    R.drawable.live2d_haru_fallback_07
-)
+private const val Live2DPresenterModelPixelThreshold = 64
 
 @Composable
 fun Live2DStage(
@@ -109,8 +90,7 @@ fun Live2DStage(
         if (state.canRenderLive2D && !webStagePresented) {
             delay(4500L)
             if (!webStagePresented) {
-                Log.e(Live2DWebTag, "Live2D model pixels timed out, showing native Haru fallback")
-                webStageFailed = true
+                Log.e(Live2DWebTag, "Live2D presenter trust timed out; keeping WebView visible")
             }
         }
     }
@@ -138,8 +118,6 @@ fun Live2DStage(
     }
 
     val useWebStage = state.canRenderLive2D && !webStageFailed
-    val useNativeVisibilityGuard = stageMode == "home"
-    val showNativeFallback = !useWebStage || !webStagePresented || useNativeVisibilityGuard
 
     Box(modifier) {
         SakuraSceneBackground(background)
@@ -155,31 +133,16 @@ fun Live2DStage(
                     Log.e(Live2DWebTag, it)
                     webStageFailed = true
                 },
-                onPresented = {
+                onPresented = { report ->
                     webStagePresented = true
-                    Log.d(Live2DWebTag, "presented")
+                    Log.d(
+                        Live2DWebTag,
+                        "presented ${report.mode} frames=${report.presenterCanvasFrames} pixels=${report.modelPixelHits}"
+                    )
                 },
                 modifier = Modifier
                     .fillMaxSize()
                     .zIndex(1f)
-            )
-        }
-        if (showNativeFallback) {
-            NativeHaruLive2DFallback(
-                placement = stagePlacement,
-                baseHeight = baseHeight,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .zIndex(2f)
-            )
-        }
-        if (!editable && showNativeFallback) {
-            FallbackTapLayer(
-                onTap = { normalizedX, normalizedY -> handleStageTap(normalizedX, normalizedY) },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(3f)
             )
         }
         if (editable && onPlacementChange != null) {
@@ -198,32 +161,6 @@ fun Live2DStage(
 }
 
 @Composable
-private fun NativeHaruLive2DFallback(
-    placement: OutfitPlacement = OutfitPlacement(),
-    baseHeight: Dp,
-    modifier: Modifier = Modifier
-) {
-    val nativePlacement = placement.coerceForStage()
-    var frameIndex by remember { mutableStateOf(0) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(160L)
-            frameIndex = (frameIndex + 1) % NativeHaruFallbackFrames.size
-        }
-    }
-    Image(
-        painter = painterResource(NativeHaruFallbackFrames[frameIndex]),
-        contentDescription = "Live2D fallback Haru",
-        modifier = modifier
-            .offset(x = nativePlacement.offsetX.dp, y = nativePlacement.offsetY.dp)
-            .height(baseHeight * nativePlacement.scale)
-            .padding(bottom = (nativePlacement.bottomInset + 24f).dp),
-        alignment = Alignment.BottomCenter,
-        contentScale = ContentScale.Fit
-    )
-}
-
-@Composable
 fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
     val state = remember {
         Live2DRenderState(
@@ -235,14 +172,6 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
         )
     }
     Box(modifier) {
-        NativeHaruLive2DFallback(
-            placement = OutfitPlacement(scale = 1.0f, offsetY = 0f, bottomInset = 0f),
-            baseHeight = Live2DStageBaseHeight,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .zIndex(0f)
-        )
         Live2DWebStage(
             state = state,
             background = "classroom",
@@ -251,32 +180,17 @@ fun Live2DSelfTestStage(modifier: Modifier = Modifier) {
             stageMode = "selftest",
             onTap = { _, _ -> },
             onError = { Log.e(Live2DWebTag, it) },
-            onPresented = { Log.d(Live2DWebTag, "selftest presented") },
+            onPresented = { report ->
+                Log.d(
+                    Live2DWebTag,
+                    "selftest presented ${report.mode} frames=${report.presenterCanvasFrames} pixels=${report.modelPixelHits}"
+                )
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .zIndex(1f)
         )
     }
-}
-
-@Composable
-private fun FallbackTapLayer(
-    onTap: (Float, Float) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier.pointerInput(Unit) {
-            detectTapGestures { offset ->
-                val width = size.width.toFloat()
-                val height = size.height.toFloat()
-                if (width <= 0f || height <= 0f) return@detectTapGestures
-                onTap(
-                    (offset.x / width).coerceIn(0f, 1f),
-                    (offset.y / height).coerceIn(0f, 1f)
-                )
-            }
-        }
-    )
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -289,7 +203,7 @@ private fun Live2DWebStage(
     stageMode: String,
     onTap: (Float, Float) -> Unit,
     onError: (String) -> Unit,
-    onPresented: () -> Unit,
+    onPresented: (Live2DPresentationReport) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var ready by remember { mutableStateOf(false) }
@@ -374,7 +288,7 @@ private fun Live2DWebStage(
                         onReady = { ready = true },
                         onTap = { normalizedX, normalizedY -> latestOnTap.value(normalizedX, normalizedY) },
                         onError = { latestOnError.value(it) },
-                        onPresented = { latestOnPresented.value() },
+                        onPresented = { report -> latestOnPresented.value(report) },
                         onDebug = { Log.d(Live2DWebTag, it) }
                     ),
                     "AndroidLive2D"
@@ -456,7 +370,7 @@ private class Live2DWebBridge(
     private val onReady: () -> Unit,
     private val onTap: (Float, Float) -> Unit,
     private val onError: (String) -> Unit,
-    private val onPresented: () -> Unit,
+    private val onPresented: (Live2DPresentationReport) -> Unit,
     private val onDebug: (String) -> Unit
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -483,7 +397,12 @@ private class Live2DWebBridge(
     fun onPresented(payload: String?) {
         mainHandler.post {
             onDebug("presented: ${payload.orEmpty()}")
-            onPresented()
+            val report = Live2DPresentationReport.fromPayload(payload)
+            if (report.isTrusted) {
+                onPresented(report)
+            } else {
+                onDebug("presented ignored: ${report.reason}")
+            }
         }
     }
 
@@ -498,6 +417,83 @@ private class Live2DWebBridge(
         val normalizedX = json.optDouble("normalizedX", 0.5).toFloat()
         val normalizedY = json.optDouble("normalizedY", 0.5).toFloat()
         mainHandler.post { onTap(normalizedX, normalizedY) }
+    }
+}
+
+private data class Live2DPresentationReport(
+    val mode: String,
+    val stageVersion: String,
+    val presenterCanvasFrames: Int,
+    val presenterImageFrames: Int,
+    val modelPixelHits: Int,
+    val modelPixelReady: Boolean,
+    val presenterWidth: Int,
+    val presenterHeight: Int,
+    val stageWidth: Int,
+    val stageHeight: Int,
+    val reason: String
+) {
+    val isTrusted: Boolean
+        get() = reason.isBlank()
+
+    companion object {
+        fun fromPayload(payload: String?): Live2DPresentationReport {
+            val json = runCatching { JSONObject(payload.orEmpty()) }.getOrNull()
+                ?: return invalid("invalid-json")
+            val pixelProbe = json.optJSONObject("pixelProbe")
+            val report = Live2DPresentationReport(
+                mode = json.optString("mode"),
+                stageVersion = json.optString("stageVersion"),
+                presenterCanvasFrames = json.optInt(
+                    "presenterCanvasFrames",
+                    json.optInt("presenterFrames", 0)
+                ),
+                presenterImageFrames = json.optInt("presenterImageFrames", 0),
+                modelPixelHits = json.optInt(
+                    "modelPixelHits",
+                    pixelProbe?.optInt("modelHits", 0) ?: 0
+                ),
+                modelPixelReady = json.optBoolean(
+                    "modelPixelReady",
+                    pixelProbe?.optBoolean("modelPixelReady", false) ?: false
+                ),
+                presenterWidth = json.optInt("presenterWidth", 0),
+                presenterHeight = json.optInt("presenterHeight", 0),
+                stageWidth = json.optInt("stageWidth", 0),
+                stageHeight = json.optInt("stageHeight", 0),
+                reason = ""
+            )
+            return report.copy(reason = report.validationFailure())
+        }
+
+        private fun invalid(reason: String): Live2DPresentationReport {
+            return Live2DPresentationReport(
+                mode = "",
+                stageVersion = "",
+                presenterCanvasFrames = 0,
+                presenterImageFrames = 0,
+                modelPixelHits = 0,
+                modelPixelReady = false,
+                presenterWidth = 0,
+                presenterHeight = 0,
+                stageWidth = 0,
+                stageHeight = 0,
+                reason = reason
+            )
+        }
+    }
+
+    private fun validationFailure(): String {
+        return when {
+            stageVersion != Live2DWebStageVersion -> "stage-version-$stageVersion"
+            mode != "dom-presenter" -> "mode-$mode"
+            presenterCanvasFrames <= 0 -> "no-presenter-canvas-frame"
+            !modelPixelReady -> "model-pixels-not-ready"
+            modelPixelHits < Live2DPresenterModelPixelThreshold -> "model-pixels-$modelPixelHits"
+            presenterWidth <= 0 || presenterHeight <= 0 -> "presenter-size-${presenterWidth}x$presenterHeight"
+            stageWidth <= 0 || stageHeight <= 0 -> "stage-size-${stageWidth}x$stageHeight"
+            else -> ""
+        }
     }
 }
 
@@ -522,6 +518,7 @@ private fun Live2DRenderState.toLive2DWebStateJson(
         .put("expression", expression)
         .put("motion", motion)
         .put("commandNonce", commandNonce)
+        .put("idleMotionEnabled", false)
         .put("nowSpeaking", nowSpeaking)
         .put("mouthOpenSize", mouthOpen.toDouble())
         .put("focusAt", focusJson)

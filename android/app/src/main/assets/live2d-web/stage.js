@@ -4,7 +4,7 @@
     var MODEL_BASE_URL = new URL("../", window.location.href).href;
     var DEFAULT_MODEL = MODEL_BASE_URL + "live2d/models/Haru/Haru.model3.json";
     var DEFAULT_BACKGROUND = "";
-    var STAGE_VERSION = "pixi-cubism-runtime-v10-transparent-dom-fallback";
+    var STAGE_VERSION = "pixi-cubism-runtime-v11-presenter-primary";
     var STAGE_BACKGROUND_COLOR = 0x000000;
     var STAGE_BACKGROUND_CSS = "transparent";
     var ENABLE_DOM_PRESENTER = true;
@@ -12,7 +12,6 @@
     var MAX_RESOLUTION = 2;
     var RENDER_BURST_FRAMES = 36;
     var PRESENTER_FRAME_INTERVAL_MS = 33;
-    var PRESENT_IMAGE_INTERVAL_MS = 250;
     var motionAliases = {
         Idle: "Idle",
         Happy: "TapBody",
@@ -40,7 +39,6 @@
     };
 
     var canvas = document.getElementById("live2d-canvas");
-    var fallbackImage = document.getElementById("fallback-image");
     var presentCanvas = document.getElementById("present-canvas");
     var presentContext = ENABLE_DOM_PRESENTER && presentCanvas && presentCanvas.getContext
         ? presentCanvas.getContext("2d", { alpha: true })
@@ -98,7 +96,6 @@
     var presenterLastError = "";
     var presenterLoopId = 0;
     var presenterLastCopyAt = 0;
-    var presenterLastImageAt = 0;
     var presenterLastDiagnosticsAt = 0;
     var status = {
         coreLoaded: !!window.Live2DCubismCore,
@@ -117,6 +114,7 @@
             expression: "Neutral",
             motion: "Idle",
             commandNonce: 0,
+            idleMotionEnabled: false,
             nowSpeaking: false,
             mouthOpenSize: 0,
             focusAt: { x: 0, y: 0 },
@@ -183,7 +181,7 @@
                     (presenterLastError ? " err " + presenterLastError : "")
                 : "raw-webgl",
             ENABLE_DOM_PRESENTER
-                ? presenterFrames > 0 && presenterImageFrames > 0 && !presenterLastError &&
+                ? presenterFrames > 0 && !presenterLastError &&
                     (latestPixelProbe.modelHits || 0) >= MODEL_PIXEL_THRESHOLD
                 : true
         );
@@ -371,11 +369,6 @@
         canvas.style.height = "100vh";
         canvas.style.opacity = "1";
         canvas.style.background = STAGE_BACKGROUND_CSS;
-        if (fallbackImage) {
-            fallbackImage.style.opacity = "1";
-            fallbackImage.style.visibility = "visible";
-            fallbackImage.style.background = STAGE_BACKGROUND_CSS;
-        }
         if (presentCanvas) {
             presentCanvas.style.width = "100vw";
             presentCanvas.style.height = "100vh";
@@ -458,11 +451,22 @@
     function notifyPresented(mode) {
         if (presenterReported) return;
         presenterReported = true;
-        setFallbackVisible(true);
+        setPresenterVisible(true);
         post("onPresented", JSON.stringify({
+            stageVersion: STAGE_VERSION,
             mode: mode || "raw-webgl",
             presenterFrames: presenterFrames,
-            presenterImageFrames: presenterImageFrames
+            presenterCanvasFrames: presenterFrames,
+            presenterImageFrames: presenterImageFrames,
+            modelPixelHits: latestPixelProbe.modelHits || 0,
+            modelPixelReady: !!latestPixelProbe.modelPixelReady,
+            pixelProbe: latestPixelProbe,
+            presenterWidth: presenterWidth,
+            presenterHeight: presenterHeight,
+            stageWidth: app && app.screen ? app.screen.width : 0,
+            stageHeight: app && app.screen ? app.screen.height : 0,
+            rendererWidth: app && app.renderer ? app.renderer.width : 0,
+            rendererHeight: app && app.renderer ? app.renderer.height : 0
         }));
         renderDiagnostics();
     }
@@ -518,12 +522,6 @@
         };
     }
 
-    function setFallbackVisible(visible) {
-        if (!fallbackImage) return;
-        fallbackImage.style.opacity = visible ? "1" : "0";
-        fallbackImage.style.visibility = visible ? "visible" : "hidden";
-    }
-
     function setPresenterVisible(visible) {
         if (presentCanvas) {
             presentCanvas.style.display = "block";
@@ -532,10 +530,10 @@
         }
         if (presentImage) {
             presentImage.style.display = "block";
-            presentImage.style.opacity = visible ? "1" : "0";
-            presentImage.style.visibility = visible ? "visible" : "hidden";
+            presentImage.style.opacity = "0";
+            presentImage.style.visibility = "hidden";
+            presentImage.removeAttribute("src");
         }
-        setFallbackVisible(true);
     }
 
     function ensurePresenterBuffers(width, height) {
@@ -584,14 +582,8 @@
             presentContext.putImageData(presenterImageData, 0, 0);
             presenterFrames += 1;
             presenterLastError = "";
-            if (presentImage && now - presenterLastImageAt >= PRESENT_IMAGE_INTERVAL_MS) {
-                presenterLastImageAt = now;
-                presentImage.src = presentCanvas.toDataURL("image/png");
-                presentImage.style.visibility = "visible";
-                setPresenterVisible(true);
-                presenterImageFrames += 1;
-                notifyPresented("dom-presenter");
-            }
+            setPresenterVisible(true);
+            notifyPresented("dom-presenter");
             if (now - presenterLastDiagnosticsAt > 500) {
                 presenterLastDiagnosticsAt = now;
                 renderDiagnostics();
@@ -644,8 +636,8 @@
         }
 
         model = await Live2DModel.from(resolvedSrc, {
-            autoInteract: true,
-            idleMotionGroup: "Idle"
+            autoInteract: false,
+            idleMotionGroup: state.idleMotionEnabled ? "Idle" : ""
         });
         resetModelTransform();
         model.interactive = interactive;
@@ -663,7 +655,7 @@
 
         applyFit();
         applyExpression(state.expression, true);
-        playMotion(state.motion, true);
+        playMotion(state.motion, false);
         requestRenderBurst(RENDER_BURST_FRAMES);
         requestAnimationFrame(function () {
             try {
@@ -804,6 +796,12 @@
         if (!model) return;
         var requested = String(name || "Idle");
         var resolved = resolveMotion(requested);
+        if (isIdleMotion(requested) && !state.idleMotionEnabled) {
+            stopAllMotions("idle-disabled");
+            lastMotion = requested;
+            lastCommandNonce = state.commandNonce;
+            return;
+        }
         if (!force && requested === lastMotion && state.commandNonce === lastCommandNonce) {
             return;
         }
@@ -825,6 +823,24 @@
             } else {
                 debug("motion failed: " + error.message);
             }
+        }
+    }
+
+    function isIdleMotion(name) {
+        var requested = String(name || "Idle").trim();
+        var resolved = resolveMotion(requested);
+        return requested.toLowerCase() === "idle" || resolved.toLowerCase() === "idle";
+    }
+
+    function stopAllMotions(reason) {
+        try {
+            var motionManager = model && model.internalModel && model.internalModel.motionManager;
+            if (motionManager && typeof motionManager.stopAllMotions === "function") {
+                motionManager.stopAllMotions();
+                debug("motion stopped: " + reason);
+            }
+        } catch (error) {
+            debug("motion stop failed: " + (error && error.message ? error.message : String(error)));
         }
     }
 
@@ -912,6 +928,7 @@
             state = Object.assign({}, state, nextState || {});
             state.placement = Object.assign({}, defaultState().placement, state.placement || {});
             state.focusAt = Object.assign({}, defaultState().focusAt, state.focusAt || {});
+            state.idleMotionEnabled = state.idleMotionEnabled === true;
             applyStageClass(state.stageMode || "home");
             if (state.stageVersion && state.stageVersion !== STAGE_VERSION) {
                 debug("stage version mismatch android=" + state.stageVersion + " web=" + STAGE_VERSION);
@@ -1014,6 +1031,7 @@
                 modelAlpha: model ? model.alpha : 0,
                 modelVisible: model ? model.visible : false,
                 domPresenterEnabled: ENABLE_DOM_PRESENTER,
+                idleMotionEnabled: !!state.idleMotionEnabled,
                 presenterCanvas: !!presentCanvas,
                 presenterImage: !!presentImage,
                 presenterFrames: presenterFrames,

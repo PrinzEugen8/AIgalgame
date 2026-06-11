@@ -49,7 +49,6 @@ val requiredLive2DAssets = listOf(
     "src/main/assets/live2d-web/vendor/live2dcubismcore.min.js",
     "src/main/assets/live2d-web/vendor/pixi.min.js",
     "src/main/assets/live2d-web/vendor/cubism4.min.js",
-    "src/main/assets/live2d-web/fallbacks/haru-stage.png",
     "src/main/assets/live2d/models/Haru/Haru.model3.json",
     "src/main/assets/live2d/models/Haru/Haru.moc3",
     "src/main/assets/live2d/models/Haru/Haru.physics3.json",
@@ -61,7 +60,12 @@ val requiredLive2DAssets = listOf(
     "src/main/assets/live2d/models/Haru/motions/haru_g_m26.motion3.json"
 )
 
-val requiredLive2DNativeAssets = listOf(
+val forbiddenLive2DAssets = listOf(
+    "src/main/assets/live2d-web/official/index.html",
+    "src/main/assets/live2d-web/official/official-stage.js",
+    "src/main/assets/live2d/sdk/live2dcubismcore.min.js",
+    "src/main/assets/live2d/samples",
+    "src/main/assets/live2d-web/fallbacks",
     "src/main/res/drawable-nodpi/live2d_haru_fallback.png",
     "src/main/res/drawable-nodpi/live2d_haru_fallback_00.png",
     "src/main/res/drawable-nodpi/live2d_haru_fallback_01.png",
@@ -73,21 +77,13 @@ val requiredLive2DNativeAssets = listOf(
     "src/main/res/drawable-nodpi/live2d_haru_fallback_07.png"
 )
 
-val forbiddenLive2DAssets = listOf(
-    "src/main/assets/live2d-web/official/index.html",
-    "src/main/assets/live2d-web/official/official-stage.js",
-    "src/main/assets/live2d/sdk/live2dcubismcore.min.js",
-    "src/main/assets/live2d/samples"
-)
-
 tasks.register("verifyLive2DAssets") {
     group = "verification"
     description = "Checks that the offline Live2D Web runtime and fallback model are packaged."
     doLast {
         val missing = requiredLive2DAssets.filterNot { layout.projectDirectory.file(it).asFile.exists() }
-        val missingNative = requiredLive2DNativeAssets.filterNot { layout.projectDirectory.file(it).asFile.exists() }
-        if (missing.isNotEmpty() || missingNative.isNotEmpty()) {
-            throw GradleException("Missing Live2D assets: ${(missing + missingNative).joinToString()}")
+        if (missing.isNotEmpty()) {
+            throw GradleException("Missing Live2D assets: ${missing.joinToString()}")
         }
         val forbidden = forbiddenLive2DAssets.filter { layout.projectDirectory.file(it).asFile.exists() }
         if (forbidden.isNotEmpty()) {
@@ -134,25 +130,47 @@ tasks.register("verifyLive2DAssets") {
         if ("#present-canvas" !in indexHtml || "#present-image" !in indexHtml || hiddenPresenterPattern.containsMatchIn(indexHtml)) {
             throw GradleException("Live2D presenter layers must stay displayable and hide only with visibility/opacity")
         }
-        if ("fallback-image" !in indexHtml || "src=\"./fallbacks/haru-stage.png\"" !in indexHtml) {
-            throw GradleException("Live2D Web stage must expose the packaged Haru DOM fallback while waiting for verified model frames")
+        if ("fallback-image" in indexHtml || "src=\"./fallbacks/haru-stage.png\"" in indexHtml) {
+            throw GradleException("Live2D Web stage must not use a static PNG character fallback")
         }
         if ("presentCanvas.style.display = \"block\"" !in stageJs || "presentImage.style.display = \"block\"" !in stageJs) {
             throw GradleException("Live2D presenter JS must restore display:block when exposing verified model frames")
         }
-        if ("setFallbackVisible(false)" in stageJs || "setFallbackVisible(!visible)" in stageJs) {
-            throw GradleException("Live2D presenter must not hide the Haru fallback from an internal pixel-ready false positive")
+        if ("setFallbackVisible" in stageJs || "presentCanvas.toDataURL" in stageJs) {
+            throw GradleException("Live2D presenter must make the high-resolution canvas primary and stop using image snapshots as the main display")
+        }
+        if (
+            "presenterCanvasFrames" !in stageJs ||
+            "modelPixelHits" !in stageJs ||
+            "stageVersion: STAGE_VERSION" !in stageJs
+        ) {
+            throw GradleException("Live2D presenter must send trusted canvas/model-pixel diagnostics to Android")
+        }
+        if ("idleMotionEnabled" !in stageJs || "stopAllMotions(\"idle-disabled\")" !in stageJs) {
+            throw GradleException("Live2D stage.js must disable looping body idle motion by default")
         }
         if ("model-pixels" !in indexHtml) {
             throw GradleException("Live2D self-test must expose model pixel diagnostics")
         }
         val stageKt = layout.projectDirectory.file("src/main/java/com/aigalgame/demo/Live2DStage.kt").asFile.readText()
+        if ("val useNativeVisibilityGuard = stageMode == \"home\"" in stageKt) {
+            throw GradleException("Home must not permanently pin the native PNG fallback above the WebView")
+        }
         if (
-            "val useNativeVisibilityGuard = stageMode == \"home\"" !in stageKt ||
-            "val showNativeFallback = !useWebStage || !webStagePresented || useNativeVisibilityGuard" !in stageKt ||
-            "baseHeight * nativePlacement.scale" !in stageKt
+            "Live2DPresentationReport" !in stageKt ||
+            "report.isTrusted" !in stageKt
         ) {
-            throw GradleException("Home must keep a placement-aware native Haru guard above the WebView until Android composition is visibly reliable")
+            throw GradleException("Home must trust only verified Web presenter reports")
+        }
+        if (
+            "NativeHaruLive2DFallback" in stageKt ||
+            "R.drawable.live2d_haru_fallback" in stageKt ||
+            "showNativeFallback" in stageKt ||
+            "NativeHaruFallbackFrames" in stageKt ||
+            "R.drawable.live2d_haru_fallback_00" in stageKt ||
+            "delay(160L)" in stageKt
+        ) {
+            throw GradleException("Home must not use PNG character fallbacks")
         }
     }
 }
