@@ -20,6 +20,7 @@ class User(Base):
     timezone: Mapped[str] = mapped_column(String, default="Asia/Hong_Kong")
     sleep_start: Mapped[str] = mapped_column(String, default="00:30")
     sleep_end: Mapped[str] = mapped_column(String, default="08:00")
+    active_character_id: Mapped[str] = mapped_column(String, default="atri")
     interest_topics_json: Mapped[str] = mapped_column(Text, default="[]")
     profile_json: Mapped[str] = mapped_column(Text, default="{}")
     proactive_daily_limit: Mapped[str] = mapped_column(String, default="unlimited")
@@ -83,6 +84,18 @@ class RelationState(Base):
     relationship_stage: Mapped[str] = mapped_column(String, default="初识")
     last_interaction_at: Mapped[str] = mapped_column(String, default=now_iso)
     last_decay_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class UserCharacterProfile(Base):
+    __tablename__ = "user_character_profiles"
+
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.user_id"), primary_key=True)
+    character_id: Mapped[str] = mapped_column(String, ForeignKey("characters.character_id"), primary_key=True)
+    overlay_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_memory_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
@@ -175,6 +188,12 @@ class Moment(Base):
     source_experience_id: Mapped[str] = mapped_column(String, default="")
     mood_snapshot: Mapped[str] = mapped_column(String, default="")
     visibility: Mapped[str] = mapped_column(String, default="private_demo")
+    moment_type: Mapped[str] = mapped_column(String, default="original", index=True)
+    source_platform: Mapped[str] = mapped_column(String, default="", index=True)
+    source_title: Mapped[str] = mapped_column(String, default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    source_summary: Mapped[str] = mapped_column(Text, default="")
+    source_payload_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
 
 
@@ -329,6 +348,27 @@ class TrendRadarSnapshot(Base):
     endpoint: Mapped[str] = mapped_column(String, default="")
     error_message: Mapped[str] = mapped_column(Text, default="")
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[str] = mapped_column(String, default=now_iso)
+    updated_at: Mapped[str] = mapped_column(String, default=now_iso)
+
+
+class ContentItem(Base):
+    __tablename__ = "content_items"
+
+    item_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String, default="", index=True)
+    platform: Mapped[str] = mapped_column(String, default="", index=True)
+    source_name: Mapped[str] = mapped_column(String, default="")
+    title: Mapped[str] = mapped_column(String, default="")
+    url: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    tags_json: Mapped[str] = mapped_column(Text, default="[]")
+    published_at: Mapped[str] = mapped_column(String, default="", index=True)
+    hot_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    interest_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    dedupe_key: Mapped[str] = mapped_column(String, default="", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    fetched_at: Mapped[str] = mapped_column(String, default=now_iso, index=True)
     created_at: Mapped[str] = mapped_column(String, default=now_iso)
     updated_at: Mapped[str] = mapped_column(String, default=now_iso)
 

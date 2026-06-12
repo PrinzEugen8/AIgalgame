@@ -14,18 +14,18 @@ from .image_generation import ImageRequestBlocked, generate_safe_image, infer_im
 from .models import Character, ProactiveEvent, ProviderConfig, User
 from .news import trend_radar_payload_for_news
 from .proactive_rules import build_judge_messages
-from .providers import OpenAICompatibleClient, ProviderError, VolcArkWebSearchClient, get_enabled_provider, get_task_llm_provider, provider_ready
+from .providers import OpenAICompatibleClient, ProviderError, VolcArkWebSearchClient, get_enabled_provider, get_enabled_provider_by_provider, get_task_llm_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
 from .weather import ensure_weather_candidate
 
 
 PROACTIVE_STATUSES = {"pending", "delivered", "opened", "reflected", "expired", "dismissed"}
-PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather", "calendar_event", "appointment"}
+PROACTIVE_SOURCES = {"schedule", "memory", "moment_interaction", "news", "weather", "calendar_event", "appointment", "repost"}
 DEFAULT_EXPIRY = timedelta(days=2)
 PROACTIVE_JUDGE_CANDIDATE_LIMIT = 8
 JUDGE_TEXT_LIMIT = 180
 ON_TIME_DELIVERY_WINDOW = timedelta(minutes=10)
-SOURCE_TYPE_RANK = {"appointment": 0, "calendar_event": 1, "schedule": 2, "weather": 3, "news": 4, "moment_interaction": 5, "memory": 6}
+SOURCE_TYPE_RANK = {"appointment": 0, "calendar_event": 1, "schedule": 2, "weather": 3, "repost": 4, "news": 5, "moment_interaction": 6, "memory": 7}
 
 logger = logging.getLogger(__name__)
 
@@ -508,14 +508,11 @@ def ensure_news_candidate(session: Session, *, user_id: str, character_id: str, 
     topic_records, existing_events = _news_topic_records(session, user_id=user_id, topics=topics, now_local=now_local)
     if not topic_records:
         return existing_events[-1] if existing_events else None
-    search = get_enabled_provider(session, "search")
-    if search is None:
-        write_diagnostic("proactive_news_skipped", reason="search_not_configured", user_id=user_id)
-        return _ensure_ark_news_candidate(session, primary=None, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
-    if search.provider == "trend_radar":
+    trend_search = get_enabled_provider_by_provider(session, "search", "trend_radar")
+    if trend_search is not None:
         event = _ensure_trend_radar_news_candidate(
             session,
-            config=search,
+            config=trend_search,
             user_id=user_id,
             character_id=character_id,
             topic_records=topic_records,
@@ -523,11 +520,10 @@ def ensure_news_candidate(session: Session, *, user_id: str, character_id: str, 
         )
         if event is not None:
             return event
-        return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
-    if search.provider == "volc_ark_web_search":
-        return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
-    write_diagnostic("proactive_news_skipped", reason="search_not_ready", provider_id=search.provider_id, provider=search.provider)
-    return _ensure_ark_news_candidate(session, primary=search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
+    ark_search = get_enabled_provider_by_provider(session, "search", "volc_ark_web_search")
+    if ark_search is None and trend_search is None and get_enabled_provider(session, "search") is None:
+        write_diagnostic("proactive_news_skipped", reason="search_not_configured", user_id=user_id)
+    return _ensure_ark_news_candidate(session, primary=ark_search or trend_search, user_id=user_id, character_id=character_id, topic_records=topic_records, now_local=now_local)
 
 
 def _event_payload(event: ProactiveEvent) -> dict[str, Any]:
@@ -583,6 +579,8 @@ def _proactive_image_prompt(event: ProactiveEvent, payload: dict[str, Any]) -> s
             parts.append(normalized)
     if event.source_type == "weather":
         parts.insert(0, "天气相关的日常风景 CG")
+    elif event.source_type == "repost":
+        parts.insert(0, "角色刷到有趣内容时的日常物品或房间场景 CG")
     elif event.source_type == "news":
         parts.insert(0, "角色看到消息时的日常物品或场景 CG")
     elif event.source_type in {"schedule", "memory", "moment_interaction"}:
@@ -732,7 +730,7 @@ def _judge_text(value: Any, limit: int = JUDGE_TEXT_LIMIT) -> str:
 
 def _payload_for_judge(payload: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
-    for key in ("topic", "summary", "activity_title", "memory", "interaction_type", "content", "trigger_key", "severity"):
+    for key in ("topic", "summary", "activity_title", "memory", "interaction_type", "content", "trigger_key", "severity", "platform", "title", "source_name"):
         if key in payload:
             compact[key] = _judge_text(payload.get(key))
     sources = payload.get("sources")
@@ -1112,10 +1110,15 @@ def pending_proactive_response(
     if not appointment_only:
         if generate_news:
             ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+            from .information_circle import ensure_repost_candidate
+
+            ensure_repost_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
         if generate_weather:
             ensure_weather_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
     _expire_old_pending(session, user_id, now_utc)
     unread_event = _unread_selected_event(session, user, character_id=character_id)
+    if appointment_only and unread_event is not None and unread_event.source_type != "appointment":
+        unread_event = None
     if unread_event is not None:
         write_diagnostic(
             "proactive_unread_retained",

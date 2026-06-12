@@ -55,7 +55,7 @@ class ApiClient(private val baseUrl: String) {
     }
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
-    suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
+    suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}&generate_news=false&generate_weather=false&appointment_only=true")
     suspend fun registerDevice(deviceId: String, pushToken: String, notificationsEnabled: Boolean): JSONObject {
         val body = JSONObject()
             .put("device_id", deviceId)

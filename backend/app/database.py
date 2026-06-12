@@ -60,10 +60,25 @@ def _upgrade_sqlite_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN proactive_judgement_json TEXT DEFAULT '{}'"))
             if "profile_json" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN profile_json TEXT DEFAULT '{}'"))
+            if "active_character_id" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN active_character_id VARCHAR DEFAULT 'atri'"))
         if "moment_interactions" in table_names:
             columns = {item["name"] for item in inspector.get_columns("moment_interactions")}
             if "actor_name" not in columns:
                 conn.execute(text("ALTER TABLE moment_interactions ADD COLUMN actor_name VARCHAR DEFAULT ''"))
+        if "moments" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("moments")}
+            additions = {
+                "moment_type": "VARCHAR DEFAULT 'original'",
+                "source_platform": "VARCHAR DEFAULT ''",
+                "source_title": "VARCHAR DEFAULT ''",
+                "source_url": "TEXT DEFAULT ''",
+                "source_summary": "TEXT DEFAULT ''",
+                "source_payload_json": "TEXT DEFAULT '{}'",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE moments ADD COLUMN {name} {definition}"))
         if "characters" in table_names:
             columns = {item["name"] for item in inspector.get_columns("characters")}
             if "persona_card_json" not in columns:

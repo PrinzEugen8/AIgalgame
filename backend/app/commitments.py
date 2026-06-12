@@ -322,7 +322,7 @@ def extract_user_commitment(
         updated_at=utc_now(),
     )
     session.add(commitment)
-    create_proactive_event(
+    proactive = create_proactive_event(
         session,
         user_id=event.user_id,
         character_id=event.character_id,
@@ -344,6 +344,8 @@ def extract_user_commitment(
         scheduled_at=remind_at,
         expires_at=event_at + timedelta(hours=2),
     )
+    if proactive is not None:
+        session.flush()
     from .scheduler import schedule_commitment_delivery
 
     schedule_commitment_delivery(commitment.commitment_id, remind_at.astimezone(timezone.utc))

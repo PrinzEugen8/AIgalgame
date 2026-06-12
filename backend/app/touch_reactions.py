@@ -8,10 +8,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .character_profiles import resolve_character_profile
 from .database import SessionLocal
 from .diagnostics import write_diagnostic
 from .live2d_config import DEFAULT_LIVE2D_APPEARANCE_ID, enabled_hit_area_ids, get_hit_area
 from .models import Character, MediaAsset, RelationState, TouchReactionPool, User
+from .persona import relationship_state_summary, touch_tier_for_affection
 from .seed import DEFAULT_CHARACTER_ID
 from .pipeline import _active_voice_profile, _tts_for_line, _valid_japanese_tts_text
 from .providers import OpenAICompatibleClient, ProviderError, get_task_llm_provider
@@ -22,12 +24,13 @@ TTS_COOLDOWN_BUFFER_MS = 300
 TOUCH_JSON_MAX_TOKENS = 5120
 
 
+def _relationship_state_for(session: Session, relation: RelationState, character: Character) -> dict[str, Any]:
+    card = resolve_character_profile(session, user_id=relation.user_id, character_id=relation.character_id, character=character).card
+    return relationship_state_summary(relation, card)
+
+
 def affection_tier(affection: int) -> str:
-    if affection >= 70:
-        return "high"
-    if affection >= 45:
-        return "mid"
-    return "low"
+    return touch_tier_for_affection(affection)
 
 
 def _voice_profile_id(character: Character) -> str:
@@ -216,9 +219,14 @@ def _touch_prompt(
     retry_block = ""
     if retry_reason:
         retry_block = f"\n\n上一次输出未通过校验：{retry_reason}。请重新生成完整 JSON。"
+    relation_state = _relationship_state_for(session, relation, character)
+    mood = relation_state["mood"]
+    affection = relation_state["affection"]
     return f"""你是 Galgame 角色 {character.name}，用户刚刚触摸了你的 {label}（{hit_area}）。
 当前关系：好感 {relation.affection}，信任 {relation.trust}，依赖 {relation.dependency}，心情 {relation.mood}。
-好感档位：{tier}。
+好感阶段：{affection['label']}({affection['score']}/1000)，触摸档位：{tier}。
+当前心情：{mood['label']}({mood['score']}/100)，{mood['visible_hint']}
+关系边界提示：{relation_state['boundary_hint']}
 
 【本档语气】
 {tier_guidance}
@@ -691,6 +699,7 @@ def touch_reaction_bundle(
     if character is None:
         raise ProviderError("character missing")
     tier = affection_tier(relation.affection)
+    relation_state = _relationship_state_for(session, relation, character)
     voice_profile_id = _voice_profile_id(character)
     areas: dict[str, Any] = {}
     for hit_area in enabled_hit_area_ids(session, appearance_id=appearance_id):
@@ -732,6 +741,7 @@ def touch_reaction_bundle(
         "character_id": character_id,
         "appearance_id": appearance_id,
         "tier": tier,
+        "relationship_state": relation_state,
         "voice_profile_id": voice_profile_id,
         "touch_pool_version": touch_pool_version(
             session,
@@ -799,6 +809,7 @@ def list_touch_pool_admin(
         raise ProviderError("character missing")
     relation_tier = affection_tier(relation.affection)
     voice_profile_id = _voice_profile_id(character)
+    relation_state = _relationship_state_for(session, relation, character)
     requested = str(tier or "").strip().lower()
     if requested == "all":
         grouped = [
@@ -820,6 +831,7 @@ def list_touch_pool_admin(
             "character_id": character_id,
             "appearance_id": appearance_id,
             "relation_tier": relation_tier,
+            "relationship_state": relation_state,
             "voice_profile_id": voice_profile_id,
             "voice_language": _voice_language(session, character),
             "tiers": grouped,
@@ -845,6 +857,7 @@ def list_touch_pool_admin(
         "appearance_id": appearance_id,
         "tier": active_tier,
         "relation_tier": relation_tier,
+        "relationship_state": relation_state,
         "voice_profile_id": voice_profile_id,
         "voice_language": _voice_language(session, character),
         "lines": payload["lines"],
@@ -871,6 +884,7 @@ def consume_touch_reaction(
     if character is None:
         raise ProviderError("character missing")
     tier = affection_tier(relation.affection)
+    relation_state = _relationship_state_for(session, relation, character)
     voice_profile_id = _voice_profile_id(character)
     area_cfg = get_hit_area(session, appearance_id=appearance_id, area_id=hit_area)
     base_cooldown = area_cfg.base_cooldown_ms if area_cfg is not None else 1400
@@ -920,7 +934,9 @@ def consume_touch_reaction(
     user_pool.updated_at = utc_now()
     session.commit()
     line = lines[pick]
-    return _line_response(line, hit_area=hit_area, tier=tier, base_cooldown_ms=base_cooldown)
+    response = _line_response(line, hit_area=hit_area, tier=tier, base_cooldown_ms=base_cooldown)
+    response["relationship_state"] = relation_state
+    return response
 
 
 def touch_pool_coverage_admin(
@@ -938,6 +954,7 @@ def touch_pool_coverage_admin(
         raise ProviderError("character missing")
     relation_tier = affection_tier(relation.affection)
     voice_profile_id = _voice_profile_id(character)
+    relation_state = _relationship_state_for(session, relation, character)
     hit_areas = enabled_hit_area_ids(session, appearance_id=appearance_id)
     matrix: list[dict[str, Any]] = []
     bundle_line_count = 0
@@ -974,6 +991,7 @@ def touch_pool_coverage_admin(
         "appearance_id": appearance_id,
         "user_id": user_id,
         "relation_tier": relation_tier,
+        "relationship_state": relation_state,
         "voice_profile_id": voice_profile_id,
         "hit_areas": hit_areas,
         "matrix": matrix,

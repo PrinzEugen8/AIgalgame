@@ -16,15 +16,23 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, ensure_calendar_proactive_candidates, update_calendar_event
+from .calendar_events import calendar_categories, calendar_items, calendar_unified_items, create_calendar_event, day_note, ensure_calendar_events, ensure_calendar_proactive_candidates, update_calendar_event
+from .character_profiles import (
+    get_or_create_user_character_profile,
+    resolve_character_profile,
+    update_user_character_profile,
+    user_character_profile_to_out,
+)
 from .database import get_session, init_db
-from .diagnostics import runtime_logs, tail_diagnostics, write_diagnostic
+from .diagnostics import diagnostic_span, new_trace_id, runtime_logs, tail_diagnostics, write_diagnostic
 from .image_generation import (
     MANUAL_IMAGE_COOLDOWN_SECONDS,
     ImageRequestBlocked,
     generate_safe_image,
+    infer_image_kind,
     normalize_image_kind,
 )
+from .information_circle import ensure_repost_candidate
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
@@ -44,6 +52,7 @@ from .models import (
     TtsVoiceProfile,
     User,
     UserCommitment,
+    UserCharacterProfile,
     UserLocation,
 )
 from .opening import consume_ready_opening, prepare_due_openings, prepare_opening
@@ -71,7 +80,7 @@ from .touch_reactions import (
     touch_reaction_bundle,
 )
 from .online import mark_heartbeat, mark_offline, mark_online, presence_context
-from .persona import normalize_memory_layer, normalize_persona_card, relation_attitude
+from .persona import normalize_memory_layer, normalize_persona_card, relation_attitude, relationship_state_summary, sync_relationship_stage
 from .pipeline import handle_event
 from .proactive import consume_proactive_event, create_moment_feedback_event, create_proactive_event, ensure_news_candidate, mark_proactive_delivered, mark_proactive_dismissed, pending_proactive_response
 from .push import record_delivery_attempt, register_device
@@ -100,7 +109,7 @@ from .schedule import ensure_schedule, run_daily_cycle
 from .scheduler import start_scheduler, stop_scheduler
 from .seed import DEFAULT_CHARACTER_ID, DEFAULT_USER_ID, ensure_seed
 from .utils import clamp, dump_json, load_json, uid
-from .vector_memory import delete_memory_vector, safe_index_memory_vector
+from .vector_memory import delete_memory_vector, explain_memory_recall, safe_index_memory_vector
 from .weather import ensure_weather_candidate, read_weather_snapshot, refresh_weather_snapshot, update_user_location, weather_snapshot_to_dict
 
 
@@ -242,7 +251,7 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     providers = [provider_to_out(item).model_dump() for item in session.execute(select(ProviderConfig)).scalars().all()]
     configured = {
         kind: any(item["kind"] == kind and item["ready"] for item in providers)
-        for kind in ("llm", "llm_task", "embedding", "tts", "search", "weather", "image")
+        for kind in ("llm", "llm_task", "embedding", "tts", "search", "weather", "image", "push")
     }
     return {"ok": True, "providers": providers, "configured": configured}
 
@@ -285,6 +294,7 @@ def _user_to_out(user: User) -> dict[str, Any]:
         "timezone": user.timezone,
         "sleep_start": user.sleep_start,
         "sleep_end": user.sleep_end,
+        "active_character_id": user.active_character_id,
         "interest_topics": load_json(user.interest_topics_json, []),
         "profile": load_json(user.profile_json, {}),
         "proactive_daily_limit": user.proactive_daily_limit,
@@ -300,9 +310,13 @@ def _user_to_out(user: User) -> dict[str, Any]:
     }
 
 
-def _relation_to_out(relation: RelationState, character: Character | None = None) -> dict[str, Any]:
-    persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name) if character is not None else {}
+def _relation_to_out(relation: RelationState, character: Character | None = None, session: Session | None = None) -> dict[str, Any]:
+    if session is not None:
+        persona_card = resolve_character_profile(session, user_id=relation.user_id, character_id=relation.character_id, character=character).card
+    else:
+        persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name) if character is not None else {}
     attitude_band, attitude_text = relation_attitude(relation, persona_card)
+    relationship_state = relationship_state_summary(relation, persona_card)
     return {
         "id": relation.id,
         "user_id": relation.user_id,
@@ -314,6 +328,10 @@ def _relation_to_out(relation: RelationState, character: Character | None = None
         "relationship_stage": relation.relationship_stage,
         "attitude_band": attitude_band,
         "attitude_text": attitude_text,
+        "affection_state": relationship_state["affection"],
+        "mood_state": relationship_state["mood"],
+        "relationship_state": relationship_state,
+        "touch_tier": relationship_state["touch_tier"],
         "last_interaction_at": relation.last_interaction_at,
         "updated_at": relation.updated_at,
     }
@@ -482,6 +500,37 @@ def _ensure_relation(session: Session, user_id: str, character_id: str = DEFAULT
     return relation
 
 
+def _touch_user_updated(user: User) -> None:
+    user.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+
+def _resolve_character_id(
+    session: Session,
+    *,
+    user_id: str,
+    character_id: str = "",
+    make_active: bool = False,
+) -> str:
+    ensure_seed(session, user_id=user_id)
+    user = session.get(User, user_id)
+    requested = str(character_id or "").strip()
+    active = str(user.active_character_id or "").strip() if user is not None else ""
+    # Older app builds send the legacy default "atri" on every request. Once the
+    # user has chosen another active character, that default must not switch them back.
+    if requested == DEFAULT_CHARACTER_ID and active and active != DEFAULT_CHARACTER_ID and session.get(Character, active) is not None:
+        return ensure_seed(session, user_id=user_id, character_id=active)
+    if requested and session.get(Character, requested) is not None:
+        resolved = ensure_seed(session, user_id=user_id, character_id=requested)
+        if make_active and user is not None and user.active_character_id != resolved:
+            user.active_character_id = resolved
+            _touch_user_updated(user)
+            session.commit()
+        return resolved
+    if requested:
+        return ensure_seed(session, user_id=user_id, character_id=requested)
+    return ensure_seed(session, user_id=user_id, character_id=active or DEFAULT_CHARACTER_ID)
+
+
 def _update_user_fields(user: User, payload: dict[str, Any]) -> None:
     for field in ("display_name", "timezone", "sleep_start", "sleep_end"):
         if field in payload:
@@ -520,7 +569,7 @@ def admin_users(page: int = 1, page_size: int = 20, q: str = "", session: Sessio
     } if character_ids else {}
     return {
         **_page_response([_user_to_out(item) for item in users], total, page, page_size),
-        "relations": [_relation_to_out(item, characters.get(item.character_id)) for item in relations],
+        "relations": [_relation_to_out(item, characters.get(item.character_id), session=session) for item in relations],
     }
 
 
@@ -533,7 +582,12 @@ def admin_create_user(payload: dict[str, Any], session: Session = Depends(get_se
     _update_user_fields(user, payload)
     session.add(user)
     session.commit()
-    ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    character_id = ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    user = session.get(User, user_id)
+    if user is not None:
+        user.active_character_id = character_id
+        _touch_user_updated(user)
+        session.commit()
     return _user_to_out(session.get(User, user_id))
 
 
@@ -554,6 +608,7 @@ def admin_delete_user(user_id: str, session: Session = Depends(get_session)) -> 
         raise HTTPException(status_code=404, detail="user not found")
     for model, field in (
         (RelationState, RelationState.user_id),
+        (UserCharacterProfile, UserCharacterProfile.user_id),
         (Memory, Memory.user_id),
         (ScheduleSlot, ScheduleSlot.user_id),
         (Message, Message.user_id),
@@ -580,21 +635,225 @@ def admin_update_relation(user_id: str, payload: dict[str, Any], session: Sessio
         relation.mood = clamp(int(payload.get("mood") or 0), -100, 100)
     if "relationship_stage" in payload:
         relation.relationship_stage = str(payload.get("relationship_stage") or "").strip() or relation.relationship_stage
+    sync_relationship_stage(relation)
     relation.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
     session.commit()
-    return _relation_to_out(relation, session.get(Character, character_id))
+    return _relation_to_out(relation, session.get(Character, character_id), session=session)
+
+
+@app.get("/api/admin/users/{user_id}/character-profile")
+def admin_user_character_profile(
+    user_id: str,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    include_cards: bool = True,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if session.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if session.get(Character, character_id) is None:
+        raise HTTPException(status_code=404, detail="character not found")
+    payload = user_character_profile_to_out(session, user_id=user_id, character_id=character_id, include_cards=include_cards)
+    session.commit()
+    return {"ok": True, **payload}
+
+
+@app.put("/api/admin/users/{user_id}/character-profile")
+def admin_update_user_character_profile(
+    user_id: str,
+    payload: dict[str, Any],
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = str(payload.get("character_id") or DEFAULT_CHARACTER_ID).strip() or DEFAULT_CHARACTER_ID
+    if session.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if session.get(Character, character_id) is None:
+        raise HTTPException(status_code=404, detail="character not found")
+    overlay = payload.get("overlay")
+    if overlay is None:
+        overlay = payload.get("persona_overlay")
+    if not isinstance(overlay, dict):
+        raise HTTPException(status_code=400, detail="overlay must be an object")
+    source_memory_ids = payload.get("source_memory_ids")
+    if source_memory_ids is not None and not isinstance(source_memory_ids, list):
+        raise HTTPException(status_code=400, detail="source_memory_ids must be a list")
+    profile = get_or_create_user_character_profile(session, user_id=user_id, character_id=character_id)
+    update_result = update_user_character_profile(
+        profile,
+        overlay=overlay,
+        source_memory_ids=[str(item) for item in source_memory_ids] if isinstance(source_memory_ids, list) else None,
+    )
+    session.commit()
+    result = user_character_profile_to_out(session, user_id=user_id, character_id=character_id, include_cards=True)
+    return {"ok": True, **result, "ignored_keys": update_result["ignored_keys"]}
 
 
 @app.get("/api/admin/users/{user_id}/memories")
-def admin_memories(user_id: str, page: int = 1, page_size: int = 20, q: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+def admin_memories(
+    user_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    layer: str = "",
+    vector_status: str = "",
+    hidden: str = "",
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     stmt = select(Memory).where(Memory.user_id == user_id)
     query = q.strip()
     if query:
         like = f"%{query}%"
         stmt = stmt.where(or_(Memory.content.like(like), Memory.layer.like(like), Memory.character_id.like(like)))
+    if layer.strip():
+        stmt = stmt.where(Memory.layer == normalize_memory_layer(layer.strip()))
+    if vector_status.strip():
+        stmt = stmt.where(Memory.vector_status == vector_status.strip())
+    if character_id.strip():
+        stmt = stmt.where(Memory.character_id == character_id.strip())
+    hidden_value = hidden.strip().lower()
+    if hidden_value in {"true", "1", "yes", "hidden"}:
+        stmt = stmt.where(Memory.hidden == True)  # noqa: E712
+    elif hidden_value in {"false", "0", "no", "visible"}:
+        stmt = stmt.where(Memory.hidden == False)  # noqa: E712
     stmt = stmt.order_by(Memory.created_at.desc())
     memories, total, page, page_size = _paginate_scalars(session, stmt, page=page, page_size=page_size)
     return _page_response([_memory_to_out(item) for item in memories], total, page, page_size)
+
+
+def _memory_layer_set(value: Any) -> set[str] | None:
+    if value in (None, ""):
+        return None
+    raw_items = value if isinstance(value, list) else str(value).split(",")
+    layers = {
+        normalize_memory_layer(str(item).strip(), default="")
+        for item in raw_items
+        if str(item).strip()
+    }
+    layers.discard("")
+    return layers or None
+
+
+@app.post("/api/admin/memory-recall/evaluate")
+def admin_memory_recall_evaluate(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    character_id = ensure_seed(session, user_id=user_id, character_id=str(body.get("character_id") or DEFAULT_CHARACTER_ID))
+    query = str(body.get("query") or body.get("text") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    return explain_memory_recall(
+        session,
+        user_id=user_id,
+        character_id=character_id,
+        query_text=query,
+        vector_layers=_memory_layer_set(body.get("vector_layers") or body.get("layers")),
+        fixed_layers=_memory_layer_set(body.get("fixed_layers")),
+        vector_limit=clamp(int(body.get("vector_limit") or body.get("limit") or 8), 1, 30),
+        fixed_limit=clamp(int(body.get("fixed_limit") or 8), 0, 30),
+        inactive_limit=clamp(int(body.get("inactive_limit") or 200), 1, 1000),
+        include_hidden=bool(body.get("include_hidden", False)),
+    )
+
+
+def _string_list(value: Any, default: list[str] | None = None) -> list[str]:
+    if value in (None, ""):
+        return list(default or [])
+    raw_items = value if isinstance(value, list) else str(value).split(",")
+    return [str(item).strip() for item in raw_items if str(item).strip()]
+
+
+@app.get("/api/admin/memory-vector/health")
+def admin_memory_vector_health(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = DEFAULT_CHARACTER_ID,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    rows = session.execute(
+        select(Memory.layer, Memory.vector_status, Memory.hidden, func.count())
+        .where(Memory.user_id == user_id, Memory.character_id == character_id)
+        .group_by(Memory.layer, Memory.vector_status, Memory.hidden)
+        .order_by(Memory.layer, Memory.vector_status, Memory.hidden)
+    ).all()
+    groups = [
+        {
+            "layer": str(layer or ""),
+            "vector_status": str(status or "unknown"),
+            "hidden": bool(hidden),
+            "count": int(count or 0),
+        }
+        for layer, status, hidden, count in rows
+    ]
+    total = sum(item["count"] for item in groups)
+    ready = sum(item["count"] for item in groups if item["vector_status"] == "ready" and not item["hidden"])
+    needs_reindex = sum(
+        item["count"]
+        for item in groups
+        if item["vector_status"] in {"pending", "error"} and not item["hidden"]
+    )
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "character_id": character_id,
+        "summary": {"total": total, "ready": ready, "needs_reindex": needs_reindex},
+        "groups": groups,
+    }
+
+
+@app.post("/api/admin/memory-vector/reindex")
+def admin_memory_vector_reindex(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    character_id = ensure_seed(session, user_id=user_id, character_id=str(body.get("character_id") or DEFAULT_CHARACTER_ID))
+    statuses = _string_list(body.get("statuses"), ["pending", "error"])
+    layers = _memory_layer_set(body.get("layers"))
+    limit = clamp(int(body.get("limit") or 100), 1, 500)
+    dry_run = bool(body.get("dry_run", False))
+    stmt = select(Memory).where(Memory.user_id == user_id, Memory.character_id == character_id)
+    if statuses:
+        stmt = stmt.where(Memory.vector_status.in_(statuses))
+    if layers:
+        stmt = stmt.where(Memory.layer.in_(sorted(layers)))
+    if not bool(body.get("include_hidden", False)):
+        stmt = stmt.where(Memory.hidden == False)  # noqa: E712
+    memories = session.execute(stmt.order_by(Memory.created_at.desc()).limit(limit)).scalars().all()
+    results: list[dict[str, Any]] = []
+    if dry_run:
+        results = [
+            {
+                "memory_id": item.memory_id,
+                "layer": item.layer,
+                "summary": item.content[:160],
+                "vector_status": item.vector_status,
+                "status": "dry_run",
+            }
+            for item in memories
+        ]
+    else:
+        for memory in memories:
+            result = safe_index_memory_vector(session, memory)
+            results.append(
+                {
+                    "memory_id": memory.memory_id,
+                    "layer": memory.layer,
+                    "summary": memory.content[:160],
+                    "vector_status": memory.vector_status,
+                    **result,
+                }
+            )
+        session.commit()
+    ok_count = len([item for item in results if item.get("status") in {"ready", "hidden", "dry_run"}])
+    error_count = len([item for item in results if item.get("status") == "error"])
+    return {
+        "ok": error_count == 0,
+        "dry_run": dry_run,
+        "user_id": user_id,
+        "character_id": character_id,
+        "matched": len(memories),
+        "indexed": ok_count if not dry_run else 0,
+        "errors": error_count,
+        "items": results,
+    }
 
 
 @app.post("/api/admin/users/{user_id}/memories")
@@ -828,7 +1087,7 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
     character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
     source_type = str(body.get("source_type") or "memory").strip()
-    if source_type not in {"news", "weather", "schedule", "calendar_event", "moment_interaction", "appointment", "memory"}:
+    if source_type not in {"news", "weather", "schedule", "calendar_event", "moment_interaction", "appointment", "memory", "repost"}:
         raise HTTPException(status_code=400, detail="unsupported proactive source_type")
     character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     local_time = _parse_client_time(str(body.get("local_time") or ""))
@@ -842,6 +1101,10 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
         event = ensure_news_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
         if event is not None:
             generated_by = "news_provider"
+    elif source_type == "repost" and not _payload_bool(body, "manual_only", False):
+        event = ensure_repost_candidate(session, user_id=user_id, character_id=character_id, local_time=local_time)
+        if event is not None:
+            generated_by = "information_circle"
             events.append(event)
     elif source_type == "weather" and not _payload_bool(body, "manual_only", False):
         snapshot = refresh_weather_snapshot(session, user_id=user_id, local_time=local_time, force=_payload_bool(body, "force_refresh", True))
@@ -890,6 +1153,7 @@ def admin_generate_proactive_source(payload: dict[str, Any] | None = None, sessi
         else:
             fallback_text = text or {
                 "news": "后台测试：有一条用户可能感兴趣的新闻，适合主动开口。",
+                "repost": "后台测试：角色刚刷到一条有趣内容，想转发给用户看看。",
                 "weather": "后台测试：天气有变化，适合提醒用户。",
                 "schedule": "后台测试：今天的 AI 日程里有一件事想告诉用户。",
                 "calendar_event": "后台测试：最近有一个日历事件适合问问用户安排。",
@@ -1080,14 +1344,54 @@ def update_character(character_id: str, payload: CharacterAdminIn, session: Sess
     return _character_to_out(character)
 
 
+@app.get("/api/characters")
+def public_characters(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
+    ensure_seed(session, user_id=user_id)
+    user = session.get(User, user_id)
+    characters = session.execute(select(Character).order_by(Character.character_id)).scalars().all()
+    return {
+        "ok": True,
+        "active_character_id": user.active_character_id if user is not None else DEFAULT_CHARACTER_ID,
+        "items": [_character_to_out(item).model_dump() for item in characters],
+    }
+
+
+@app.post("/api/characters/switch")
+def switch_character(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    requested = str(body.get("character_id") or "").strip()
+    ensure_seed(session, user_id=user_id)
+    if not requested:
+        raise HTTPException(status_code=400, detail="character_id is required")
+    character = session.get(Character, requested)
+    if character is None:
+        raise HTTPException(status_code=404, detail="character not found")
+    character_id = ensure_seed(session, user_id=user_id, character_id=requested)
+    user = session.get(User, user_id)
+    if user is not None:
+        user.active_character_id = character_id
+        _touch_user_updated(user)
+    relation = _ensure_relation(session, user_id, character_id)
+    sync_relationship_stage(relation)
+    session.commit()
+    character = session.get(Character, character_id)
+    return {
+        "ok": True,
+        "active_character_id": character_id,
+        "character": _character_to_out(character).model_dump() if character is not None else {},
+        "relation": _relation_to_out(relation, character, session=session),
+    }
+
+
 @app.get("/api/bootstrap")
 def bootstrap(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id, make_active=bool(str(character_id or "").strip()))
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
     relation = session.execute(
@@ -1095,8 +1399,9 @@ def bootstrap(
     ).scalar_one()
     character = session.get(Character, character_id)
     display_name = character.name if character and character.name else character_id
-    persona_card = normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=display_name)
+    persona_card = resolve_character_profile(session, user_id=user_id, character_id=character_id, character=character).card
     attitude_band, attitude_text = relation_attitude(relation, persona_card)
+    relationship_state = relationship_state_summary(relation, persona_card)
     live2d = live2d_bootstrap_payload(session, appearance_id=appearance_id)
     live2d["touch_pool_version"] = touch_pool_version(
         session,
@@ -1107,6 +1412,7 @@ def bootstrap(
     return {
         "user": {
             "user_id": user_id,
+            "active_character_id": character_id,
             "story_completed": bool(user and user.story_completed),
             "interest_topics": load_json(user.interest_topics_json if user else "[]", []),
         },
@@ -1123,6 +1429,10 @@ def bootstrap(
             "stage": relation.relationship_stage,
             "attitude_band": attitude_band,
             "attitude_text": attitude_text,
+            "affection_state": relationship_state["affection"],
+            "mood_state": relationship_state["mood"],
+            "relationship_state": relationship_state,
+            "touch_tier": relationship_state["touch_tier"],
         },
         "live2d": live2d,
         "touch_reactions_ready": True,
@@ -1132,11 +1442,11 @@ def bootstrap(
 @app.get("/api/live2d/config")
 def live2d_config(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     live2d = live2d_bootstrap_payload(session, appearance_id=appearance_id)
     live2d["touch_pool_version"] = touch_pool_version(
         session,
@@ -1150,11 +1460,11 @@ def live2d_config(
 @app.get("/api/live2d/touch/bundle")
 def live2d_touch_bundle(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     ensure_default_hit_areas(session, appearance_id=appearance_id)
     session.commit()
     try:
@@ -1172,10 +1482,10 @@ def live2d_touch_bundle(
 def live2d_touch(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
-    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = str(body.get("character_id") or "")
     appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
     hit_area = str(body.get("hit_area") or "")
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     try:
         return consume_touch_reaction(
             session,
@@ -1202,9 +1512,9 @@ def live2d_touch_refresh(
 ) -> dict[str, Any]:
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
-    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = str(body.get("character_id") or "")
     appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     hit_area = str(body.get("hit_area") or "")
     force = bool(body.get("force"))
     tts_only = bool(body.get("tts_only"))
@@ -1420,7 +1730,8 @@ def provider_models(provider_id: str, session: Session = Depends(get_session)) -
 @app.post("/api/events")
 def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
-        character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+        requested_character_id = event.character_id if "character_id" in event.model_fields_set else ""
+        character_id = _resolve_character_id(session, user_id=event.user_id, character_id=requested_character_id)
         event = event.model_copy(update={"character_id": character_id})
         result = handle_event(session, event)
         write_diagnostic("event_ok", event_type=event.event_type, session_id=event.session_id, result_type=result.event_type)
@@ -1469,10 +1780,10 @@ def _location_to_out(location: UserLocation | None) -> dict[str, Any] | None:
 def location_update(
     payload: dict[str, Any] | None = None,
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=character_id)
+    _resolve_character_id(session, user_id=user_id, character_id=character_id)
     body = payload or {}
     try:
         latitude = float(body.get("latitude"))
@@ -1505,7 +1816,7 @@ def weather_current(
     local_time: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    ensure_seed(session, user_id=user_id, character_id=DEFAULT_CHARACTER_ID)
+    _resolve_character_id(session, user_id=user_id)
     snapshot = read_weather_snapshot(session, user_id=user_id, local_time=_parse_client_time(local_time), allow_stale=True)
     location = session.get(UserLocation, user_id)
     return {"ok": True, "location": _location_to_out(location), "weather": weather_snapshot_to_dict(snapshot)}
@@ -1515,13 +1826,13 @@ def weather_current(
 def weather_refresh(
     payload: dict[str, Any] | None = None,
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     body = payload or {}
     effective_user_id = str(body.get("user_id") or user_id)
-    effective_character_id = ensure_seed(session, user_id=effective_user_id, character_id=str(body.get("character_id") or character_id))
+    effective_character_id = _resolve_character_id(session, user_id=effective_user_id, character_id=str(body.get("character_id") or character_id))
     local_time = _parse_client_time(str(body.get("local_time") or ""))
     snapshot = refresh_weather_snapshot(session, user_id=effective_user_id, local_time=local_time, force=True)
     event = ensure_weather_candidate(session, user_id=effective_user_id, character_id=effective_character_id, local_time=local_time) if snapshot is not None else None
@@ -1537,23 +1848,29 @@ def weather_refresh(
 @app.get("/api/proactive/pending")
 def proactive_pending(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     local_time: str = "",
+    generate_news: bool = True,
+    generate_weather: bool = True,
+    appointment_only: bool = False,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     return pending_proactive_response(
         session,
         user_id=user_id,
         character_id=character_id,
         local_time=_parse_client_time(local_time),
+        generate_news=generate_news,
+        generate_weather=generate_weather,
+        appointment_only=appointment_only,
     )
 
 
 @app.post("/api/devices/register")
 def devices_register(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
     user_id = str(payload.get("user_id") or DEFAULT_USER_ID)
-    character_id = ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=str(payload.get("character_id") or ""))
     try:
         registration = register_device(session, {**payload, "user_id": user_id, "character_id": character_id})
     except ValueError as exc:
@@ -1580,9 +1897,9 @@ def presence_heartbeat(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 def proactive_foreground_check(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
-    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = str(body.get("character_id") or "")
     device_id = str(body.get("device_id") or "android")
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     heartbeat = {
         "app_state": "foreground",
         "screen": str(body.get("screen") or ""),
@@ -1662,12 +1979,12 @@ def proactive_consume(event_id: str, session: Session = Depends(get_session)) ->
 def opening_prepare(
     payload: dict[str, Any] | None = None,
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     body = payload or {}
-    body_character_id = ensure_seed(session, user_id=str(body.get("user_id") or user_id), character_id=str(body.get("character_id") or character_id))
+    body_character_id = _resolve_character_id(session, user_id=str(body.get("user_id") or user_id), character_id=str(body.get("character_id") or character_id))
     return prepare_opening(
         session,
         user_id=str(body.get("user_id") or user_id),
@@ -1681,13 +1998,13 @@ def opening_prepare(
 @app.get("/api/opening/ready")
 def opening_ready(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session_id: str = "android",
     local_time: str = "",
     proactive_event_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     result = consume_ready_opening(
         session,
         user_id=user_id,
@@ -1712,7 +2029,8 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
             event = EventIn(**payload, user_id=payload.get("user_id") or user_id)
             with next(get_session()) as session:
                 try:
-                    character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+                    requested_character_id = str(payload.get("character_id") or "")
+                    character_id = _resolve_character_id(session, user_id=event.user_id, character_id=requested_character_id)
                     event = event.model_copy(update={"character_id": character_id})
                     result = handle_event(session, event)
                     await websocket.send_json(result.model_dump())
@@ -1732,24 +2050,28 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
 
 
 @app.get("/api/state/home")
-def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=datetime.now())
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
     ).scalar_one()
     next_slot = session.execute(
-        select(ScheduleSlot).where(ScheduleSlot.user_id == user_id, ScheduleSlot.actual_status == "pending").order_by(ScheduleSlot.start_at).limit(1)
+        select(ScheduleSlot)
+        .where(ScheduleSlot.user_id == user_id, ScheduleSlot.character_id == character_id, ScheduleSlot.actual_status == "pending")
+        .order_by(ScheduleSlot.start_at)
+        .limit(1)
     ).scalar_one_or_none()
     unread = session.execute(
         select(MomentInteraction).where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
     ).scalars().all()
     character = session.get(Character, character_id)
     display_name = character.name if character and character.name else character_id
-    persona_card = normalize_persona_card(load_json(character.persona_card_json if character else "{}", {}), name=display_name)
+    persona_card = resolve_character_profile(session, user_id=user_id, character_id=character_id, character=character).card
     attitude_band, attitude_text = relation_attitude(relation, persona_card)
+    relationship_state = relationship_state_summary(relation, persona_card)
     return {
-        "character": {"name": display_name, "pose": "happy" if relation.mood >= 0 else "sad"},
+        "character": {"name": display_name, "pose": relationship_state["mood"].get("expression") or ("happy" if relation.mood >= 0 else "sad")},
         "relation": {
             "affection": relation.affection,
             "trust": relation.trust,
@@ -1758,6 +2080,10 @@ def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARA
             "stage": relation.relationship_stage,
             "attitude_band": attitude_band,
             "attitude_text": attitude_text,
+            "affection_state": relationship_state["affection"],
+            "mood_state": relationship_state["mood"],
+            "relationship_state": relationship_state,
+            "touch_tier": relationship_state["touch_tier"],
         },
         "schedule": {
             "current_title": next_slot.activity_title if next_slot else "想和你聊天",
@@ -1781,6 +2107,12 @@ def moments(session: Session = Depends(get_session)) -> dict[str, Any]:
                 "media_asset_id": row.media_asset_id,
                 "media_url": f"/media/{row.media_asset_id}" if row.media_asset_id else "",
                 "mood_snapshot": row.mood_snapshot,
+                "moment_type": row.moment_type,
+                "source_platform": row.source_platform,
+                "source_title": row.source_title,
+                "source_url": row.source_url,
+                "source_summary": row.source_summary,
+                "source_payload": load_json(row.source_payload_json, {}),
                 "created_at": row.created_at,
                 "likes": len([item for item in interactions if item.interaction_type == "like"]),
                 "like_actors": [
@@ -1813,10 +2145,10 @@ def moments(session: Session = Depends(get_session)) -> dict[str, Any]:
 def generate_image(
     payload: dict[str, Any],
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     image_config = get_enabled_provider(session, "image")
     if image_config is None:
         raise HTTPException(status_code=400, detail="image provider is not configured")
@@ -1859,15 +2191,19 @@ def generate_image(
 
 @app.post("/api/moments/{moment_id}/like")
 def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    if session.get(Moment, moment_id) is None:
+    moment = session.get(Moment, moment_id)
+    if moment is None:
         raise HTTPException(status_code=404, detail="moment not found")
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=moment.author_id)
+    character = session.get(Character, character_id)
+    character_name = character.name if character is not None and character.name else character_id
     interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="like")
     session.add(interaction)
-    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content="用户点赞了亚托莉的朋友圈。", source_event_id=interaction.interaction_id, importance=0.6, confidence=0.9))
+    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=character_id, layer="temporary", content=f"用户点赞了{character_name}的朋友圈。", source_event_id=interaction.interaction_id, importance=0.6, confidence=0.9))
     create_moment_feedback_event(
         session,
         user_id=user_id,
-        character_id=DEFAULT_CHARACTER_ID,
+        character_id=character_id,
         interaction_id=interaction.interaction_id,
         interaction_type="like",
         moment_id=moment_id,
@@ -1878,18 +2214,22 @@ def like_moment(moment_id: str, user_id: str = DEFAULT_USER_ID, session: Session
 
 @app.post("/api/moments/{moment_id}/comments")
 def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    if session.get(Moment, moment_id) is None:
+    moment = session.get(Moment, moment_id)
+    if moment is None:
         raise HTTPException(status_code=404, detail="moment not found")
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=moment.author_id)
+    character = session.get(Character, character_id)
+    character_name = character.name if character is not None and character.name else character_id
     content = str(payload.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="content required")
     interaction = MomentInteraction(interaction_id=uid("mi"), moment_id=moment_id, actor_id=user_id, actor_name="你", interaction_type="comment", content=content)
     session.add(interaction)
-    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=DEFAULT_CHARACTER_ID, layer="temporary", content=f"用户评论了亚托莉的朋友圈：{content}", source_event_id=interaction.interaction_id, importance=0.8, confidence=0.95))
+    session.add(Memory(memory_id=uid("mem"), user_id=user_id, character_id=character_id, layer="temporary", content=f"用户评论了{character_name}的朋友圈：{content}", source_event_id=interaction.interaction_id, importance=0.8, confidence=0.95))
     create_moment_feedback_event(
         session,
         user_id=user_id,
-        character_id=DEFAULT_CHARACTER_ID,
+        character_id=character_id,
         interaction_id=interaction.interaction_id,
         interaction_type="comment",
         moment_id=moment_id,
@@ -1900,27 +2240,42 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
 
 
 @app.get("/api/calendar")
-def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
     day = datetime.now()
     prefix = month or day.strftime("%Y-%m")
+    if prefix == day.strftime("%Y-%m"):
+        ensure_schedule(session, user_id=user_id, character_id=character_id, day=day)
     items = calendar_items(session, user_id=user_id, character_id=character_id, month=prefix)
+    unified_items = calendar_unified_items(session, user_id=user_id, character_id=character_id, month=prefix)
     notes = {item["date"]: day_note(session, day=item["date"]) for item in items}
+    days = [
+        {
+            **item,
+            "day_note": notes.get(item["date"], ""),
+        }
+        for item in items
+    ]
+    unified_notes = {item["date"]: notes.get(item["date"], day_note(session, day=item["date"])) for item in unified_items}
+    unified_days = [
+        {
+            **item,
+            "day_note": unified_notes.get(item["date"], ""),
+        }
+        for item in unified_items
+    ]
     return {
         "month": prefix,
-        "days": [
-            {
-                **item,
-                "day_note": notes.get(item["date"], ""),
-            }
-            for item in items
-        ],
+        "days": days,
+        "items": unified_days,
+        "categories": calendar_categories(unified_days),
     }
 
 
 @app.get("/api/journal")
-def journal(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    memories = session.execute(select(Memory).where(Memory.user_id == user_id, Memory.hidden == False).order_by(Memory.created_at.desc()).limit(80)).scalars().all()  # noqa: E712
+def journal(user_id: str = DEFAULT_USER_ID, character_id: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = _resolve_character_id(session, user_id=user_id, character_id=character_id)
+    memories = session.execute(select(Memory).where(Memory.user_id == user_id, Memory.character_id == character_id, Memory.hidden == False).order_by(Memory.created_at.desc()).limit(80)).scalars().all()  # noqa: E712
     return {
         "memories": [
             {
@@ -1939,9 +2294,9 @@ def journal(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_sessi
 @app.get("/api/widget/state")
 def widget_state(user_id: str = DEFAULT_USER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
     home = home_state(user_id=user_id, session=session)
-    mood = home["relation"]["mood"]
-    status = "开心" if mood >= 20 else "想聊天" if mood >= 0 else "有点低落"
-    bubble = "今天也想听你说说话。" if status == "想聊天" else "刚刚有新的小事想告诉你。"
+    mood = home["relation"].get("mood_state") or {}
+    status = str(mood.get("label") or ("开心" if home["relation"]["mood"] >= 20 else "想聊天" if home["relation"]["mood"] >= 0 else "有点低落"))
+    bubble = "今天也想听你说说话。" if status in {"平静", "想聊天"} else "刚刚有新的小事想告诉你。"
     return {"character_name": home["character"]["name"], "status": status, "bubble": bubble, "unread_count": home["unread_count"], "open_target": "home"}
 
 
@@ -1954,6 +2309,192 @@ def get_media(asset_id: str, session: Session = Depends(get_session)) -> FileRes
     if not path.exists():
         raise HTTPException(status_code=404, detail="asset file missing")
     return FileResponse(path)
+
+
+def _debug_bool(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _debug_moment_to_out(moment: Moment, asset: MediaAsset | None = None) -> dict[str, Any]:
+    return {
+        "moment_id": moment.moment_id,
+        "author_id": moment.author_id,
+        "author_name": moment.author_name,
+        "text": moment.text,
+        "media_asset_id": moment.media_asset_id,
+        "media_url": f"/media/{moment.media_asset_id}" if moment.media_asset_id else "",
+        "asset_type": asset.asset_type if asset is not None else "",
+        "mood_snapshot": moment.mood_snapshot,
+        "source_payload": load_json(moment.source_payload_json, {}),
+        "created_at": moment.created_at,
+    }
+
+
+@app.post("/api/debug/generate-moment")
+def debug_generate_moment(
+    payload: dict[str, Any] | None = None,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    body = payload or {}
+    resolved_user_id = str(body.get("user_id") or user_id)
+    resolved_character_id = _resolve_character_id(
+        session,
+        user_id=resolved_user_id,
+        character_id=str(body.get("character_id") or character_id),
+    )
+    character = session.get(Character, resolved_character_id)
+    character_name = character.name if character is not None and character.name else resolved_character_id
+    text = str(body.get("text") or "").strip() or "刚刚拍了一张测试用的照片。如果你能看到这条朋友圈和图片，就说明图片生成链路跑通了。"
+    mood = str(body.get("mood") or "测试").strip() or "测试"
+    scene_hint = (
+        str(body.get("scene_hint") or body.get("photo_prompt") or "")
+        .strip()
+        or "窗边的手机随手拍，柔和午后光线，一张用于验证朋友圈图片生成的日常场景"
+    )
+    requested_kind = str(body.get("image_kind") or body.get("kind") or "").strip()
+    should_generate_image = _debug_bool(body.get("generate_image"), True)
+    trace_id = new_trace_id("debug_moment")
+
+    with diagnostic_span(
+        "debug_moment_trace",
+        feature="朋友圈测试",
+        stage="generate_moment",
+        purpose="Generate a debug moment and optional image asset",
+        summary=f"{resolved_user_id}/{resolved_character_id}",
+        trace_id=trace_id,
+        input={
+            "user_id": resolved_user_id,
+            "character_id": resolved_character_id,
+            "text": text,
+            "scene_hint": scene_hint,
+            "requested_kind": requested_kind,
+            "generate_image": should_generate_image,
+        },
+    ) as span:
+        asset: MediaAsset | None = None
+        image_kind = ""
+        if should_generate_image:
+            image_config = get_enabled_provider(session, "image")
+            if image_config is None:
+                raise HTTPException(status_code=400, detail="image provider is not configured")
+            try:
+                image_kind = normalize_image_kind(requested_kind) if requested_kind else infer_image_kind(scene_hint)
+            except ImageRequestBlocked as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            try:
+                asset = generate_safe_image(
+                    session,
+                    config=image_config,
+                    kind=image_kind,
+                    scene_hint=scene_hint,
+                    character=character,
+                    user_id=resolved_user_id,
+                    character_id=resolved_character_id,
+                    source_id=f"debug_moment:{uid('source')}",
+                    mood=mood,
+                    cooldown_seconds=0,
+                )
+            except ImageRequestBlocked as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except ProviderError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        moment = Moment(
+            moment_id=uid("moment"),
+            author_id=resolved_character_id,
+            author_name=character_name,
+            text=text,
+            media_asset_id=asset.asset_id if asset is not None else "",
+            source_experience_id="debug_moment",
+            mood_snapshot=mood,
+            source_payload_json=dump_json(
+                {
+                    "debug": True,
+                    "tool": "generate_moment",
+                    "trace_id": trace_id,
+                    "image_kind": image_kind,
+                    "scene_hint": scene_hint,
+                    "media_asset_id": asset.asset_id if asset is not None else "",
+                }
+            ),
+        )
+        session.add(moment)
+
+        likes = body.get("likes") if isinstance(body.get("likes"), list) else ["同桌同学", "社团前辈"]
+        for index, name in enumerate(likes[:8]):
+            actor_name = str(name or "").strip()[:24] or f"NPC {index + 1}"
+            session.add(
+                MomentInteraction(
+                    interaction_id=uid("mi"),
+                    moment_id=moment.moment_id,
+                    actor_type="npc",
+                    actor_id=f"debug_npc_like_{index}",
+                    actor_name=actor_name,
+                    interaction_type="like",
+                )
+            )
+
+        comments = body.get("comments") if isinstance(body.get("comments"), list) else [
+            {"actor_name": "图片链路测试", "content": "能看到图的话，这条链路就是通的。"}
+        ]
+        for index, item in enumerate(comments[:8]):
+            actor_name = ""
+            content = ""
+            if isinstance(item, dict):
+                actor_name = str(item.get("actor_name") or item.get("name") or "").strip()
+                content = str(item.get("content") or item.get("text") or "").strip()
+            else:
+                content = str(item or "").strip()
+            if not content:
+                continue
+            session.add(
+                MomentInteraction(
+                    interaction_id=uid("mi"),
+                    moment_id=moment.moment_id,
+                    actor_type="npc",
+                    actor_id=f"debug_npc_comment_{index}",
+                    actor_name=(actor_name[:24] or f"NPC {index + 1}"),
+                    interaction_type="comment",
+                    content=content[:160],
+                )
+            )
+
+        session.commit()
+        result = {
+            "ok": True,
+            "trace_id": trace_id,
+            "moment": _debug_moment_to_out(moment, asset),
+            "image": {
+                "generated": asset is not None,
+                "kind": image_kind,
+                "asset_id": asset.asset_id if asset is not None else "",
+                "url": asset.url if asset is not None else "",
+                "asset_type": asset.asset_type if asset is not None else "",
+                "prompt": asset.prompt if asset is not None else "",
+            },
+            "runtime_logs_hint": f"/api/admin/runtime-logs?trace_id={trace_id}",
+        }
+        write_diagnostic(
+            "debug_moment_created",
+            moment_id=moment.moment_id,
+            media_asset_id=moment.media_asset_id,
+            image_kind=image_kind,
+        )
+        span.add(output={"moment_id": moment.moment_id, "media_asset_id": moment.media_asset_id, "image_kind": image_kind})
+        logger.info(
+            "debug moment generated user_id=%s character_id=%s moment_id=%s media_asset_id=%s",
+            resolved_user_id,
+            resolved_character_id,
+            moment.moment_id,
+            moment.media_asset_id,
+        )
+        return result
 
 
 @app.post("/api/debug/run-daily-cycle")

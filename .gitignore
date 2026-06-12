@@ -10,6 +10,7 @@ build/
 .env
 .env.*
 !.env.example
+*firebase-adminsdk*.json
 
 backend/data/*
 !backend/data/.gitkeep
@@ -24,3 +25,5 @@ android/local.properties
 android/**/build/
 android/.gradle/
 android/.kotlin/
+android/app/libs/sherpa-onnx-static-link-onnxruntime-*.aar
+android/app/src/main/assets/sherpa-onnx-*/

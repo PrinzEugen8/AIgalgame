@@ -25,6 +25,15 @@ SENSITIVE_KEYS = {
     "private_key",
     "cookie",
 }
+SAFE_TOKEN_COUNT_KEYS = {
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "input_token_count",
+    "output_token_count",
+}
 MAX_STRING_LENGTH = 12000
 MAX_RUNTIME_ITEMS = 500
 RUNNING_STALE_SECONDS = 15 * 60
@@ -39,7 +48,9 @@ def _redact(value: Any) -> Any:
         redacted: dict[str, Any] = {}
         for key, item in value.items():
             lowered = str(key).lower()
-            if any(part in lowered for part in SENSITIVE_KEYS):
+            if lowered in SAFE_TOKEN_COUNT_KEYS:
+                redacted[str(key)] = _redact(item)
+            elif any(part in lowered for part in SENSITIVE_KEYS):
                 redacted[str(key)] = "***"
             else:
                 redacted[str(key)] = _redact(item)
@@ -309,7 +320,9 @@ def _references_summary(item: dict[str, Any]) -> str:
         "schedule": "日程",
         "character_schedule": "角色日程",
         "user_schedule": "用户日程",
+        "calendar": "日历",
         "weather": "天气",
+        "web_search": "联网搜索",
         "persona": "人设",
         "user_profile": "用户画像",
         "relation_attitude": "关系态度",
@@ -432,6 +445,120 @@ def _build_flows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return flows
 
 
+def _number_value(value: Any) -> float:
+    if isinstance(value, dict):
+        value = value.get("amount") or value.get("cost") or value.get("value")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _usage_from_item(item: dict[str, Any]) -> dict[str, int]:
+    details = item.get("details") or {}
+    start = details.get("start") or {}
+    end = details.get("end") or {}
+    point = details.get("point") or {}
+    response = _first_present(end.get("response"), point.get("response"))
+    response_usage = response.get("usage") if isinstance(response, dict) else None
+    usage = _first_present(end.get("usage"), point.get("usage"), response_usage)
+    usage = usage if isinstance(usage, dict) else {}
+
+    def number(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    prompt_tokens = number("prompt_tokens", "input_tokens")
+    completion_tokens = number("completion_tokens", "output_tokens")
+    total_tokens = number("total_tokens")
+    if not total_tokens:
+        total_tokens = prompt_tokens + completion_tokens
+    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+
+
+def _cost_from_item(item: dict[str, Any]) -> float:
+    details = item.get("details") or {}
+    end = details.get("end") or {}
+    point = details.get("point") or {}
+    response = _first_present(end.get("response"), point.get("response"))
+    response_cost = response.get("estimated_cost") if isinstance(response, dict) else None
+    return _number_value(_first_present(end.get("estimated_cost"), point.get("estimated_cost"), response_cost))
+
+
+def _provider_model_from_item(item: dict[str, Any]) -> tuple[str, str, str]:
+    details = item.get("details") or {}
+    start = details.get("start") or {}
+    end = details.get("end") or {}
+    point = details.get("point") or {}
+    provider_id = str(_first_present(start.get("provider_id"), end.get("provider_id"), point.get("provider_id")) or "")
+    provider = str(_first_present(start.get("provider"), end.get("provider"), point.get("provider")) or "")
+    model = str(_first_present(start.get("model"), end.get("model"), point.get("model")) or "")
+    return provider_id, provider, model
+
+
+def _trace_metrics(ordered: list[dict[str, Any]]) -> dict[str, Any]:
+    stage_elapsed: dict[str, int] = {}
+    model_usage: dict[str, dict[str, Any]] = {}
+    totals = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost": 0.0,
+        "tts_elapsed_ms": 0,
+        "tts_request_count": 0,
+    }
+    for item in ordered:
+        stage = str(item.get("stage") or item.get("event") or "unknown")
+        elapsed_ms = int(item.get("elapsed_ms") or 0)
+        stage_elapsed[stage] = stage_elapsed.get(stage, 0) + elapsed_ms
+        feature = str(item.get("feature") or "")
+        event = str(item.get("event") or "")
+        if feature == "TTS" or event == "tts_request":
+            totals["tts_elapsed_ms"] += elapsed_ms
+            totals["tts_request_count"] += 1
+        usage = _usage_from_item(item)
+        cost = _cost_from_item(item)
+        provider_id, provider, model = _provider_model_from_item(item)
+        has_usage = any(usage.values()) or cost > 0
+        if event not in {"llm_request", "embedding_request", "search_request"} and not has_usage:
+            continue
+        if not has_usage and not (provider_id or provider or model):
+            continue
+        key = f"{provider_id or provider or 'provider'}::{model or 'model'}"
+        entry = model_usage.setdefault(
+            key,
+            {
+                "provider_id": provider_id,
+                "provider": provider,
+                "model": model,
+                "request_count": 0,
+                "elapsed_ms": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost": 0.0,
+            },
+        )
+        entry["request_count"] += 1
+        entry["elapsed_ms"] += elapsed_ms
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            entry[field] += int(usage.get(field) or 0)
+            totals[field] += int(usage.get(field) or 0)
+        entry["estimated_cost"] = round(float(entry["estimated_cost"]) + cost, 8)
+        totals["estimated_cost"] = round(float(totals["estimated_cost"]) + cost, 8)
+    return {
+        "stage_elapsed_ms": dict(sorted(stage_elapsed.items(), key=lambda item: item[1], reverse=True)),
+        "models": sorted(model_usage.values(), key=lambda item: int(item.get("elapsed_ms") or 0), reverse=True),
+        "totals": totals,
+    }
+
+
 def _build_traces(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in items:
@@ -504,6 +631,7 @@ def _build_traces(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "edges": parent_edges or sequence_edges,
                 "sequence_edges": sequence_edges,
                 "items": ordered,
+                "metrics": _trace_metrics(ordered),
             }
         )
     traces.sort(key=lambda trace: float(trace.get("started_ts") or 0), reverse=True)

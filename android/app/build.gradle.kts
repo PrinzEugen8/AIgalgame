@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.gms.google-services")
 }
 
 val aigalgameCompileSdk: Int = (findProperty("aigalgame.compileSdkOverride") as? String)?.toInt()
@@ -10,6 +11,8 @@ val aigalgameCompileSdk: Int = (findProperty("aigalgame.compileSdkOverride") as?
 val aigalgameTargetSdk: Int = (findProperty("aigalgame.targetSdkOverride") as? String)?.toInt()
     ?: (findProperty("PROP_TARGET_SDK_VERSION") as? String)?.toInt()
     ?: 35
+val sherpaVersion = "1.13.2"
+val sherpaAar = layout.projectDirectory.file("libs/sherpa-onnx-static-link-onnxruntime-$sherpaVersion.aar")
 
 android {
     namespace = "com.aigalgame.demo"
@@ -38,6 +41,10 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    androidResources {
+        noCompress += setOf("onnx", "txt")
     }
 
     compileOptions {
@@ -111,8 +118,32 @@ tasks.register("verifyOfficialLive2DAssets") {
     }
 }
 
+tasks.register("verifyLocalAsrAssets") {
+    group = "verification"
+    description = "Checks sherpa-onnx local ASR runtime and model assets."
+    val required = listOf(
+        "libs/sherpa-onnx-static-link-onnxruntime-$sherpaVersion.aar",
+        "src/main/assets/sherpa-onnx-streaming-paraformer-bilingual-zh-en/encoder.int8.onnx",
+        "src/main/assets/sherpa-onnx-streaming-paraformer-bilingual-zh-en/decoder.int8.onnx",
+        "src/main/assets/sherpa-onnx-streaming-paraformer-bilingual-zh-en/tokens.txt",
+        "src/main/assets/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx",
+        "src/main/assets/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt",
+    )
+    doLast {
+        val missing = required.filterNot { layout.projectDirectory.file(it).asFile.exists() }
+        if (missing.isNotEmpty()) {
+            throw GradleException(
+                "Missing Android local ASR assets: ${missing.joinToString()}. " +
+                    "Run from repo root: powershell -ExecutionPolicy Bypass -File tools/fetch_android_asr_assets.ps1 -Download " +
+                    "or pass -SourceProject to copy an existing local ASR setup."
+            )
+        }
+    }
+}
+
 tasks.named("preBuild") {
     dependsOn("verifyOfficialLive2DAssets")
+    dependsOn("verifyLocalAsrAssets")
 }
 
 dependencies {
@@ -132,6 +163,7 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation(files("libs/Live2DCubismCore.aar"))
+    implementation(files(sherpaAar.asFile))
 
     testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")

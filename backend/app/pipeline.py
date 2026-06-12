@@ -3,15 +3,18 @@
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .character_profiles import resolve_character_profile
 from .commitments import extract_user_commitment
+from .context_planner import build_context_plan, context_plan_reference, user_profile_has_content
 from .diagnostics import current_span_id, current_trace_id, diagnostic_point, diagnostic_span, new_span_id, write_diagnostic
 from .models import (
+    CalendarEvent,
     Character,
     Memory,
     Message,
@@ -28,13 +31,14 @@ from .persona import (
     FIXED_MEMORY_LAYERS,
     VECTOR_RECALL_LAYERS,
     normalize_memory_layer,
-    normalize_persona_card,
     persona_card_summary,
     relation_attitude,
+    relationship_state_summary,
+    sync_relationship_stage,
     user_profile_summary,
 )
 from .proactive import consume_proactive_event, ensure_proactive_event_image, mark_proactive_opened, mark_proactive_reflected
-from .providers import OpenAICompatibleClient, ProviderError, VolcTtsClient, get_enabled_provider, get_task_llm_provider
+from .providers import OpenAICompatibleClient, ProviderError, VolcArkWebSearchClient, VolcTtsClient, get_enabled_provider, get_enabled_provider_by_provider, get_task_llm_provider
 from .schemas import AppEventOut, DialogueLine, DialoguePayload, EventIn, RelationDelta, ReplyOption
 from .schedule import ensure_schedule, mark_interruption
 from .utils import clamp, dump_json, load_json, uid, utc_now
@@ -69,6 +73,7 @@ def _apply_delta(relation: RelationState, delta: RelationDelta) -> None:
     relation.trust = clamp(relation.trust + delta.trust, 0, 1000)
     relation.dependency = clamp(relation.dependency + delta.dependency, 0, 1000)
     relation.mood = clamp(relation.mood + delta.mood, -100, 100)
+    sync_relationship_stage(relation)
     relation.last_interaction_at = utc_now()
     relation.updated_at = utc_now()
 
@@ -136,6 +141,11 @@ def _split_expression_tag(text: str) -> tuple[str, str]:
 def _summary_text(value: str, limit: int = 120) -> str:
     text = " ".join(str(value or "").split())
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _skipped_context(source: str, label: str) -> tuple[str, dict[str, Any]]:
+    text = f"计划器本轮未取用{label}。"
+    return text, {"used": False, "planned": False, "count": 0, "items": [], "summary": text, "source": source}
 
 
 def _start_reply_stage(stage: str, summary: str, *, input_payload: dict[str, Any] | None = None, references: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -208,71 +218,105 @@ def _memories_by_ids(session: Session, memory_ids: list[str]) -> list[Memory]:
     return [by_id[memory_id] for memory_id in memory_ids if memory_id in by_id and not by_id[memory_id].hidden]
 
 
-def _context_with_references(session: Session, user_id: str, character_id: str, query_text: str = "") -> tuple[str, dict[str, Any], dict[str, Any]]:
-    fixed_memories = session.execute(
-        select(Memory)
-        .where(
-            Memory.user_id == user_id,
-            Memory.character_id == character_id,
-            Memory.hidden == False,  # noqa: E712
-            Memory.layer.in_(sorted(FIXED_MEMORY_LAYERS)),
-        )
-        .order_by(Memory.importance.desc(), Memory.created_at.desc())
-        .limit(8)
-    ).scalars().all()
+def _context_with_references(
+    session: Session,
+    user_id: str,
+    character_id: str,
+    query_text: str = "",
+    *,
+    include_memory: bool = True,
+    include_moment_interactions: bool = True,
+    memory_layers: set[str] | None = None,
+    memory_limit: int = 8,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    selected_layers = set(memory_layers or (FIXED_MEMORY_LAYERS | VECTOR_RECALL_LAYERS))
+    fixed_layers = selected_layers.intersection(FIXED_MEMORY_LAYERS)
+    vector_layers = selected_layers.intersection(VECTOR_RECALL_LAYERS)
+    memory_limit = max(0, min(int(memory_limit or 0), 12))
+    fixed_memories: list[Memory] = []
     vector_hits = []
     vector_error = ""
-    try:
-        vector_hits = search_memory_vectors(
-            session,
-            user_id=user_id,
-            character_id=character_id,
-            query_text=query_text,
-            layers=VECTOR_RECALL_LAYERS,
-            limit=8,
-        )
-    except Exception as exc:  # noqa: BLE001
-        vector_error = str(exc)
-        write_diagnostic(
-            "memory_vector_recall_fallback",
-            feature="记忆向量",
-            stage="search_memory",
-            user_id=user_id,
-            character_id=character_id,
-            error_type=type(exc).__name__,
-            message=str(exc),
-        )
-    hit_by_id = {hit.memory_id: hit for hit in vector_hits}
-    recalled_memories = _memories_by_ids(session, [hit.memory_id for hit in vector_hits])
-    recall_source = "qdrant" if recalled_memories else "sqlite_recent"
-    if not recalled_memories:
-        recalled_memories = session.execute(
-            select(Memory)
-            .where(
-                Memory.user_id == user_id,
-                Memory.character_id == character_id,
-                Memory.hidden == False,  # noqa: E712
-                Memory.layer.in_(sorted(VECTOR_RECALL_LAYERS)),
-            )
-            .order_by(Memory.created_at.desc())
-            .limit(8)
-        ).scalars().all()
+    recalled_memories: list[Memory] = []
+    hit_by_id = {}
+    recall_source = "planner_skipped"
+    if include_memory and memory_limit > 0:
+        if fixed_layers:
+            fixed_memories = session.execute(
+                select(Memory)
+                .where(
+                    Memory.user_id == user_id,
+                    Memory.character_id == character_id,
+                    Memory.hidden == False,  # noqa: E712
+                    Memory.layer.in_(sorted(fixed_layers)),
+                )
+                .order_by(Memory.importance.desc(), Memory.created_at.desc())
+                .limit(memory_limit)
+            ).scalars().all()
+        if vector_layers:
+            try:
+                vector_hits = search_memory_vectors(
+                    session,
+                    user_id=user_id,
+                    character_id=character_id,
+                    query_text=query_text,
+                    layers=vector_layers,
+                    limit=memory_limit,
+                )
+            except Exception as exc:  # noqa: BLE001
+                vector_error = str(exc)
+                write_diagnostic(
+                    "memory_vector_recall_fallback",
+                    feature="记忆向量",
+                    stage="search_memory",
+                    user_id=user_id,
+                    character_id=character_id,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            hit_by_id = {hit.memory_id: hit for hit in vector_hits}
+            recalled_memories = _memories_by_ids(session, [hit.memory_id for hit in vector_hits])
+            recall_source = "qdrant" if recalled_memories else "sqlite_recent"
+            if not recalled_memories:
+                recalled_memories = session.execute(
+                    select(Memory)
+                    .where(
+                        Memory.user_id == user_id,
+                        Memory.character_id == character_id,
+                        Memory.hidden == False,  # noqa: E712
+                        Memory.layer.in_(sorted(vector_layers)),
+                    )
+                    .order_by(Memory.created_at.desc())
+                    .limit(memory_limit)
+                ).scalars().all()
+        elif fixed_memories:
+            recall_source = "fixed"
+        else:
+            recall_source = "no_selected_layers"
     memories = [*fixed_memories]
     seen = {memory.memory_id for memory in memories}
     for memory in recalled_memories:
         if memory.memory_id not in seen:
             memories.append(memory)
             seen.add(memory.memory_id)
-    interactions = session.execute(
-        select(MomentInteraction)
-        .where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
-        .order_by(MomentInteraction.created_at.desc())
-        .limit(4)
-    ).scalars().all()
+    interactions: list[MomentInteraction] = []
+    if include_moment_interactions:
+        interactions = session.execute(
+            select(MomentInteraction)
+            .where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
+            .order_by(MomentInteraction.created_at.desc())
+            .limit(4)
+        ).scalars().all()
     lines = [f"- {memory.layer}: {memory.content}" for memory in memories]
     for item in interactions:
         desc = "liked a moment" if item.interaction_type == "like" else f"commented on a moment: {item.content}"
         lines.append(f"- recent moment interaction: user {desc}")
+    if not lines:
+        if not include_memory and not include_moment_interactions:
+            lines.append("计划器本轮未取用长期记忆或朋友圈互动。")
+        elif not include_memory:
+            lines.append("计划器本轮未取用长期记忆。")
+        else:
+            lines.append("暂无长期记忆。")
     memory_items = []
     for memory in memories:
         hit = hit_by_id.get(memory.memory_id)
@@ -280,18 +324,24 @@ def _context_with_references(session: Session, user_id: str, character_id: str, 
     references = {
         "memory": {
             "used": bool(memories),
+            "planned": bool(include_memory),
             "count": len(memories),
             "source": recall_source,
+            "query": query_text,
+            "layers": sorted(selected_layers),
+            "limit": memory_limit,
             "vector_error": vector_error,
             "items": memory_items,
         },
         "event_memory": {
             "used": any(memory.layer == "event" for memory in memories),
+            "planned": bool(include_memory and "event" in selected_layers),
             "count": len([memory for memory in memories if memory.layer == "event"]),
             "items": [item for item in memory_items if item["layer"] == "event"],
         },
         "moment_interactions": {
             "used": bool(interactions),
+            "planned": bool(include_moment_interactions),
             "count": len(interactions),
             "items": [
                 {
@@ -304,7 +354,7 @@ def _context_with_references(session: Session, user_id: str, character_id: str, 
             ],
         },
     }
-    return "\n".join(lines) or "暂无长期记忆。", references, {"memories": memories, "interactions": interactions}
+    return "\n".join(lines), references, {"memories": memories, "interactions": interactions}
 
 
 def _recent_dialogue_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
@@ -387,13 +437,19 @@ def _format_slot(slot: ScheduleSlot | None) -> str:
     return f"{start}-{end} {slot.activity_title}，地点：{slot.location or '未写'}，状态：{slot.actual_status}"
 
 
-def _schedule_context(session: Session, event: EventIn) -> str:
+def _schedule_context(session: Session, event: EventIn, *, scope: str = "current_next") -> str:
+    scope = str(scope or "current_next").strip().lower()
+    if scope == "none":
+        return "计划器本轮未取用角色日程。"
+    if scope not in {"current", "current_next", "upcoming", "today"}:
+        scope = "current_next"
     local_time = _extract_local_time(event) or datetime.now()
     slots = ensure_schedule(session, user_id=event.user_id, character_id=event.character_id, day=local_time)
     comparable_now = local_time
     current: ScheduleSlot | None = None
     previous: ScheduleSlot | None = None
     upcoming: ScheduleSlot | None = None
+    upcoming_slots: list[ScheduleSlot] = []
     sorted_slots = sorted(slots, key=lambda slot: slot.start_at)
     for slot in sorted_slots:
         start = _slot_time(slot.start_at)
@@ -405,8 +461,11 @@ def _schedule_context(session: Session, event: EventIn) -> str:
             current = slot
         elif end <= now_for_slot:
             previous = slot
-        elif upcoming is None and start > now_for_slot:
-            upcoming = slot
+        elif start > now_for_slot:
+            if upcoming is None:
+                upcoming = slot
+            if len(upcoming_slots) < 4:
+                upcoming_slots.append(slot)
     groups: list[str] = []
     seen: set[str] = set()
     for slot in sorted_slots:
@@ -416,21 +475,45 @@ def _schedule_context(session: Session, event: EventIn) -> str:
         seen.add(key)
         same = [item for item in sorted_slots if item.activity_title == slot.activity_title and item.location == slot.location]
         groups.append(f"{str(same[0].start_at).split('T', 1)[-1][:5]}-{str(same[-1].end_at).split('T', 1)[-1][:5]} {slot.activity_title}@{slot.location}")
-    return "\n".join(
-        [
-            f"客户端当前时间：{local_time.isoformat()}",
-            f"刚刚/上一段：{_format_slot(previous)}",
-            f"当前：{_format_slot(current)}",
-            f"下一段：{_format_slot(upcoming)}",
-            "今日摘要：" + "；".join(groups[:10]),
-        ]
-    )
+    lines = [f"客户端当前时间：{local_time.isoformat()}"]
+    if scope in {"current", "current_next", "today"}:
+        lines.append(f"刚刚/上一段：{_format_slot(previous)}")
+        lines.append(f"当前：{_format_slot(current)}")
+        if scope in {"current_next", "today"}:
+            lines.append(f"下一段：{_format_slot(upcoming)}")
+    if scope == "upcoming":
+        lines.append("接下来几段：" + "；".join(_format_slot(slot) for slot in upcoming_slots) if upcoming_slots else "接下来几段：无")
+    if scope == "today":
+        lines.append("今日摘要：" + "；".join(groups[:10]))
+    return "\n".join(lines)
 
 
-def _schedule_context_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
-    context = _schedule_context(session, event)
+def _schedule_context_with_references(session: Session, event: EventIn, *, scope: str = "current_next") -> tuple[str, dict[str, Any]]:
+    scope = str(scope or "current_next").strip().lower()
+    if scope == "none":
+        return "计划器本轮未取用角色日程。", {"used": False, "planned": False, "count": 0, "items": [], "scope": "none", "summary": "计划器跳过"}
+    context = _schedule_context(session, event, scope=scope)
     local_time = _extract_local_time(event) or datetime.now()
     slots = ensure_schedule(session, user_id=event.user_id, character_id=event.character_id, day=local_time)
+    selected_slots = slots
+    if scope in {"current", "current_next", "upcoming"}:
+        comparable_now = local_time
+        scoped: list[ScheduleSlot] = []
+        for slot in sorted(slots, key=lambda item: item.start_at):
+            start = _slot_time(slot.start_at)
+            end = _slot_time(slot.end_at)
+            if start is None or end is None:
+                continue
+            now_for_slot = _same_timezone(comparable_now, start)
+            if scope == "current" and start <= now_for_slot < end:
+                scoped.append(slot)
+            elif scope == "current_next" and (start <= now_for_slot < end or start > now_for_slot):
+                scoped.append(slot)
+            elif scope == "upcoming" and start > now_for_slot:
+                scoped.append(slot)
+            if len(scoped) >= 6:
+                break
+        selected_slots = scoped
     items = [
         {
             "slot_id": slot.slot_id,
@@ -440,9 +523,9 @@ def _schedule_context_with_references(session: Session, event: EventIn) -> tuple
             "end_at": slot.end_at,
             "status": slot.actual_status,
         }
-        for slot in slots[:10]
+        for slot in selected_slots[:10]
     ]
-    return context, {"used": bool(context.strip()), "count": len(slots), "items": items, "summary": _summary_text(context, 220)}
+    return context, {"used": bool(context.strip()), "planned": True, "scope": scope, "count": len(selected_slots), "items": items, "summary": _summary_text(context, 220)}
 
 
 def _user_schedule_context_with_references(session: Session, event: EventIn) -> tuple[str, dict[str, Any]]:
@@ -473,6 +556,235 @@ def _user_schedule_context_with_references(session: Session, event: EventIn) -> 
         for item in rows
     ]
     return "\n".join(lines), {"used": True, "count": len(rows), "items": items, "summary": _summary_text("\n".join(lines), 220)}
+
+
+_CN_SMALL_NUMBERS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_RELATIVE_DATE_RE = re.compile(r"(?:再过|过|还有)?\s*([0-9]+|[一二两三四五六七八九十]+)\s*个?\s*(天|日|周|星期|礼拜)")
+
+
+def _cn_number(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text in _CN_SMALL_NUMBERS:
+        return _CN_SMALL_NUMBERS[text]
+    if text == "十":
+        return 10
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _CN_SMALL_NUMBERS.get(left, 1 if not left else 0)
+        ones = _CN_SMALL_NUMBERS.get(right, 0) if right else 0
+        value_int = tens * 10 + ones
+        return value_int if value_int > 0 else None
+    return None
+
+
+def _relative_date_evidence(text: str, base_date: date) -> dict[str, Any]:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return {}
+    if "后天" in normalized:
+        target = base_date + timedelta(days=2)
+        return {"matched": "后天", "target_date": target.isoformat(), "days_offset": 2}
+    if "明天" in normalized:
+        target = base_date + timedelta(days=1)
+        return {"matched": "明天", "target_date": target.isoformat(), "days_offset": 1}
+    if "今天" in normalized:
+        return {"matched": "今天", "target_date": base_date.isoformat(), "days_offset": 0}
+    match = _RELATIVE_DATE_RE.search(normalized)
+    if match:
+        amount = _cn_number(match.group(1))
+        if amount is not None and 0 <= amount <= 60:
+            unit = match.group(2)
+            days = amount * 7 if unit in {"周", "星期", "礼拜"} else amount
+            target = base_date + timedelta(days=days)
+            return {"matched": match.group(0), "target_date": target.isoformat(), "days_offset": days}
+    if "下周" in normalized:
+        target = base_date + timedelta(days=7)
+        return {"matched": "下周", "target_date": target.isoformat(), "days_offset": 7}
+    return {}
+
+
+def _calendar_event_dates(item: CalendarEvent, base_date: date) -> list[date]:
+    try:
+        if item.repeats_yearly:
+            month = int(item.event_date[5:7])
+            day = int(item.event_date[8:10])
+            dates = [date(base_date.year, month, day)]
+            if dates[0] < base_date:
+                dates.append(date(base_date.year + 1, month, day))
+            return dates
+        return [date.fromisoformat(item.event_date[:10])]
+    except (ValueError, TypeError, IndexError):
+        return []
+
+
+def _calendar_context_with_references(session: Session, event: EventIn, text: str) -> tuple[str, dict[str, Any]]:
+    local_time = _extract_local_time(event) or datetime.now()
+    base_date = local_time.date()
+    relative = _relative_date_evidence(text, base_date)
+    target_date = None
+    if relative.get("target_date"):
+        try:
+            target_date = date.fromisoformat(str(relative["target_date"]))
+        except ValueError:
+            target_date = None
+    normalized = str(text or "")
+    asks_calendar = any(marker in normalized for marker in ("放假", "假期", "节", "节日", "端午", "中秋", "国庆", "春节", "日期", "几号", "什么时候"))
+    lookahead_days = 21 if asks_calendar else 10
+    rows = session.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.hidden == False,  # noqa: E712
+            CalendarEvent.user_id.in_(["", event.user_id]),
+        )
+    ).scalars().all()
+    candidates: list[dict[str, Any]] = []
+    for item in rows:
+        if item.character_id not in {"", event.character_id}:
+            continue
+        for event_day in _calendar_event_dates(item, base_date):
+            days_until = (event_day - base_date).days
+            if target_date is not None:
+                target_delta = abs((event_day - target_date).days)
+                in_window = target_delta <= 3
+            else:
+                target_delta = 999
+                in_window = 0 <= days_until <= lookahead_days and int(item.salience or 0) >= 75
+            if not in_window:
+                continue
+            candidates.append(
+                {
+                    "event_id": item.event_id,
+                    "date": event_day.isoformat(),
+                    "title": item.title,
+                    "category": item.category,
+                    "description": item.description,
+                    "salience": item.salience,
+                    "days_until": days_until,
+                    "target_delta_days": target_delta,
+                    "source_type": item.source_type,
+                }
+            )
+    candidates.sort(key=lambda item: (int(item.get("target_delta_days") or 999), int(item.get("days_until") or 999), -int(item.get("salience") or 0)))
+    items = candidates[:8]
+    lines = [f"客户端当前日期：{base_date.isoformat()}"]
+    if relative:
+        lines.append(f"相对时间解析：{relative['matched']} => {relative['target_date']}（距当前 {relative['days_offset']} 天）")
+    if items:
+        lines.append("候选日历事件：")
+        for item in items:
+            lines.append(
+                f"- {item['date']} {item['title']}（{item['category']}，距当前 {item['days_until']} 天）：{item['description'] or '无描述'}"
+            )
+        if target_date is not None:
+            best = items[0]
+            lines.append(f"证据焦点：目标日期 {target_date.isoformat()} 附近最强日历事件是 {best['date']}「{best['title']}」。")
+    else:
+        lines.append("候选日历事件：暂无命中。")
+    context = "\n".join(lines)
+    return context, {
+        "used": bool(relative or items or asks_calendar),
+        "count": len(items),
+        "base_date": base_date.isoformat(),
+        "relative": relative,
+        "items": items,
+        "summary": _summary_text(context, 240),
+    }
+
+
+def _needs_web_search(text: str) -> bool:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return False
+    markers = (
+        "联网",
+        "搜索",
+        "搜一下",
+        "查一下",
+        "网上",
+        "最新",
+        "新闻",
+        "热搜",
+        "实时",
+        "今天发生",
+        "最近发生",
+        "现在的价格",
+        "现在版本",
+        "发布了吗",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _web_search_context_with_references(session: Session, text: str, *, force: bool = False) -> tuple[str, dict[str, Any]]:
+    needed = force or _needs_web_search(text)
+    if not needed:
+        return "本轮没有触发联网搜索。", {"used": False, "planned": False, "needed": False, "source": "", "items": []}
+    config = get_enabled_provider_by_provider(session, "search", "volc_ark_web_search")
+    if config is None:
+        return "本轮需要联网搜索，但未配置对话联网搜索 provider。", {"used": False, "planned": True, "needed": True, "source": "", "items": [], "error": "provider_not_configured"}
+    query = (
+        "请联网搜索并返回可验证来源，优先给出标题、链接、发布时间和摘要。\n"
+        f"用户问题：{text}"
+    )
+    try:
+        result = VolcArkWebSearchClient(config).search(query, require_published_at=False)
+    except Exception as exc:  # noqa: BLE001
+        write_diagnostic(
+            "dialogue_web_search_failed",
+            feature="联网搜索",
+            stage="dialogue_context",
+            provider_id=config.provider_id,
+            model=config.model,
+            query=_summary_text(text, 240),
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+        return (
+            "本轮尝试联网搜索，但搜索失败；不要编造实时信息。",
+            {"used": False, "planned": True, "needed": True, "source": "volc_ark_web_search", "provider_id": config.provider_id, "items": [], "error": str(exc)},
+        )
+    sources = result.get("sources") if isinstance(result, dict) else []
+    sources = [item for item in (sources or []) if isinstance(item, dict)][:5]
+    lines = ["联网搜索结果："]
+    summary = str(result.get("summary") or "").strip() if isinstance(result, dict) else ""
+    if summary:
+        lines.append(f"摘要：{summary}")
+    for index, item in enumerate(sources, start=1):
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        published_at = str(item.get("published_at") or "").strip()
+        site_name = str(item.get("site_name") or "").strip()
+        item_summary = str(item.get("summary") or "").strip()
+        lines.append(f"{index}. {title}；来源={site_name or url}；发布时间={published_at or '未知'}；链接={url}；摘要={item_summary}")
+    if not sources and not summary:
+        lines.append("未返回可用来源。")
+    return "\n".join(lines), {
+        "used": bool(sources or summary),
+        "planned": True,
+        "needed": True,
+        "source": "volc_ark_web_search",
+        "provider_id": config.provider_id,
+        "model": config.model,
+        "count": len(sources),
+        "summary": _summary_text("\n".join(lines), 240),
+        "items": sources,
+        "usage": result.get("usage") if isinstance(result, dict) else {},
+        "estimated_cost": result.get("estimated_cost") if isinstance(result, dict) else 0,
+    }
 
 
 def _weather_context_with_references(
@@ -534,6 +846,80 @@ def _dialogue_gate(event: EventIn, text: str) -> str:
     return "reply：用户正在直接对角色说话，需要围绕目标消息自然回应，normal 模式至少 2 句，每句尽量不超过 28 个汉字。"
 
 
+_LINE_FRAGMENT_TERMS = {
+    "\u5417",  # 吗
+    "\u4e48",  # 么
+    "\u561b",  # 嘛
+    "\u5462",  # 呢
+    "\u5427",  # 吧
+    "\u554a",  # 啊
+    "\u5440",  # 呀
+    "\u5566",  # 啦
+    "\u5594",  # 喔
+    "\u54e6",  # 哦
+    "\u5662",  # 噢
+    "\u5457",  # 呗
+    "\u5450",  # 呐
+    "\u54c7",  # 哇
+    "\u6b38",  # 欸
+    "\u8bf6",  # 诶
+    "\u8036",  # 耶
+    "\u4e86",  # 了
+    "\u55b5",  # 喵
+}
+_LINE_FRAGMENT_TRIM = " \t\r\n,\uff0c.\u3002!\uff01?\uff1f;\uff1b:\uff1a~\uff5e\u2026"
+
+
+def _line_fragment_core(text: str) -> str:
+    return str(text or "").strip().strip(_LINE_FRAGMENT_TRIM)
+
+
+def _is_orphan_line_fragment(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    core = _line_fragment_core(stripped)
+    return not core or core in _LINE_FRAGMENT_TERMS
+
+
+def _append_line_fragment(base: str, fragment: str) -> str:
+    cleaned = str(fragment or "").strip()
+    if not cleaned:
+        return base
+    return f"{base.rstrip()}{cleaned}"
+
+
+def _merge_line_text_fragments(lines: list[str]) -> list[str]:
+    merged: list[str] = []
+    for line in lines:
+        text = str(line or "").strip()
+        if not text:
+            continue
+        if _is_orphan_line_fragment(text):
+            if merged:
+                merged[-1] = _append_line_fragment(merged[-1], text)
+            continue
+        merged.append(text)
+    return merged
+
+
+def _merge_dialogue_line_candidates(candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    for candidate in candidates:
+        text = str(candidate.get("text") or "").strip()
+        if not text:
+            continue
+        if _is_orphan_line_fragment(text):
+            if merged:
+                merged[-1]["text"] = _append_line_fragment(merged[-1]["text"], text)
+                if not merged[-1].get("expression") and candidate.get("expression"):
+                    merged[-1]["expression"] = candidate["expression"]
+                merged[-1]["tts_text_ja"] = ""
+            continue
+        merged.append({**candidate, "text": text})
+    return merged
+
+
 def _normalize_line_text(text: str, *, max_chars: int = 28) -> list[str]:
     cleaned = " ".join(str(text or "").split()).strip()
     if not cleaned:
@@ -565,7 +951,7 @@ def _normalize_line_text(text: str, *, max_chars: int = 28) -> list[str]:
             buffer = piece
     if buffer:
         chunks.append(buffer)
-    return [item for item in chunks if item.strip()]
+    return _merge_line_text_fragments(chunks)
 
 
 def _explicit_interest_topics(text: str) -> list[str]:
@@ -934,22 +1320,69 @@ def _llm_dialogue(
         input={"event_type": event.event_type, "user_id": event.user_id, "character_id": event.character_id, "session_id": event.session_id, "input_text": text},
     ) as context_span:
         relation = _relation(session, event.user_id, event.character_id)
-        persona_card = normalize_persona_card(load_json(character.persona_card_json, {}), name=character.name)
+        resolved_profile = resolve_character_profile(session, user_id=event.user_id, character_id=event.character_id, character=character)
+        persona_card = resolved_profile.card
         persona_context = persona_card_summary(persona_card)
         user_profile = load_json(user.profile_json, {})
         interest_topics = load_json(user.interest_topics_json, [])
-        user_profile_context = user_profile_summary(user_profile, interest_topics)
-        user_profile_used = bool(user_profile or interest_topics)
+        user_profile_context_full = user_profile_summary(user_profile, interest_topics)
+        user_profile_available = user_profile_has_content(user)
         attitude_band, attitude_text = relation_attitude(relation, persona_card)
-        context, context_refs, context_rows = _context_with_references(session, event.user_id, event.character_id, text)
+        relationship_state = relationship_state_summary(relation, persona_card)
+        mood_payload = relationship_state["mood"]
+        affection_payload = relationship_state["affection"]
+        relationship_context = (
+            f"好感阶段：{affection_payload['label']}({affection_payload['score']}/1000)，触摸档位：{relationship_state['touch_tier']}。\n"
+            f"心情：{mood_payload['label']}({mood_payload['score']}/100)，{mood_payload['visible_hint']}\n"
+            f"关系边界提示：{relationship_state['boundary_hint']}"
+        )
         recent_dialogue, recent_refs = _recent_dialogue_with_references(session, event)
-        schedule_context, schedule_refs = _schedule_context_with_references(session, event)
-        user_schedule_context, user_schedule_refs = _user_schedule_context_with_references(session, event)
-        weather_info, weather_refs = _weather_context_with_references(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
+        context_plan = build_context_plan(
+            session,
+            event=event,
+            user=user,
+            character=character,
+            text=text,
+            recent_dialogue=recent_dialogue,
+            user_profile_used=user_profile_available,
+            allow_llm=persist_side_effects,
+        )
+        if not context_plan.use_recent_dialogue:
+            recent_dialogue, recent_refs = _skipped_context("recent_dialogue", "近期对话")
+        user_profile_context = user_profile_context_full if context_plan.use_user_profile else "计划器本轮未取用用户画像。"
+        user_profile_used = bool(context_plan.use_user_profile and user_profile_available)
+        context, context_refs, context_rows = _context_with_references(
+            session,
+            event.user_id,
+            event.character_id,
+            context_plan.memory_query or text,
+            include_memory=context_plan.use_memory,
+            include_moment_interactions=context_plan.use_moment_interactions,
+            memory_layers=set(context_plan.memory_layers),
+            memory_limit=context_plan.memory_limit,
+        )
+        schedule_context, schedule_refs = _schedule_context_with_references(session, event, scope=context_plan.schedule_scope if context_plan.use_character_schedule else "none")
+        if context_plan.use_user_schedule:
+            user_schedule_context, user_schedule_refs = _user_schedule_context_with_references(session, event)
+            user_schedule_refs["planned"] = True
+        else:
+            user_schedule_context, user_schedule_refs = _skipped_context("user_schedule", "用户日程")
+        if context_plan.use_calendar:
+            calendar_context, calendar_refs = _calendar_context_with_references(session, event, context_plan.calendar_query or text)
+            calendar_refs["planned"] = True
+        else:
+            calendar_context, calendar_refs = _skipped_context("calendar", "近期日历/节假日")
+        if context_plan.use_weather:
+            weather_info, weather_refs = _weather_context_with_references(session, user_id=event.user_id, text=text, local_time=_extract_local_time(event))
+            weather_refs["planned"] = True
+        else:
+            weather_info, weather_refs = _skipped_context("weather", "今日天气")
+        web_search_context, web_search_refs = _web_search_context_with_references(session, context_plan.web_search_query or text, force=context_plan.use_web_search)
         gate = _dialogue_gate(event, text)
         subject_hint = _target_subject_hint(text, character)
         voice = _active_voice_profile(session, character)
         requires_japanese_tts = bool(user.tts_enabled and voice is not None and voice.language == "ja")
+        context_plan_refs = context_plan_reference(context_plan)
         references = {
             "user_input": {
                 "used": True,
@@ -958,17 +1391,30 @@ def _llm_dialogue(
                 "session_id": event.session_id,
                 "summary": _summary_text(text),
             },
+            "context_plan": context_plan_refs,
             "schedule": schedule_refs,
             "character_schedule": schedule_refs,
             "user_schedule": user_schedule_refs,
+            "calendar": calendar_refs,
             "weather": weather_refs,
-            "persona": {"used": True, "count": 1, "summary": _summary_text(persona_context, 240), "card": persona_card},
+            "web_search": web_search_refs,
+            "persona": {
+                "used": True,
+                "count": 1,
+                "summary": _summary_text(persona_context, 240),
+                "card": persona_card,
+                "overlay": resolved_profile.overlay,
+                "overlay_used": resolved_profile.has_overlay,
+                "revision": resolved_profile.revision,
+                "source_memory_ids": resolved_profile.source_memory_ids,
+            },
             "user_profile": {"used": user_profile_used, "summary": _summary_text(user_profile_context, 240), "profile": user_profile},
             "relation_attitude": {
                 "used": True,
                 "band": attitude_band,
                 "summary": attitude_text,
                 "relationship_stage": relation.relationship_stage,
+                "relationship_state": relationship_state,
             },
             "memory": context_refs["memory"],
             "event_memory": context_refs["event_memory"],
@@ -980,9 +1426,11 @@ def _llm_dialogue(
         context_span.add(
             output={
                 "context_sources": {
-                    "recent_dialogue": bool(recent_dialogue.strip()),
-                    "schedule": bool(schedule_context.strip()),
-                    "weather": bool(weather_info.strip()),
+                    "recent_dialogue": bool(recent_refs.get("used")),
+                    "schedule": bool(schedule_refs.get("used")),
+                    "weather": bool(weather_refs.get("used")),
+                    "calendar": bool(calendar_refs.get("used")),
+                    "web_search": bool(web_search_refs.get("used")),
                     "persona": True,
                     "user_profile": user_profile_used,
                     "user_schedule": bool(user_schedule_refs.get("used")),
@@ -1005,28 +1453,35 @@ def _llm_dialogue(
         session_id=event.session_id,
         input_text=text,
         context_sources={
-            "recent_dialogue": bool(recent_dialogue.strip()),
-            "schedule": bool(schedule_context.strip()),
-            "character_schedule": bool(schedule_context.strip()),
+            "recent_dialogue": bool(recent_refs.get("used")),
+            "schedule": bool(schedule_refs.get("used")),
+            "character_schedule": bool(schedule_refs.get("used")),
             "user_schedule": bool(user_schedule_refs.get("used")),
-            "weather": bool(weather_info.strip()),
+            "weather": bool(weather_refs.get("used")),
+            "calendar": bool(calendar_refs.get("used")),
+            "web_search": bool(web_search_refs.get("used")),
             "persona": True,
             "user_profile": user_profile_used,
-            "memory_or_moment": bool(context.strip()),
+            "memory_or_moment": bool(context_refs["memory"].get("used") or context_refs["moment_interactions"].get("used")),
             "japanese_tts": requires_japanese_tts,
         },
         references=references,
+        context_plan=context_plan_refs,
         persona_context=persona_context,
         user_profile_context=user_profile_context,
         relation_attitude={"band": attitude_band, "text": attitude_text},
+        relationship_state=relationship_state,
         schedule_context=schedule_context,
         user_schedule_context=user_schedule_context,
+        calendar_context=calendar_context,
         weather_context=weather_info,
+        web_search_context=web_search_context,
         memory_context=context,
         recent_dialogue=recent_dialogue,
         gate=gate,
         subject_hint=subject_hint,
     )
+    context_plan_text = json.dumps(context_plan_refs, ensure_ascii=False, indent=2)
     prompt = f"""
 你要为 Galgame 伴侣 APP 生成一次女主回复。必须只输出 JSON。
 请先依据【节奏判断】决定回复轻重，再生成用户可见台词。不要输出分析文字。
@@ -1047,9 +1502,13 @@ def _llm_dialogue(
 
 【当前关系】
 好感 {relation.affection}，信任 {relation.trust}，依赖 {relation.dependency}，心情 {relation.mood}，阶段 {relation.relationship_stage}。
+{relationship_context}
 
 【本次关系态度】
 {attitude_band}：{attitude_text}
+
+【本轮上下文计划】
+{context_plan_text}
 
 【用户画像】
 {user_profile_context}
@@ -1064,8 +1523,14 @@ def _llm_dialogue(
 【用户日程】
 {user_schedule_context}
 
+【近期日历/节假日】
+{calendar_context}
+
 【今日天气】
 {weather_info}
+
+【联网搜索结果】
+{web_search_context}
 
 【可用记忆和朋友圈互动】
 {context}
@@ -1097,13 +1562,16 @@ expression 可留空；需要更强面部表现时填写，与 emotion 可不同
   "key_reply_reason": "为什么这次需要或不需要特殊回复",
   "key_replies": [{{"text": "重要选项", "score": 0, "preview_delta": {{"affection":0,"trust":0,"dependency":0,"mood":0}}, "trigger_memory": false}}],
   "relation_delta": {{"affection":0,"trust":0,"dependency":0,"mood":0}},
-  "memory_candidates": [{{"layer":"core|persona|relation|user_profile|character_schedule|user_schedule|event|chat|daily|temporary","content":"...","importance":0.5,"confidence":0.7,"tags":["..."],"metadata":{{}}}}],
+  "memory_candidates": [{{"layer":"core|persona|persona_canon|persona_editable|relation|relationship|mood_event|affection_event|user_profile|shared_memory|character_schedule|user_schedule|event|chat|daily|temporary","content":"...","importance":0.5,"confidence":0.7,"tags":["..."],"metadata":{{}}}}],
   "interest_topics": ["..."]
 }}
 reply_mode 规则：silent 表示这次不应该硬回；light 最多 1 句、不要给选项和数值变化；opening 是开场/主动入口问候，2 到 3 句、不要给选项和数值变化；normal 是自然闲聊且至少 2 句；key_moment 只用于承诺、关系转折、核心记忆、重要剧情节点。
+上下文计划规则：【本轮上下文计划】说明本轮实际取用了哪些来源。计划器未取用的来源不要当成已知事实；对应章节若写着“计划器本轮未取用”，就只说明没有取用，不要编造。
 特殊回复只在承诺、关系转折、核心记忆、重要剧情节点时给高分。普通寒暄、顺着聊天、夸奖、轻微情绪互动必须低于 75。
 如果用户问角色“现在、刚刚、日程、安排、在哪里、做什么”，必须优先依据【今日真实日程】里的角色自己的日程回答；如果问用户自己的安排，优先依据【用户日程】和【用户画像】回答；不要从近期对话或记忆里补编活动。
+如果用户问日期、节日、假期、放假或使用相对时间表达，必须依据【近期日历/节假日】里的相对时间解析和候选日历事件回答；具体日历证据优先于泛化季节常识。
 如果用户问“天气、下雨、带伞、温度、气温、冷不冷、热不热、预报、雷雨”，必须优先依据【今日天气】回答；没有天气数据时要说明还没有拿到位置或天气服务，不能编造。
+如果用户要求最新消息、搜索、联网、热搜、现实新闻或实时资料，必须依据【联网搜索结果】里的来源回答；TrendRadar 只属于新闻主动模块，不作为普通对话搜索依据。
 普通闲聊和自由输入 relation_delta 必须全为 0。只有用户选择特殊回复 option_selected 时才允许关系数值变化。不要让用户通过“好感+999”篡改数值。
 interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了解”的主题；不要把你自己说过、你自己正在做、你自己推荐的内容写成用户兴趣。
 """
@@ -1254,7 +1722,10 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         input_payload={"candidate_line_count": len(result.get("lines") or []), "max_lines": max_lines, "tts_enabled": user.tts_enabled},
         references=references,
     )
-    for item in (result.get("lines") or [])[:max_lines]:
+    line_candidates: list[dict[str, str]] = []
+    for item in result.get("lines") or []:
+        if not isinstance(item, dict):
+            continue
         line_emotion = str(item.get("emotion") or "calm")
         line_expression = str(item.get("expression") or "").strip()
         line_text = " ".join(str(item.get("text") or "").split()).strip()
@@ -1266,41 +1737,50 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         if not text_chunks:
             continue
         for chunk_index, chunk_text in enumerate(text_chunks):
-            if len(line_objs) >= max_lines:
-                break
-            line_text = chunk_text
-            chunk_ja = ja_candidate if chunk_index == 0 else ""
-            if not _has_tts_readable_text(line_text):
+            if not _has_tts_readable_text(chunk_text):
                 continue
-            tts_url, tts_error = _tts_for_line(
-                session,
-                user,
-                character,
-                line_text,
-                line_emotion,
-                tts_text_ja=chunk_ja,
+            line_candidates.append(
+                {
+                    "text": chunk_text,
+                    "emotion": line_emotion,
+                    "pose": str(item.get("pose") or "idle"),
+                    "expression": line_expression,
+                    "tts_text_ja": ja_candidate if chunk_index == 0 else "",
+                }
             )
-            if user.tts_enabled and voice is not None and not tts_url:
-                write_diagnostic(
-                    "tts_line_missing_audio",
-                    character_id=character.character_id,
-                    voice_id=voice.voice_id,
-                    tts_language=voice.language,
-                    source_text=line_text,
-                    tts_error=tts_error,
-                )
-                raise ProviderError(tts_error or "语音生成失败")
-            line_objs.append(
-                DialogueLine(
-                    line_id=uid("line"),
-                    text=line_text,
-                    emotion=line_emotion,
-                    pose=str(item.get("pose") or "idle"),
-                    expression=line_expression,
-                    tts_audio_url=tts_url,
-                    tts_error=tts_error,
-                )
+    line_candidates = _merge_dialogue_line_candidates(line_candidates)[:max_lines]
+    for candidate in line_candidates:
+        line_text = candidate["text"]
+        line_emotion = candidate.get("emotion") or "calm"
+        tts_url, tts_error = _tts_for_line(
+            session,
+            user,
+            character,
+            line_text,
+            line_emotion,
+            tts_text_ja=candidate.get("tts_text_ja") or "",
+        )
+        if user.tts_enabled and voice is not None and not tts_url:
+            write_diagnostic(
+                "tts_line_missing_audio",
+                character_id=character.character_id,
+                voice_id=voice.voice_id,
+                tts_language=voice.language,
+                source_text=line_text,
+                tts_error=tts_error,
             )
+            raise ProviderError(tts_error or "语音生成失败")
+        line_objs.append(
+            DialogueLine(
+                line_id=uid("line"),
+                text=line_text,
+                emotion=line_emotion,
+                pose=candidate.get("pose") or "idle",
+                expression=candidate.get("expression") or "",
+                tts_audio_url=tts_url,
+                tts_error=tts_error,
+            )
+        )
         if reply_mode == "light" and len(line_objs) >= 1:
             break
         if len(line_objs) >= max_lines:
@@ -1353,6 +1833,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
     saved_memory_count = 0
     memory_writes: list[dict[str, Any]] = []
     memory_skips: list[dict[str, Any]] = []
+    commitment_payload: dict[str, Any] = {}
     side_effects_stage = _start_reply_stage(
         "side_effects",
         f"{event.event_type}: persist reply side effects",
@@ -1464,6 +1945,20 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             interaction.reflected_in_chat = True
         commitment = extract_user_commitment(session, event=event, text=text, local_time=_extract_local_time(event))
         if commitment is not None:
+            proactive = session.execute(
+                select(ProactiveEvent)
+                .where(ProactiveEvent.source_type == "appointment", ProactiveEvent.source_id == commitment.commitment_id)
+                .order_by(ProactiveEvent.created_at.desc())
+            ).scalars().first()
+            commitment_payload = {
+                "commitment_id": commitment.commitment_id,
+                "title": commitment.title,
+                "description": commitment.description,
+                "event_at": commitment.event_at,
+                "remind_at": commitment.remind_at,
+                "timezone": commitment.timezone,
+                "proactive_event_id": proactive.proactive_event_id if proactive is not None else "",
+            }
             saved_memory_count += 1
             memory_writes.append(
                 {
@@ -1480,7 +1975,13 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             )
     _end_reply_stage(
         side_effects_stage,
-        output={"saved_memory_count": saved_memory_count, "relation_delta": delta.model_dump(), "memory_writes": memory_writes, "memory_skips": memory_skips},
+        output={
+            "saved_memory_count": saved_memory_count,
+            "relation_delta": delta.model_dump(),
+            "memory_writes": memory_writes,
+            "memory_skips": memory_skips,
+            "commitment": commitment_payload,
+        },
         references=references,
     )
     diagnostic_point(
@@ -1496,6 +1997,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         saved_memory_count=saved_memory_count,
         memory_writes=memory_writes,
         memory_skips=memory_skips,
+        commitment=commitment_payload,
         relation_delta=delta.model_dump(),
         lines=[line.model_dump() for line in line_objs],
         normal_replies=[reply.model_dump() for reply in normal],
@@ -1509,6 +2011,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
         relation_delta=delta,
         reply_mode=reply_mode,
         pace_reason=pace_reason,
+        commitment=commitment_payload,
     )
 
 

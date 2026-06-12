@@ -137,6 +137,7 @@ class DialoguePayload(BaseModel):
     media_asset_id: str = ""
     reply_mode: str = "normal"
     pace_reason: str = ""
+    commitment: dict[str, Any] = Field(default_factory=dict)
 
 
 class AppEventOut(BaseModel):

@@ -120,6 +120,10 @@
           <div id="relationEditor" class="editor-placeholder">请选择用户。</div>
         </section>
         <section>
+          <h3>角色养成覆盖</h3>
+          <div id="characterProfileEditor" class="editor-placeholder">请选择用户。</div>
+        </section>
+        <section>
           <h3>记忆</h3>
           <div id="memoryEditor" class="editor-placeholder">请选择用户。</div>
         </section>
@@ -241,10 +245,12 @@
           </div>
         </header>
         <div class="debug-actions">
+          <button data-debug="/api/debug/generate-moment">生成朋友圈（含图片）</button>
           <button data-debug="/api/debug/run-daily-cycle">触发日程/朋友圈</button>
           <button data-debug="/api/debug/advance-time">模拟时间推进</button>
         </div>
         <pre id="debugResult">等待操作...</pre>
+        <div id="debugMomentPreview" class="debug-moment-preview" hidden></div>
       </article>
       <article class="manager" id="proactiveDebugManager">
         <header>

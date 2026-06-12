@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import CalendarEvent, Experience, User
+from .models import CalendarEvent, Experience, ScheduleSlot, User, UserCommitment
 from .utils import uid, utc_now
 
 
@@ -160,8 +160,12 @@ def _status_for(day: str, today: date | None = None) -> str:
 def _event_out(event: CalendarEvent, event_date: str, today: date | None = None) -> dict[str, Any]:
     return {
         "event_id": event.event_id,
+        "item_type": "calendar_event",
+        "calendar_kind": event.category,
+        "owner_type": "user" if event.user_id else "system",
         "date": event_date,
         "start_at": f"{event_date}T00:00:00",
+        "end_at": "",
         "activity_title": event.title,
         "title": event.title,
         "category": event.category,
@@ -170,7 +174,117 @@ def _event_out(event: CalendarEvent, event_date: str, today: date | None = None)
         "salience": event.salience,
         "repeats_yearly": event.repeats_yearly,
         "source_type": event.source_type,
+        "source_id": event.source_id,
     }
+
+
+def _schedule_item_out(slots: list[ScheduleSlot], today: date | None = None) -> dict[str, Any]:
+    first = slots[0]
+    last = slots[-1]
+    title = first.activity_title
+    status = "completed" if all(slot.actual_status == "completed" for slot in slots) else first.actual_status
+    return {
+        "event_id": first.slot_id,
+        "item_type": "schedule_slot",
+        "calendar_kind": "character_schedule",
+        "owner_type": "character",
+        "date": first.schedule_date,
+        "start_at": first.start_at,
+        "end_at": last.end_at,
+        "activity_title": title,
+        "title": title,
+        "category": "character_schedule",
+        "description": first.location or first.activity_type,
+        "status": status or _status_for(first.schedule_date, today),
+        "salience": max(int(slot.salience or 0) for slot in slots),
+        "repeats_yearly": False,
+        "source_type": "character_schedule",
+        "source_id": first.slot_id,
+        "activity_type": first.activity_type,
+        "location": first.location,
+        "slot_count": len(slots),
+        "can_generate_moment": any(slot.can_generate_moment for slot in slots),
+        "can_generate_photo": any(slot.can_generate_photo for slot in slots),
+    }
+
+
+def _character_schedule_items(session: Session, *, user_id: str, character_id: str, month: str) -> list[dict[str, Any]]:
+    rows = session.execute(
+        select(ScheduleSlot)
+        .where(
+            ScheduleSlot.user_id == user_id,
+            ScheduleSlot.character_id == character_id,
+            ScheduleSlot.schedule_date.like(f"{month}-%"),
+        )
+        .order_by(ScheduleSlot.start_at)
+    ).scalars().all()
+    if not rows:
+        return []
+    groups: list[list[ScheduleSlot]] = []
+    current: list[ScheduleSlot] = []
+    for slot in rows:
+        if not current:
+            current = [slot]
+            continue
+        previous = current[-1]
+        same_block = (
+            previous.schedule_date == slot.schedule_date
+            and previous.end_at == slot.start_at
+            and previous.activity_title == slot.activity_title
+            and previous.activity_type == slot.activity_type
+            and previous.location == slot.location
+        )
+        if same_block:
+            current.append(slot)
+        else:
+            groups.append(current)
+            current = [slot]
+    if current:
+        groups.append(current)
+    today = date.today()
+    return [_schedule_item_out(group, today) for group in groups]
+
+
+def _commitment_out(item: UserCommitment, today: date | None = None) -> dict[str, Any] | None:
+    when = str(item.event_at or item.remind_at or "")
+    if len(when) < 10:
+        return None
+    event_date = when[:10]
+    return {
+        "event_id": item.commitment_id,
+        "item_type": "user_commitment",
+        "calendar_kind": "user_commitment",
+        "owner_type": "user",
+        "date": event_date,
+        "start_at": when,
+        "end_at": "",
+        "activity_title": item.title,
+        "title": item.title,
+        "category": "user_commitment",
+        "description": item.description,
+        "status": item.status or _status_for(event_date, today),
+        "salience": 88,
+        "repeats_yearly": False,
+        "source_type": "user_commitment",
+        "source_id": item.commitment_id,
+        "remind_at": item.remind_at,
+        "timezone": item.timezone,
+    }
+
+
+def _user_commitment_items(session: Session, *, user_id: str, character_id: str, month: str) -> list[dict[str, Any]]:
+    rows = session.execute(
+        select(UserCommitment)
+        .where(
+            UserCommitment.user_id == user_id,
+            UserCommitment.character_id == character_id,
+            UserCommitment.status != "cancelled",
+        )
+        .order_by(UserCommitment.event_at, UserCommitment.remind_at)
+    ).scalars().all()
+    today = date.today()
+    items = [_commitment_out(item, today) for item in rows]
+    return [item for item in items if item is not None and str(item["date"]).startswith(month)]
 
 
 def calendar_items(session: Session, *, user_id: str, character_id: str, month: str) -> list[dict[str, Any]]:
@@ -191,6 +305,37 @@ def calendar_items(session: Session, *, user_id: str, character_id: str, month: 
             continue
         items.append(_event_out(event, event_date, today))
     return sorted(items, key=lambda item: (item["date"], -int(item["salience"]), item["title"]))
+
+
+def calendar_unified_items(session: Session, *, user_id: str, character_id: str, month: str) -> list[dict[str, Any]]:
+    items = list(calendar_items(session, user_id=user_id, character_id=character_id, month=month))
+    items.extend(_character_schedule_items(session, user_id=user_id, character_id=character_id, month=month))
+    items.extend(_user_commitment_items(session, user_id=user_id, character_id=character_id, month=month))
+    return sorted(items, key=lambda item: (item["date"], str(item.get("start_at") or ""), -int(item["salience"]), item["title"]))
+
+
+def calendar_categories(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    categories: dict[str, list[dict[str, Any]]] = {
+        "calendar_events": [],
+        "character_schedule": [],
+        "user_commitments": [],
+        "holidays": [],
+        "anniversaries": [],
+    }
+    for item in items:
+        kind = str(item.get("calendar_kind") or item.get("category") or "")
+        item_type = str(item.get("item_type") or "")
+        if item_type == "schedule_slot" or kind == "character_schedule":
+            categories["character_schedule"].append(item)
+        elif item_type == "user_commitment" or kind == "user_commitment":
+            categories["user_commitments"].append(item)
+        else:
+            categories["calendar_events"].append(item)
+            if kind == "holiday":
+                categories["holidays"].append(item)
+            if kind in {"relationship", "anniversary"}:
+                categories["anniversaries"].append(item)
+    return categories
 
 
 def ensure_calendar_proactive_candidates(

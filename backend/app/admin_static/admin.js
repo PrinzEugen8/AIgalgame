@@ -17,6 +17,7 @@ const state = {
   ttsProviders: [],
   users: [],
   relations: [],
+  characterProfile: null,
   memories: [],
   calendarEvents: [],
   proactiveEvents: [],
@@ -39,7 +40,10 @@ const state = {
   runtimeFilters: { feature: "", status: "", q: "", limit: 200, traceId: "", includeLegacy: true, includeCacheHits: false },
   currentPage: "users",
   userPage: { page: 1, pageSize: 20, total: 0, q: "" },
-  memoryPage: { page: 1, pageSize: 10, total: 0, q: "" },
+  memoryPage: { page: 1, pageSize: 10, total: 0, q: "", layer: "", vectorStatus: "", hidden: "" },
+  memoryRecall: null,
+  memoryVectorHealth: null,
+  memoryVectorActionResult: null,
   calendarPage: { page: 1, pageSize: 10, total: 0, q: "" },
   proactivePage: { page: 1, pageSize: 10, total: 0, q: "" },
   activeUserId: "",
@@ -81,6 +85,57 @@ function parseJsonField(field, fallback = {}) {
   return JSON.parse(raw);
 }
 
+function splitLines(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function personaSection(card, key, fallback = {}) {
+  const value = card && typeof card[key] === "object" && card[key] !== null ? card[key] : fallback;
+  return escapeHtml(pretty(value));
+}
+
+function personaTextList(card, key) {
+  const value = Array.isArray(card?.[key]) ? card[key] : [];
+  return escapeHtml(value.join("\n"));
+}
+
+function personaTextarea(name, label, value, rows = 5) {
+  return `<label class="wide persona-section"><span>${escapeHtml(label)}</span><textarea name="${escapeHtml(name)}" rows="${rows}">${value}</textarea></label>`;
+}
+
+function buildPersonaPayload(form, character) {
+  const existing = character.persona_card || {};
+  const card = {
+    ...existing,
+    identity: parseJsonField(form.elements.persona_identity, {}),
+    canon_profile: parseJsonField(form.elements.persona_canon_profile, {}),
+    personality_profile: parseJsonField(form.elements.persona_personality_profile, {}),
+    speech_profile: parseJsonField(form.elements.persona_speech_profile, {}),
+    likes_dislikes: parseJsonField(form.elements.persona_likes_dislikes, {}),
+    life_story: parseJsonField(form.elements.persona_life_story, {}),
+    relationships: parseJsonField(form.elements.persona_relationships, {}),
+    boundaries: parseJsonField(form.elements.persona_boundaries, {}),
+    growth_rules: parseJsonField(form.elements.persona_growth_rules, {}),
+    schedule_profile: parseJsonField(form.elements.persona_schedule_profile, {}),
+    information_profile: parseJsonField(form.elements.persona_information_profile, {}),
+    repost_profile: parseJsonField(form.elements.persona_repost_profile, {}),
+    editable_overrides: parseJsonField(form.elements.persona_editable_overrides, {}),
+    personality: splitLines(form.elements.persona_personality.value),
+    interests: splitLines(form.elements.persona_interests.value),
+    likes: splitLines(form.elements.persona_likes.value),
+    dislikes: splitLines(form.elements.persona_dislikes.value),
+    experiences: splitLines(form.elements.persona_experiences.value),
+    autobiography: form.elements.persona_autobiography.value.trim(),
+    relationship_status: form.elements.persona_relationship_status.value.trim(),
+    relationship_attitudes: parseJsonField(form.elements.persona_relationship_attitudes, {}),
+  };
+  card.name = form.elements.name.value.trim() || character.name || card.name || "亚托莉";
+  return card;
+}
+
 function formatDateTime(value) {
   if (!value) return "-";
   const date = new Date(Number(value) * 1000);
@@ -92,6 +147,13 @@ function formatDuration(ms) {
   const value = Number(ms || 0);
   if (value < 1000) return `${Math.max(0, Math.round(value))} ms`;
   return `${(value / 1000).toFixed(value < 10_000 ? 2 : 1)} s`;
+}
+
+function formatCost(value) {
+  const amount = Number(value || 0);
+  if (!amount) return "0";
+  if (amount < 0.0001) return amount.toExponential(2);
+  return amount.toFixed(amount < 0.01 ? 6 : 4);
 }
 
 function formatIsoTime(value) {
@@ -484,13 +546,39 @@ function renderCharacterManager() {
   }
   const character = state.characters.find((item) => item.character_id === state.activeCharacterId);
   if (!character) return;
+  const persona = character.persona_card || {};
   editor.innerHTML = `
     <form class="character-form">
       <label><span>角色名</span><input name="name" value="${escapeHtml(character.name)}"></label>
       <label><span>特殊回复阈值</span><input name="key_reply_threshold" type="number" min="0" max="100" value="${escapeHtml(character.key_reply_threshold ?? 75)}"></label>
       <label><span>当前音色</span><select name="tts_voice_profile_id"></select></label>
       <label><span>兼容旧 voice_type</span><input value="${escapeHtml(character.tts_voice_type || "")}" disabled></label>
-      <label class="wide"><span>结构化人设卡 JSON</span><textarea name="persona_card">${escapeHtml(pretty(character.persona_card || {}))}</textarea></label>
+      <div class="wide persona-editor">
+        <h3>结构化人设卡</h3>
+        <div class="persona-grid">
+          ${personaTextarea("persona_identity", "固定身份 identity JSON", personaSection(persona, "identity"), 7)}
+          ${personaTextarea("persona_canon_profile", "原作设定 canon_profile JSON", personaSection(persona, "canon_profile"), 9)}
+          ${personaTextarea("persona_personality_profile", "性格 personality_profile JSON", personaSection(persona, "personality_profile"), 9)}
+          ${personaTextarea("persona_speech_profile", "口吻 speech_profile JSON", personaSection(persona, "speech_profile"), 7)}
+          ${personaTextarea("persona_likes_dislikes", "喜恶 likes_dislikes JSON", personaSection(persona, "likes_dislikes"), 7)}
+          ${personaTextarea("persona_life_story", "经历 life_story JSON", personaSection(persona, "life_story"), 11)}
+          ${personaTextarea("persona_relationships", "关系 relationships JSON", personaSection(persona, "relationships"), 10)}
+          ${personaTextarea("persona_boundaries", "边界 boundaries JSON", personaSection(persona, "boundaries"), 9)}
+          ${personaTextarea("persona_growth_rules", "养成规则 growth_rules JSON", personaSection(persona, "growth_rules"), 9)}
+          ${personaTextarea("persona_schedule_profile", "日程 schedule_profile JSON", personaSection(persona, "schedule_profile"), 10)}
+          ${personaTextarea("persona_information_profile", "信息圈 information_profile JSON", personaSection(persona, "information_profile"), 9)}
+          ${personaTextarea("persona_repost_profile", "转发 repost_profile JSON", personaSection(persona, "repost_profile"), 7)}
+          ${personaTextarea("persona_editable_overrides", "可调覆盖 editable_overrides JSON", personaSection(persona, "editable_overrides"), 6)}
+          ${personaTextarea("persona_relationship_attitudes", "兼容关系态度 JSON", escapeHtml(pretty(persona.relationship_attitudes || {})), 5)}
+          <label class="wide persona-section"><span>兼容性格（一行一个）</span><textarea name="persona_personality" rows="5">${personaTextList(persona, "personality")}</textarea></label>
+          <label class="wide persona-section"><span>兼容兴趣（一行一个）</span><textarea name="persona_interests" rows="5">${personaTextList(persona, "interests")}</textarea></label>
+          <label class="wide persona-section"><span>兼容喜欢（一行一个）</span><textarea name="persona_likes" rows="5">${personaTextList(persona, "likes")}</textarea></label>
+          <label class="wide persona-section"><span>兼容雷点（一行一个）</span><textarea name="persona_dislikes" rows="5">${personaTextList(persona, "dislikes")}</textarea></label>
+          <label class="wide persona-section"><span>兼容经历（一行一个）</span><textarea name="persona_experiences" rows="6">${personaTextList(persona, "experiences")}</textarea></label>
+          <label class="wide persona-section"><span>兼容自传</span><textarea name="persona_autobiography" rows="5">${escapeHtml(persona.autobiography || "")}</textarea></label>
+          <label class="wide persona-section"><span>兼容关系状态</span><textarea name="persona_relationship_status" rows="4">${escapeHtml(persona.relationship_status || "")}</textarea></label>
+        </div>
+      </div>
       <label class="wide"><span>角色设定</span><textarea name="persona_prompt">${escapeHtml(character.persona_prompt || "")}</textarea></label>
       <label class="wide"><span>表达风格</span><textarea name="speech_style">${escapeHtml(character.speech_style || "")}</textarea></label>
       <label class="wide"><span>关系边界</span><textarea name="relationship_boundary">${escapeHtml(character.relationship_boundary || "")}</textarea></label>
@@ -509,7 +597,7 @@ function renderCharacterManager() {
     try {
       const payload = {
         name: form.elements.name.value.trim(),
-        persona_card: parseJsonField(form.elements.persona_card, {}),
+        persona_card: buildPersonaPayload(form, character),
         persona_prompt: form.elements.persona_prompt.value.trim(),
         speech_style: form.elements.speech_style.value.trim(),
         relationship_boundary: form.elements.relationship_boundary.value.trim(),
@@ -648,12 +736,45 @@ function activeUser() {
   return state.users.find((item) => item.user_id === state.activeUserId) || state.users[0] || null;
 }
 
+function defaultCharacterId() {
+  return state.characters.find((item) => item.character_id === "atri")?.character_id
+    || state.characters[0]?.character_id
+    || "atri";
+}
+
+function characterById(characterId) {
+  return state.characters.find((item) => item.character_id === characterId) || null;
+}
+
+function activeCharacterIdForUser(user = activeUser()) {
+  const candidate = String(user?.active_character_id || "").trim();
+  if (candidate && (!state.characters.length || characterById(candidate))) {
+    return candidate;
+  }
+  return defaultCharacterId();
+}
+
+function characterLabel(characterId) {
+  const character = characterById(characterId);
+  if (!character) return characterId || defaultCharacterId();
+  return `${character.name || character.character_id} (${character.character_id})`;
+}
+
+function characterSelectOptions(selectedId = "") {
+  const selected = selectedId || defaultCharacterId();
+  const characters = state.characters.length
+    ? state.characters
+    : [{ character_id: selected, name: selected }];
+  return characters.map((character) => `
+    <option value="${escapeHtml(character.character_id)}" ${character.character_id === selected ? "selected" : ""}>${escapeHtml(characterLabel(character.character_id))}</option>
+  `).join("");
+}
+
 function activeRelation() {
   const user = activeUser();
   if (!user) return null;
-  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === "atri")
-    || state.relations.find((item) => item.user_id === user.user_id)
-    || null;
+  const characterId = activeCharacterIdForUser(user);
+  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === characterId) || null;
 }
 
 function renderUserTabs() {
@@ -663,9 +784,10 @@ function renderUserTabs() {
   tbody.innerHTML = "";
   for (const user of state.users) {
     const row = document.createElement("tr");
+    const roleLabel = characterLabel(activeCharacterIdForUser(user));
     row.classList.toggle("active", user.user_id === state.activeUserId);
     row.innerHTML = `
-      <td><strong>${escapeHtml(user.display_name || user.user_id)}</strong><br><small>${escapeHtml(user.user_id)}</small></td>
+      <td><strong>${escapeHtml(user.display_name || user.user_id)}</strong><br><small>${escapeHtml(user.user_id)} · ${escapeHtml(roleLabel)}</small></td>
       <td>${escapeHtml(user.timezone || "")}</td>
       <td>${escapeHtml(user.proactive_daily_limit || "")}</td>
       <td>${user.story_completed ? "已完成" : "未完成"}</td>
@@ -673,10 +795,14 @@ function renderUserTabs() {
     `;
     row.addEventListener("click", async () => {
       state.activeUserId = user.user_id;
+      state.activeCharacterId = activeCharacterIdForUser(user);
       state.memoryPage.page = 1;
+      state.memoryRecall = null;
+      state.memoryVectorHealth = null;
+      state.memoryVectorActionResult = null;
       state.calendarPage.page = 1;
       state.proactivePage.page = 1;
-      await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+      await Promise.all([loadCharacterProfile(), loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
       renderTestData();
     });
     tbody.appendChild(row);
@@ -690,6 +816,7 @@ function renderUserTabs() {
 function renderUserEditor() {
   const node = $("#userEditor");
   const user = activeUser();
+  const currentCharacterId = activeCharacterIdForUser(user);
   if (!user) {
     node.textContent = "还没有用户。";
     return;
@@ -697,6 +824,8 @@ function renderUserEditor() {
   node.innerHTML = `
     <form class="compact-form" id="userForm">
       <label><span>user_id</span><input name="user_id" value="${escapeHtml(user.user_id)}" disabled></label>
+      <label class="wide role-switch-field"><span>当前角色</span><select name="active_character_id" id="activeUserCharacter">${characterSelectOptions(currentCharacterId)}</select></label>
+      <div class="wide role-switch-note">后端当前角色：${escapeHtml(characterLabel(currentCharacterId))}。切换后，关系、记忆、日程、主动消息会按这个角色读取。</div>
       <label><span>显示名</span><input name="display_name" value="${escapeHtml(user.display_name || "")}"></label>
       <label><span>时区</span><input name="timezone" value="${escapeHtml(user.timezone || "Asia/Hong_Kong")}"></label>
       <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "unlimited")}"></label>
@@ -715,6 +844,17 @@ function renderUserEditor() {
     </form>
   `;
   $("#userForm").addEventListener("submit", saveUser);
+  const actions = $("#userForm .actions");
+  const deleteButton = $("#deleteUser");
+  if (actions && deleteButton) {
+    const switchButton = document.createElement("button");
+    switchButton.type = "button";
+    switchButton.className = "secondary";
+    switchButton.id = "switchUserCharacter";
+    switchButton.textContent = "切换角色";
+    actions.insertBefore(switchButton, deleteButton);
+    switchButton.addEventListener("click", switchUserCharacter);
+  }
   $("#deleteUser").addEventListener("click", deleteUser);
 }
 
@@ -725,6 +865,9 @@ function renderRelationEditor() {
     node.textContent = "还没有关系数据，保存一次用户后会自动补齐。";
     return;
   }
+  const affection = relation.affection_state || relation.relationship_state?.affection || {};
+  const mood = relation.mood_state || relation.relationship_state?.mood || {};
+  const nextStage = affection.next_threshold ? `下一阶段 ${escapeHtml(affection.next_label || "")}: ${escapeHtml(affection.next_threshold)}` : "已到最高阶段";
   node.innerHTML = `
     <form class="compact-form" id="relationForm">
       <label><span>好感</span><input name="affection" type="number" value="${escapeHtml(relation.affection)}"></label>
@@ -733,6 +876,9 @@ function renderRelationEditor() {
       <label><span>心情</span><input name="mood" type="number" value="${escapeHtml(relation.mood)}"></label>
       <label class="wide"><span>关系阶段</span><input name="relationship_stage" value="${escapeHtml(relation.relationship_stage || relation.stage || "")}"></label>
       <div class="wide relation-attitude">
+        <strong>${escapeHtml(affection.label || relation.relationship_stage || "初识")} · ${escapeHtml(mood.label || "平静")} · touch ${escapeHtml(relation.touch_tier || relation.relationship_state?.touch_tier || "low")}</strong>
+        <span>好感 ${escapeHtml(affection.score ?? relation.affection)} / 1000 · ${nextStage}</span>
+        <span>心情 ${escapeHtml(mood.score ?? relation.mood)} / 100 · ${escapeHtml(mood.visible_hint || "")}</span>
         <strong>${escapeHtml(relation.attitude_band || "neutral")}</strong>
         <span>${escapeHtml(relation.attitude_text || "")}</span>
       </div>
@@ -740,6 +886,116 @@ function renderRelationEditor() {
     </form>
   `;
   $("#relationForm").addEventListener("submit", saveRelation);
+}
+
+function renderCharacterProfileEditor() {
+  const node = $("#characterProfileEditor");
+  const user = activeUser();
+  if (!user) {
+    node.textContent = "请选择用户。";
+    return;
+  }
+  const profile = state.characterProfile || {};
+  const overlay = profile.overlay || {};
+  const resolved = profile.resolved_card || {};
+  const speech = resolved.speech_profile || {};
+  const lifeStory = resolved.life_story || {};
+  const info = resolved.information_profile || {};
+  const repost = resolved.repost_profile || {};
+  const sourceMemoryIds = profile.source_memory_ids || [];
+  node.innerHTML = `
+    <form class="compact-form" id="characterProfileForm">
+      <label class="wide"><span>当前角色</span><input value="${escapeHtml(characterLabel(activeCharacterIdForUser(user)))}" disabled></label>
+      <label class="wide"><span>用户-角色覆盖 overlay JSON</span><textarea name="overlay" rows="14">${escapeHtml(pretty(overlay))}</textarea></label>
+      <label class="wide"><span>来源 memory_id（一行一个）</span><textarea name="source_memory_ids" rows="4">${escapeHtml(sourceMemoryIds.join("\n"))}</textarea></label>
+      <div class="wide relation-attitude">
+        <strong>revision ${escapeHtml(profile.revision || 0)} · overlay ${profile.has_overlay ? "on" : "empty"}</strong>
+        <span>允许覆盖：${escapeHtml((profile.editable_keys || []).join(", "))}</span>
+        <span>不可覆盖：${escapeHtml((profile.immutable_keys || []).join(", "))}</span>
+        <span>口癖：${escapeHtml((speech.catchphrases || []).join(" / ") || "-")}</span>
+        <span>经历：${escapeHtml((lifeStory.shared_experiences || lifeStory.experiences || []).slice(0, 3).join(" / ") || "-")}</span>
+        <span>信息圈：${escapeHtml((info.personal_topics || []).slice(0, 8).join(" / ") || "-")}</span>
+        <span>转发阈值：${escapeHtml(repost.min_interest_score ?? "-")} · daily ${escapeHtml(repost.daily_limit ?? "-")}</span>
+      </div>
+      <div class="actions">
+        <button type="submit">保存覆盖层</button>
+        <button type="button" class="secondary" id="refreshCharacterProfile">刷新</button>
+      </div>
+      <small>覆盖层只保存可养成字段；identity / canon / boundaries / growth_rules 会被后端忽略。</small>
+    </form>
+  `;
+  $("#characterProfileForm").addEventListener("submit", saveCharacterProfile);
+  $("#refreshCharacterProfile").addEventListener("click", async () => {
+    await loadCharacterProfile();
+    renderCharacterProfileEditor();
+  });
+}
+
+function renderRecallMemoryItem(item) {
+  const stateLabel = item.activated ? "激活" : "未激活";
+  const score = item.score === undefined ? "" : ` · score ${Number(item.score).toFixed(4)}`;
+  const rank = item.rank ? ` · rank ${item.rank}` : "";
+  return `
+    <article class="data-item recall-item ${item.activated ? "active" : ""}">
+      <strong>${escapeHtml(stateLabel)} · ${escapeHtml(item.layer)} · ${escapeHtml(item.reason || "")}</strong>
+      <div>${escapeHtml(item.content || item.summary || "")}</div>
+      <small>${escapeHtml(item.memory_id || "")} · vector ${escapeHtml(item.vector_status || "unknown")}${score}${rank}</small>
+      <small>${(item.tags || []).map((tag) => `#${escapeHtml(tag)}`).join(" ")}</small>
+    </article>
+  `;
+}
+
+function renderMemoryRecallResult() {
+  const result = state.memoryRecall;
+  if (!result) return `<div class="recall-empty">输入一句话后可以看到哪些记忆被激活、哪些没有激活。</div>`;
+  const summary = result.summary || {};
+  const activated = result.activated || [];
+  const inactive = result.inactive || [];
+  const errors = [summary.vector_error, summary.score_error].filter(Boolean).join(" / ");
+  return `
+    <div class="recall-summary">
+      <span>query: ${escapeHtml(result.query || "")}</span>
+      <span>activated ${activated.length}</span>
+      <span>inactive ${inactive.length}${summary.inactive_truncated ? "+" : ""}</span>
+      <span>ready ${summary.vector_ready_count || 0}</span>
+      <span>pending/error ${summary.vector_pending_or_error_count || 0}</span>
+      ${errors ? `<span class="warn">error: ${escapeHtml(errors)}</span>` : ""}
+    </div>
+    <div class="recall-columns">
+      <section>
+        <h4>激活记忆</h4>
+        <div class="data-list">${activated.map(renderRecallMemoryItem).join("") || "<small>没有激活记忆</small>"}</div>
+      </section>
+      <section>
+        <h4>未激活记忆</h4>
+        <div class="data-list">${inactive.map(renderRecallMemoryItem).join("") || "<small>没有未激活项</small>"}</div>
+      </section>
+    </div>
+  `;
+}
+
+function renderMemoryVectorHealth() {
+  const health = state.memoryVectorHealth;
+  const action = state.memoryVectorActionResult;
+  const summary = health?.summary || {};
+  const groups = health?.groups || [];
+  const groupText = groups.map((item) => `${item.layer}/${item.vector_status}${item.hidden ? "/hidden" : ""}: ${item.count}`).join(" · ");
+  const actionText = action ? `matched ${action.matched || 0} · indexed ${action.indexed || 0} · errors ${action.errors || 0}${action.dry_run ? " · dry-run" : ""}` : "";
+  return `
+    <div class="vector-health">
+      <div>
+        <strong>向量健康</strong>
+        <small>${health ? `total ${summary.total || 0} · ready ${summary.ready || 0} · needs reindex ${summary.needs_reindex || 0}` : "尚未刷新"}</small>
+        ${groupText ? `<small>${escapeHtml(groupText)}</small>` : ""}
+        ${actionText ? `<small>${escapeHtml(actionText)}</small>` : ""}
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" id="memoryVectorHealthRefresh">刷新健康</button>
+        <button type="button" class="secondary" id="memoryVectorDryRun">预览重建</button>
+        <button type="button" class="secondary" id="memoryVectorReindex">重建 pending/error</button>
+      </div>
+    </div>
+  `;
 }
 
 function renderMemoryEditor() {
@@ -766,14 +1022,36 @@ function renderMemoryEditor() {
       <label><span>层级</span><input name="layer" value="chat"></label>
       <label><span>重要度</span><input name="importance" type="number" step="0.01" value="0.5"></label>
       <label><span>置信度</span><input name="confidence" type="number" step="0.01" value="0.8"></label>
-      <label><span>角色</span><input name="character_id" value="atri"></label>
+      <label><span>角色</span><select name="character_id">${characterSelectOptions(activeCharacterIdForUser(user))}</select></label>
       <label><span>Tags（逗号分隔）</span><input name="tags" placeholder="interest,event"></label>
       <label class="wide"><span>内容</span><textarea name="content"></textarea></label>
       <label class="wide"><span>Metadata JSON</span><textarea name="metadata">{}</textarea></label>
       <div class="actions"><button type="submit">新增记忆</button></div>
     </form>
+    <form class="memory-recall-form" id="memoryRecallForm">
+      <label class="wide"><span>记忆召回评测</span><textarea name="query" placeholder="输入一句话，查看回复模块会激活哪些记忆"></textarea></label>
+      <label><span>Vector top-k</span><input name="vector_limit" type="number" min="1" max="30" value="8"></label>
+      <label><span>未激活上限</span><input name="inactive_limit" type="number" min="1" max="1000" value="200"></label>
+      <label class="inline-check"><input type="checkbox" name="include_hidden"><span>包含隐藏记忆</span></label>
+      <div class="actions"><button type="submit" class="secondary">运行评测</button></div>
+    </form>
+    <div class="memory-recall-result" id="memoryRecallResult">${renderMemoryRecallResult()}</div>
+    <div id="memoryVectorHealthPanel">${renderMemoryVectorHealth()}</div>
     <div class="table-toolbar">
       <label><span>搜索记忆</span><input id="memorySearch" value="${escapeHtml(state.memoryPage.q)}" placeholder="内容 / 层级 / 角色"></label>
+      <label><span>层级</span><select id="memoryLayerFilter">
+        ${["", "core", "persona", "persona_canon", "persona_editable", "relation", "relationship", "mood_event", "affection_event", "user_profile", "shared_memory", "character_schedule", "user_schedule", "event", "chat", "daily", "temporary"].map((value) => `<option value="${escapeHtml(value)}" ${state.memoryPage.layer === value ? "selected" : ""}>${escapeHtml(value || "全部")}</option>`).join("")}
+      </select></label>
+      <label><span>向量</span><select id="memoryVectorStatusFilter">
+        ${["", "ready", "pending", "error", "hidden"].map((value) => `<option value="${escapeHtml(value)}" ${state.memoryPage.vectorStatus === value ? "selected" : ""}>${escapeHtml(value || "全部")}</option>`).join("")}
+      </select></label>
+      <label><span>隐藏</span><select id="memoryHiddenFilter">
+        ${[
+          ["", "全部"],
+          ["visible", "仅可见"],
+          ["hidden", "仅隐藏"],
+        ].map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.memoryPage.hidden === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+      </select></label>
       <label><span>每页</span><select id="memoryPageSize">${[10, 20, 50].map((size) => `<option value="${size}" ${state.memoryPage.pageSize === size ? "selected" : ""}>${size}</option>`).join("")}</select></label>
       <button type="button" class="secondary" id="memoryRefresh">刷新</button>
       <span></span>
@@ -782,8 +1060,15 @@ function renderMemoryEditor() {
     <div class="pager" id="memoryPager"></div>
   `;
   $("#memoryForm").addEventListener("submit", createMemory);
+  $("#memoryRecallForm").addEventListener("submit", evaluateMemoryRecall);
+  $("#memoryVectorHealthRefresh").addEventListener("click", refreshMemoryVectorHealth);
+  $("#memoryVectorDryRun").addEventListener("click", () => reindexMemoryVectors(true));
+  $("#memoryVectorReindex").addEventListener("click", () => reindexMemoryVectors(false));
   $("#memoryRefresh").addEventListener("click", async () => {
     state.memoryPage.q = $("#memorySearch").value.trim();
+    state.memoryPage.layer = $("#memoryLayerFilter").value;
+    state.memoryPage.vectorStatus = $("#memoryVectorStatusFilter").value;
+    state.memoryPage.hidden = $("#memoryHiddenFilter").value;
     state.memoryPage.pageSize = Number($("#memoryPageSize").value || 10);
     state.memoryPage.page = 1;
     await loadMemories();
@@ -796,6 +1081,16 @@ function renderMemoryEditor() {
     state.memoryPage.page = 1;
     await loadMemories();
     renderMemoryEditor();
+  });
+  ["memoryLayerFilter", "memoryVectorStatusFilter", "memoryHiddenFilter"].forEach((id) => {
+    $(`#${id}`).addEventListener("change", async () => {
+      state.memoryPage.layer = $("#memoryLayerFilter").value;
+      state.memoryPage.vectorStatus = $("#memoryVectorStatusFilter").value;
+      state.memoryPage.hidden = $("#memoryHiddenFilter").value;
+      state.memoryPage.page = 1;
+      await loadMemories();
+      renderMemoryEditor();
+    });
   });
   $("#memoryPageSize").addEventListener("change", async () => {
     state.memoryPage.pageSize = Number($("#memoryPageSize").value || 10);
@@ -843,7 +1138,7 @@ function renderCalendarEventEditor() {
       <label><span>日期</span><input name="date" type="date" value="${escapeHtml(editing?.date || new Date().toISOString().slice(0, 10))}"></label>
       <label><span>标题</span><input name="title" value="${escapeHtml(editing?.title || "")}" placeholder="约会日"></label>
       <label><span>分类</span><select name="category">
-        ${["relationship", "date", "anniversary", "special"].map((category) => `<option value="${category}" ${category === (editing?.category || "relationship") ? "selected" : ""}>${category}</option>`).join("")}
+        ${["relationship", "anniversary", "date", "special", "holiday", "user_schedule", "character_schedule", "appointment"].map((category) => `<option value="${category}" ${category === (editing?.category || "relationship") ? "selected" : ""}>${category}</option>`).join("")}
       </select></label>
       <label><span>显著度</span><input name="salience" type="number" value="${escapeHtml(editing?.salience ?? 86)}"></label>
       <label class="inline-check"><input type="checkbox" name="repeats_yearly" ${editing?.repeats_yearly ? "checked" : ""}><span>每年重复</span></label>
@@ -926,6 +1221,7 @@ function renderProactiveEditor() {
   `).join("");
   const sourceOptions = [
     ["news", "新闻"],
+    ["repost", "转发"],
     ["weather", "天气"],
     ["schedule", "AI 日程"],
     ["calendar_event", "日历事件"],
@@ -1000,7 +1296,7 @@ function renderProactiveEditor() {
   $("#proactivePrewarm").addEventListener("click", async () => {
     state.proactiveActionResult = await api("/api/admin/proactive-events/prewarm", {
       method: "POST",
-      body: JSON.stringify({ user_id: state.activeUserId, character_id: "atri", limit: 4 }),
+      body: JSON.stringify({ user_id: state.activeUserId, character_id: activeCharacterIdForUser(), limit: 4 }),
     });
     await loadProactiveEvents();
     renderProactiveEditor();
@@ -1037,6 +1333,7 @@ function renderTestData() {
   renderUserTabs();
   renderUserEditor();
   renderRelationEditor();
+  renderCharacterProfileEditor();
   renderMemoryEditor();
   renderCalendarEventEditor();
 }
@@ -1056,6 +1353,19 @@ async function loadUsers() {
   if (!state.activeUserId || !state.users.some((item) => item.user_id === state.activeUserId)) {
     state.activeUserId = state.users[0]?.user_id || "";
   }
+  state.activeCharacterId = activeCharacterIdForUser(activeUser());
+}
+
+async function loadCharacterProfile() {
+  if (!state.activeUserId) {
+    state.characterProfile = null;
+    return;
+  }
+  const params = new URLSearchParams({
+    character_id: activeCharacterIdForUser(),
+    include_cards: "true",
+  });
+  state.characterProfile = await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/character-profile?${params.toString()}`);
 }
 
 async function loadMemories() {
@@ -1068,6 +1378,10 @@ async function loadMemories() {
     page: String(state.memoryPage.page),
     page_size: String(state.memoryPage.pageSize),
     q: state.memoryPage.q,
+    layer: state.memoryPage.layer || "",
+    vector_status: state.memoryPage.vectorStatus || "",
+    hidden: state.memoryPage.hidden || "",
+      character_id: activeCharacterIdForUser(),
   });
   const payload = await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories?${params.toString()}`);
   state.memories = payload.items || [];
@@ -1084,7 +1398,7 @@ async function loadCalendarEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: activeCharacterIdForUser(),
     page: String(state.calendarPage.page),
     page_size: String(state.calendarPage.pageSize),
     q: state.calendarPage.q,
@@ -1104,7 +1418,7 @@ async function loadProactiveEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: activeCharacterIdForUser(),
     page: String(state.proactivePage.page),
     page_size: String(state.proactivePage.pageSize),
     q: state.proactivePage.q,
@@ -1121,14 +1435,14 @@ async function loadAiSchedule() {
     state.aiSchedule = [];
     return;
   }
-  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "atri" });
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: activeCharacterIdForUser() });
   const payload = await api(`/api/admin/ai-schedule/today?${params.toString()}`);
   state.aiSchedule = payload.items || [];
 }
 
 async function loadTestData() {
   await loadUsers();
-  await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents(), loadAiSchedule()]);
+  await Promise.all([loadCharacterProfile(), loadMemories(), loadCalendarEvents(), loadProactiveEvents(), loadAiSchedule()]);
   renderTestData();
 }
 
@@ -1136,7 +1450,7 @@ function proactiveFormPayload() {
   const form = $("#proactiveGenerateForm");
   return {
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: activeCharacterIdForUser(),
     source_type: form.elements.source_type.value,
     slot_id: form.elements.slot_id.value,
     priority: Number(form.elements.priority.value || 80),
@@ -1202,6 +1516,40 @@ async function saveUser(event) {
   }
 }
 
+async function switchUserCharacter() {
+  const user = activeUser();
+  const select = $("#activeUserCharacter");
+  if (!user || !select) return;
+  const characterId = select.value || defaultCharacterId();
+  const button = $("#switchUserCharacter");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "切换中...";
+  }
+  try {
+    const result = await api("/api/characters/switch", {
+      method: "POST",
+      body: JSON.stringify({ user_id: user.user_id, character_id: characterId }),
+    });
+    user.active_character_id = result.active_character_id || characterId;
+    state.activeCharacterId = user.active_character_id;
+    state.memoryPage.page = 1;
+    state.calendarPage.page = 1;
+    state.proactivePage.page = 1;
+    state.memoryRecall = null;
+    state.memoryVectorHealth = null;
+    state.memoryVectorActionResult = null;
+    state.editingCalendarEventId = "";
+    await loadTestData();
+  } catch (error) {
+    $("#userEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+    if (button) {
+      button.disabled = false;
+      button.textContent = "切换角色";
+    }
+  }
+}
+
 async function deleteUser() {
   if (!window.confirm("确定删除这个用户和关联测试数据？")) return;
   await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}`, { method: "DELETE" });
@@ -1213,7 +1561,7 @@ async function saveRelation(event) {
   event.preventDefault();
   const form = $("#relationForm");
   const payload = {
-    character_id: "atri",
+    character_id: activeCharacterIdForUser(),
     affection: Number(form.elements.affection.value || 0),
     trust: Number(form.elements.trust.value || 0),
     dependency: Number(form.elements.dependency.value || 0),
@@ -1224,12 +1572,35 @@ async function saveRelation(event) {
   await loadTestData();
 }
 
+async function saveCharacterProfile(event) {
+  event.preventDefault();
+  const form = $("#characterProfileForm");
+  try {
+    const payload = {
+      character_id: activeCharacterIdForUser(),
+      overlay: parseJsonField(form.elements.overlay, {}),
+      source_memory_ids: splitLines(form.elements.source_memory_ids.value),
+    };
+    const saved = await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/character-profile`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    state.characterProfile = saved;
+    renderCharacterProfileEditor();
+    if (saved.ignored_keys?.length) {
+      $("#characterProfileEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ignored_keys: saved.ignored_keys }))}</pre>`);
+    }
+  } catch (error) {
+    $("#characterProfileEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+  }
+}
+
 async function createMemory(event) {
   event.preventDefault();
   const form = $("#memoryForm");
   try {
     const payload = {
-      character_id: form.elements.character_id.value.trim() || "atri",
+      character_id: form.elements.character_id.value.trim() || activeCharacterIdForUser(),
       layer: form.elements.layer.value.trim() || "chat",
       content: form.elements.content.value.trim(),
       importance: Number(form.elements.importance.value || 0.5),
@@ -1244,6 +1615,53 @@ async function createMemory(event) {
   } catch (error) {
     $("#memoryEditor").insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
   }
+}
+
+async function evaluateMemoryRecall(event) {
+  event.preventDefault();
+  const form = $("#memoryRecallForm");
+  const payload = {
+    user_id: state.activeUserId,
+    character_id: activeCharacterIdForUser(),
+    query: form.elements.query.value.trim(),
+    vector_limit: Number(form.elements.vector_limit.value || 8),
+    inactive_limit: Number(form.elements.inactive_limit.value || 200),
+    include_hidden: form.elements.include_hidden.checked,
+  };
+  try {
+    state.memoryRecall = await api("/api/admin/memory-recall/evaluate", { method: "POST", body: JSON.stringify(payload) });
+    $("#memoryRecallResult").innerHTML = renderMemoryRecallResult();
+  } catch (error) {
+    $("#memoryRecallResult").innerHTML = `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`;
+  }
+}
+
+async function refreshMemoryVectorHealth() {
+  if (!state.activeUserId) return;
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: activeCharacterIdForUser() });
+  state.memoryVectorHealth = await api(`/api/admin/memory-vector/health?${params.toString()}`);
+  $("#memoryVectorHealthPanel").innerHTML = renderMemoryVectorHealth();
+  $("#memoryVectorHealthRefresh").addEventListener("click", refreshMemoryVectorHealth);
+  $("#memoryVectorDryRun").addEventListener("click", () => reindexMemoryVectors(true));
+  $("#memoryVectorReindex").addEventListener("click", () => reindexMemoryVectors(false));
+}
+
+async function reindexMemoryVectors(dryRun) {
+  if (!state.activeUserId) return;
+  if (!dryRun && !window.confirm("确定重建当前用户的 pending/error 记忆向量？")) return;
+  state.memoryVectorActionResult = await api("/api/admin/memory-vector/reindex", {
+    method: "POST",
+    body: JSON.stringify({
+      user_id: state.activeUserId,
+    character_id: activeCharacterIdForUser(),
+      statuses: ["pending", "error"],
+      limit: 100,
+      dry_run: Boolean(dryRun),
+    }),
+  });
+  await refreshMemoryVectorHealth();
+  await loadMemories();
+  renderMemoryEditor();
 }
 
 async function toggleMemory(memoryId) {
@@ -1264,7 +1682,7 @@ async function saveCalendarEvent(event) {
   const form = $("#calendarEventForm");
   const payload = {
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: activeCharacterIdForUser(),
     date: form.elements.date.value,
     title: form.elements.title.value.trim(),
     category: form.elements.category.value,
@@ -1524,6 +1942,26 @@ function runtimeTraceTitle(trace) {
   return trace.summary || trace.feature || trace.trace_id || "trace";
 }
 
+function runtimeTraceMetricsSummary(trace) {
+  const metrics = trace.metrics || {};
+  const totals = metrics.totals || {};
+  const parts = [];
+  if (Number(totals.total_tokens || 0) > 0) {
+    parts.push(`tokens ${totals.total_tokens} (${totals.prompt_tokens || 0}/${totals.completion_tokens || 0})`);
+  }
+  if (Number(totals.estimated_cost || 0) > 0) {
+    parts.push(`cost ${formatCost(totals.estimated_cost)}`);
+  }
+  if (Number(totals.tts_request_count || 0) > 0) {
+    parts.push(`TTS ${formatDuration(totals.tts_elapsed_ms || 0)} / ${totals.tts_request_count}`);
+  }
+  const stages = Object.entries(metrics.stage_elapsed_ms || {}).slice(0, 3).map(([name, ms]) => `${name} ${formatDuration(ms)}`);
+  if (stages.length) parts.push(`stages ${stages.join(", ")}`);
+  const models = (metrics.models || []).slice(0, 2).map((item) => `${item.model || item.provider || item.provider_id || "model"} ${item.total_tokens || 0}t`);
+  if (models.length) parts.push(`models ${models.join(", ")}`);
+  return parts.join(" · ");
+}
+
 function renderRuntimeReferenceBadges(item) {
   const badges = [];
   if (item.references_summary) badges.push(`<span class="runtime-reference-chip">${escapeHtml(item.references_summary)}</span>`);
@@ -1573,6 +2011,7 @@ function renderRuntimeTraceCard(trace) {
   const open = state.runtimeOpenTraces.has(trace.trace_id) ? "open" : "";
   const selected = items.some((item) => item.id === state.runtimeSelectedId) ? "selected" : "";
   const canFilterTrace = trace.trace_id && !trace.is_legacy;
+  const metricsSummary = runtimeTraceMetricsSummary(trace);
   return `
     <details class="runtime-trace-card ${statusClass} ${selected}" data-runtime-trace-id="${escapeHtml(trace.trace_id || "")}" ${open}>
       <summary class="runtime-trace-summary">
@@ -1580,6 +2019,7 @@ function renderRuntimeTraceCard(trace) {
         <span class="runtime-trace-main">
           <strong>${escapeHtml(runtimeTraceTitle(trace))}</strong>
           <small>${escapeHtml(formatDateTime(trace.started_ts))} · ${escapeHtml(formatDuration(trace.elapsed_ms))} · ${items.length} 个节点 · ${escapeHtml(trace.trace_id || "no trace")}</small>
+          ${metricsSummary ? `<small>${escapeHtml(metricsSummary)}</small>` : ""}
         </span>
         <span class="runtime-trace-actions">
           ${trace.feature ? `<button type="button" class="secondary" data-runtime-feature="${escapeHtml(trace.feature)}">只看本功能</button>` : ""}
@@ -1873,6 +2313,43 @@ async function loadPairing() {
   $("#adminUrl").textContent = `管理台：${pairing.admin_url}`;
 }
 
+function renderDebugMomentPreview(payload) {
+  const node = $("#debugMomentPreview");
+  if (!node) return;
+  const moment = payload?.moment || {};
+  const image = payload?.image || {};
+  if (!payload?.ok || !moment.moment_id) {
+    node.hidden = true;
+    node.innerHTML = "";
+    return;
+  }
+  const mediaUrl = moment.media_url || image.url || "";
+  const prompt = image.prompt
+    ? `<details><summary>图片 prompt</summary><pre>${escapeHtml(image.prompt)}</pre></details>`
+    : "";
+  node.hidden = false;
+  node.innerHTML = `
+    <article>
+      ${mediaUrl ? `<img src="${escapeHtml(mediaUrl)}?t=${Date.now()}" alt="Generated moment image">` : `<div class="editor-placeholder">这次没有生成图片。</div>`}
+      <div class="debug-moment-meta">
+        <strong>${escapeHtml(moment.author_name || moment.author_id || "角色")}</strong>
+        <p>${escapeHtml(moment.text || "")}</p>
+        <small>moment_id: ${escapeHtml(moment.moment_id)}${moment.media_asset_id ? ` · media_asset_id: ${escapeHtml(moment.media_asset_id)}` : ""}</small>
+        <div class="actions">
+          <button type="button" class="secondary" data-debug-trace="${escapeHtml(payload.trace_id || "")}" ${payload.trace_id ? "" : "disabled"}>查看这次日志</button>
+        </div>
+      </div>
+      ${prompt}
+    </article>
+  `;
+  node.querySelector("[data-debug-trace]")?.addEventListener("click", (event) => {
+    const traceId = event.currentTarget.dataset.debugTrace || "";
+    if (!traceId) return;
+    state.runtimeFilters.traceId = traceId;
+    switchPage("runtime-logs");
+  });
+}
+
 async function runDebug(path) {
   $("#debugResult").textContent = "执行中...";
   try {
@@ -1882,6 +2359,22 @@ async function runDebug(path) {
     $("#debugResult").textContent = pretty(await api(path, { method: "POST", body: JSON.stringify(body) }));
   } catch (error) {
     $("#debugResult").textContent = pretty({ ok: false, message: error.message });
+  }
+}
+
+async function runDebugWithPreview(path) {
+  $("#debugResult").textContent = "执行中...";
+  renderDebugMomentPreview(null);
+  try {
+    const body = path.endsWith("advance-time")
+      ? { local_time: new Date().toISOString() }
+      : {};
+    const result = await api(path, { method: "POST", body: JSON.stringify(body) });
+    $("#debugResult").textContent = pretty(result);
+    renderDebugMomentPreview(result);
+  } catch (error) {
+    $("#debugResult").textContent = pretty({ ok: false, message: error.message });
+    renderDebugMomentPreview(null);
   }
 }
 
@@ -2709,7 +3202,7 @@ async function boot() {
   $("#voiceForm").addEventListener("submit", saveVoice);
   $("#voiceNew").addEventListener("click", () => setVoiceForm(null));
   document.querySelectorAll("[data-debug]").forEach((button) => {
-    button.addEventListener("click", () => runDebug(button.dataset.debug));
+    button.addEventListener("click", () => runDebugWithPreview(button.dataset.debug));
   });
 }
 

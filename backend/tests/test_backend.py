@@ -18,15 +18,19 @@ from sqlalchemy import select  # noqa: E402
 
 from app import providers, schedule as schedule_module, scheduler as scheduler_module  # noqa: E402
 from app.config import secret_store  # noqa: E402
+from app.context_planner import build_context_plan, context_plan_reference  # noqa: E402
 from app.database import SessionLocal, init_db  # noqa: E402
 from app.diagnostics import diagnostic_path, diagnostic_span, runtime_logs, write_diagnostic  # noqa: E402
 from app.image_generation import build_safe_image_request, generate_safe_image  # noqa: E402
+from app.information_circle import ensure_repost_candidate, upsert_content_item  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import CalendarEvent, Character, DeviceRegistration, Experience, MediaAsset, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveDeliveryAttempt, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TouchReactionPool, TrendRadarSnapshot, TtsVoiceProfile, User, UserCommitment, UserLocation, WeatherSnapshot  # noqa: E402
+from app.character_profiles import resolve_character_profile  # noqa: E402
+from app.models import CalendarEvent, Character, ContentItem, DeviceRegistration, Experience, MediaAsset, Memory, Message, Moment, MomentInteraction, OpeningCache, ProactiveDeliveryAttempt, ProactiveEvent, ProviderConfig, RelationState, ScheduleSlot, TouchReactionPool, TrendRadarSnapshot, TtsVoiceProfile, User, UserCharacterProfile, UserCommitment, UserLocation, WeatherSnapshot  # noqa: E402
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
-from app.pipeline import _normalize_line_text, _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
+from app.persona import normalize_persona_card, relationship_state_summary, touch_tier_for_affection  # noqa: E402
+from app.pipeline import _calendar_context_with_references, _merge_dialogue_line_candidates, _normalize_line_text, _split_expression_tag, _tts_for_line, _web_search_context_with_references, handle_event  # noqa: E402
 from app.opening import _instant_greeting_payload  # noqa: E402
 from app.touch_reactions import (  # noqa: E402
     _touch_prompt,
@@ -85,12 +89,48 @@ def test_health_and_bootstrap() -> None:
     payload = client.get("/api/bootstrap").json()
     assert payload["character"]["character_id"] == "atri"
     assert payload["character"]["name"] == "亚托莉"
+    assert payload["user"]["active_character_id"] == "atri"
     assert payload["live2d"]["appearance_id"] == "neko"
     assert payload["live2d"]["touch_pool_version"]
     assert "providers" not in payload
     with SessionLocal() as session:
         assert session.get(Character, "atri") is not None
+        assert session.get(Character, "miyu") is not None
         assert session.get(Character, "sakura") is None
+
+
+def test_character_switch_to_miyu_keeps_atri() -> None:
+    user_id = f"switch_user_{uid('case')}"
+    listing = client.get("/api/characters", params={"user_id": user_id}).json()
+    character_ids = {item["character_id"] for item in listing["items"]}
+    assert {"atri", "miyu"}.issubset(character_ids)
+    miyu = next(item for item in listing["items"] if item["character_id"] == "miyu")
+    serialized_card = json.dumps(miyu["persona_card"], ensure_ascii=False)
+    assert miyu["name"] == "小鸟游弥柚"
+    assert "成年" in serialized_card
+    assert "高性能" not in serialized_card
+    assert "机器人" not in serialized_card
+
+    switched = client.post("/api/characters/switch", json={"user_id": user_id, "character_id": "miyu"}).json()
+    assert switched["ok"] is True
+    assert switched["active_character_id"] == "miyu"
+    payload = client.get("/api/bootstrap", params={"user_id": user_id}).json()
+    assert payload["character"]["character_id"] == "miyu"
+    assert payload["character"]["name"] == "小鸟游弥柚"
+    assert payload["user"]["active_character_id"] == "miyu"
+
+    payload = client.get("/api/bootstrap", params={"user_id": user_id, "character_id": "atri"}).json()
+    assert payload["character"]["character_id"] == "miyu"
+    assert payload["user"]["active_character_id"] == "miyu"
+
+    switched_back = client.post("/api/characters/switch", json={"user_id": user_id, "character_id": "atri"}).json()
+    assert switched_back["ok"] is True
+    assert switched_back["active_character_id"] == "atri"
+    payload = client.get("/api/bootstrap", params={"user_id": user_id, "character_id": "atri"}).json()
+    assert payload["character"]["character_id"] == "atri"
+    with SessionLocal() as session:
+        assert session.get(Character, "atri") is not None
+        assert session.get(Character, "miyu") is not None
 
 
 def test_appearance_id_does_not_create_character() -> None:
@@ -111,8 +151,170 @@ def test_schema_has_persona_profile_and_vector_columns() -> None:
 
         assert "profile_json" in columns("users")
         assert "persona_card_json" in columns("characters")
+        assert {"user_id", "character_id", "overlay_json", "source_memory_ids_json", "revision"}.issubset(columns("user_character_profiles"))
         memory_columns = columns("memories")
         assert {"tags_json", "metadata_json", "vector_status", "vector_updated_at"}.issubset(memory_columns)
+
+
+def test_user_character_profile_overlay_overrides_only_editable_fields() -> None:
+    user_id = f"profile_overlay_user_{uid('case')}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        profile = session.get(UserCharacterProfile, (user_id, "atri"))
+        assert profile is not None
+        profile.overlay_json = dump_json(
+            {
+                "speech_profile": {"catchphrases": ["custom catch"]},
+                "information_profile": {"personal_topics": ["custom topic"]},
+                "repost_profile": {"daily_limit": 1},
+                "identity": {"role": "fake role"},
+                "canon_profile": {"summary": "fake canon"},
+            }
+        )
+        session.commit()
+        resolved = resolve_character_profile(session, user_id=user_id, character_id="atri")
+    assert "custom catch" in resolved.card["speech_profile"]["catchphrases"]
+    assert "custom topic" in resolved.card["information_profile"]["personal_topics"]
+    assert resolved.card["repost_profile"]["daily_limit"] == 1
+    assert resolved.card["identity"].get("role") != "fake role"
+    assert resolved.card["canon_profile"].get("summary") != "fake canon"
+
+
+def test_admin_user_character_profile_endpoint_reports_ignored_keys() -> None:
+    user_id = f"profile_admin_user_{uid('case')}"
+    client.post("/api/admin/users", json={"user_id": user_id, "character_id": "atri"}).raise_for_status()
+    payload = client.put(
+        f"/api/admin/users/{user_id}/character-profile",
+        json={
+            "character_id": "atri",
+            "overlay": {
+                "speech_profile": {"catchphrases": ["admin catch"]},
+                "identity": {"role": "admin fake role"},
+            },
+            "source_memory_ids": ["mem_custom"],
+        },
+    ).json()
+    assert payload["ok"] is True
+    assert "identity" in payload["ignored_keys"]
+    assert payload["overlay"]["speech_profile"]["catchphrases"] == ["admin catch"]
+    assert payload["source_memory_ids"] == ["mem_custom"]
+    assert payload["resolved_card"]["identity"].get("role") != "admin fake role"
+
+
+def test_calendar_context_resolves_relative_week_to_dragon_boat() -> None:
+    suffix = uid("calctx")
+    user_id = f"calendar_context_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        event = EventIn(
+            event_type="user_message",
+            user_id=user_id,
+            character_id="atri",
+            session_id="calendar_context_session",
+            payload={"text": "再过一个星期要放假了"},
+            client_context={"local_time": "2026-06-12T09:00:00+08:00"},
+        )
+        context, refs = _calendar_context_with_references(session, event, "再过一个星期要放假了")
+    assert refs["relative"]["target_date"] == "2026-06-19"
+    titles = {item["title"] for item in refs["items"]}
+    assert "端午节" in titles
+    assert "2026-06-19 端午节" in context
+
+
+def test_context_planner_heuristic_selects_realtime_without_memory() -> None:
+    suffix = uid("ctxplan_heuristic")
+    user_id = f"context_plan_heuristic_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind == "llm_task")).scalars():
+            config.enabled = False
+        session.commit()
+        user = session.get(User, user_id)
+        character = session.get(Character, "atri")
+        plan = build_context_plan(
+            session,
+            event=EventIn(event_type="user_message", user_id=user_id, character_id="atri", payload={"text": "帮我联网搜索最新 AI 新闻"}),
+            user=user,
+            character=character,
+            text="帮我联网搜索最新 AI 新闻",
+            recent_dialogue="USER: 帮我联网搜索最新 AI 新闻",
+            user_profile_used=False,
+        )
+    assert plan.source == "heuristic"
+    assert plan.use_web_search is True
+    assert plan.use_memory is False
+    assert plan.use_character_schedule is False
+    assert context_plan_reference(plan)["use_web_search"] is True
+
+
+def test_context_planner_uses_task_llm_when_available() -> None:
+    suffix = uid("ctxplan_llm")
+    user_id = f"context_plan_llm_user_{suffix}"
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        bodies.append(body)
+        return _llm_json_response(
+            {
+                "use_recent_dialogue": True,
+                "use_user_profile": False,
+                "use_memory": True,
+                "memory_query": "上次咖啡约定",
+                "memory_layers": ["event", "user_profile"],
+                "memory_limit": 2,
+                "use_moment_interactions": False,
+                "use_character_schedule": True,
+                "schedule_scope": "current",
+                "use_user_schedule": False,
+                "use_calendar": False,
+                "use_weather": False,
+                "use_web_search": False,
+                "reason": "用户问到上次约定，同时需要看角色当前状态。",
+                "confidence": 0.88,
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            task = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_context_planner_task_{suffix}",
+                    kind="llm_task",
+                    provider="deepseek",
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-chat",
+                    secrets={"api_key": "task-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            character = session.get(Character, "atri")
+            plan = build_context_plan(
+                session,
+                event=EventIn(event_type="user_message", user_id=user_id, character_id="atri", payload={"text": "你还记得我上次说咖啡吗"}),
+                user=user,
+                character=character,
+                text="你还记得我上次说咖啡吗",
+                recent_dialogue="USER: 你还记得我上次说咖啡吗",
+                user_profile_used=False,
+            )
+            task.enabled = False
+            session.commit()
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+    assert bodies
+    assert plan.source == "llm"
+    assert plan.use_memory is True
+    assert plan.memory_query == "上次咖啡约定"
+    assert plan.memory_layers == ["event", "user_profile"]
+    assert plan.memory_limit == 2
+    assert plan.use_character_schedule is True
+    assert plan.schedule_scope == "current"
+    assert plan.use_web_search is False
 
 
 def test_admin_routes_do_not_expose_secrets() -> None:
@@ -122,6 +324,7 @@ def test_admin_routes_do_not_expose_secrets() -> None:
     status = client.get("/api/admin/status").json()
     assert status["ok"] is True
     assert "providers" in status
+    assert "push" in status["configured"]
     serialized = json.dumps(status, ensure_ascii=False)
     if status["providers"]:
         assert "has_secret_fields" in serialized
@@ -183,6 +386,39 @@ def test_admin_runtime_logs_route_filters() -> None:
     assert payload["total"] == 1
     assert payload["items"][0]["event"] == "route_filter_test"
     assert "过滤模块" in payload["features"]
+
+
+def test_runtime_logs_aggregate_usage_and_tts_metrics() -> None:
+    _clear_diagnostics()
+    with diagnostic_span(
+        "llm_request",
+        feature="回复模块",
+        stage="llm_dialogue",
+        trace_id="trace_metrics_case",
+        provider_id="provider_llm",
+        provider="deepseek",
+        model="model-a",
+    ) as span:
+        span.add(usage={"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20}, estimated_cost=0.003)
+    with diagnostic_span(
+        "tts_request",
+        feature="TTS",
+        stage="synthesize",
+        trace_id="trace_metrics_case",
+        provider_id="provider_tts",
+    ) as span:
+        span.add(bytes=256)
+
+    payload = runtime_logs(limit=20, trace_id="trace_metrics_case")
+    trace = next(item for item in payload["traces"] if item["trace_id"] == "trace_metrics_case")
+    metrics = trace["metrics"]
+    assert metrics["totals"]["prompt_tokens"] == 12
+    assert metrics["totals"]["completion_tokens"] == 8
+    assert metrics["totals"]["total_tokens"] == 20
+    assert metrics["totals"]["estimated_cost"] == 0.003
+    assert metrics["totals"]["tts_request_count"] == 1
+    assert metrics["models"][0]["provider_id"] == "provider_llm"
+    assert metrics["models"][0]["model"] == "model-a"
 
 
 def test_runtime_logs_legacy_cache_before_and_flow() -> None:
@@ -644,6 +880,7 @@ def test_user_message_trace_records_reply_judgement() -> None:
         "schedule",
         "character_schedule",
         "user_schedule",
+        "calendar",
         "weather",
         "persona",
         "user_profile",
@@ -687,6 +924,93 @@ def test_provider_presets() -> None:
     assert {"auth_mode", "key_id", "project_id", "private_key", "api_key", "include_warning", "include_minutely"}.issubset(weather_fields)
     assert [item["provider"] for item in payload["image"]] == ["doubao_seedream", "openai_gpt_image", "gemini_image"]
     assert "supports_web_search" not in str(payload)
+
+
+def test_search_providers_can_keep_trend_radar_and_dialogue_search_enabled() -> None:
+    suffix = uid("multi_search")
+    with SessionLocal() as session:
+        trend = upsert_provider(
+            session,
+            ProviderConfigIn(
+                provider_id=f"trend_multi_{suffix}",
+                kind="search",
+                provider="trend_radar",
+                base_url="https://github.com/PrinzEugen8/AI_news",
+                enabled=True,
+            ),
+        )
+        ark = upsert_provider(
+            session,
+            ProviderConfigIn(
+                provider_id=f"ark_multi_{suffix}",
+                kind="search",
+                provider="volc_ark_web_search",
+                base_url="https://ark.example/api/v3",
+                model="ark-search",
+                secrets={"api_key": "ark-key"},
+                enabled=True,
+            ),
+        )
+        assert session.get(ProviderConfig, trend.provider_id).enabled is True
+        assert session.get(ProviderConfig, ark.provider_id).enabled is True
+        trend.enabled = False
+        ark.enabled = False
+        session.commit()
+
+
+def test_dialogue_web_search_uses_volc_search_not_trend_radar() -> None:
+    suffix = uid("dialogue_search")
+    user_id = f"dialogue_search_user_{suffix}"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        assert str(request.url) == "https://ark.example/api/v3/responses"
+        return httpx.Response(
+            200,
+            json={
+                "output_text": "Search summary",
+                "sources": [{"title": "Real source", "url": "https://example.com/source", "published_at": "2026-06-12"}],
+                "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12},
+            },
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            trend = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"trend_dialogue_{suffix}",
+                    kind="search",
+                    provider="trend_radar",
+                    base_url="https://github.com/PrinzEugen8/AI_news",
+                    enabled=True,
+                ),
+            )
+            ark = upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"ark_dialogue_{suffix}",
+                    kind="search",
+                    provider="volc_ark_web_search",
+                    base_url="https://ark.example/api/v3",
+                    model="ark-search",
+                    secrets={"api_key": "ark-key"},
+                    enabled=True,
+                ),
+            )
+            context, refs = _web_search_context_with_references(session, "联网搜索最新 AI 新闻")
+            assert refs["used"] is True
+            assert refs["source"] == "volc_ark_web_search"
+            assert "Real source" in context
+            assert calls == ["https://ark.example/api/v3/responses"]
+            trend.enabled = False
+            ark.enabled = False
+            session.commit()
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def test_embedding_provider_test_uses_openai_compatible_embeddings() -> None:
@@ -785,6 +1109,192 @@ def test_qdrant_vector_memory_upsert_search_and_filter() -> None:
             session.commit()
     finally:
         providers.HTTP_TRANSPORT = None
+
+
+def test_admin_memory_recall_evaluate_shows_active_and_inactive() -> None:
+    suffix = uid("eval")
+    user_id = f"recall_user_{suffix}"
+
+    def vector_for(text: str) -> list[float]:
+        return [1.0, 0.0, 0.0] if "coffee" in text.lower() else [0.0, 1.0, 0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        inputs = body["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        return httpx.Response(
+            200,
+            json={"data": [{"index": index, "embedding": vector_for(str(text))} for index, text in enumerate(inputs)]},
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"embedding_eval_{suffix}",
+                    kind="embedding",
+                    provider="openai_compatible",
+                    base_url="https://embedding.example/v1",
+                    model="embed-test",
+                    secrets={"api_key": "embed-key"},
+                ),
+            )
+            fixed = Memory(
+                memory_id=f"fixed_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                layer="user_profile",
+                content="User prefers concise replies.",
+                importance=0.9,
+                confidence=0.9,
+            )
+            vector = Memory(
+                memory_id=f"vector_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                layer="event",
+                content="User planned coffee on Saturday.",
+                importance=0.8,
+                confidence=0.9,
+            )
+            pending = Memory(
+                memory_id=f"pending_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                layer="chat",
+                content="User mentioned a different pending fact.",
+                vector_status="pending",
+                importance=0.4,
+                confidence=0.6,
+            )
+            session.add_all([fixed, vector, pending])
+            session.flush()
+            assert safe_index_memory_vector(session, fixed)["status"] == "ready"
+            assert safe_index_memory_vector(session, vector)["status"] == "ready"
+            session.commit()
+
+        payload = client.post(
+            "/api/admin/memory-recall/evaluate",
+            json={"user_id": user_id, "character_id": "atri", "query": "coffee plan", "vector_limit": 5},
+        ).json()
+        assert payload["ok"] is True
+        activated_ids = {item["memory_id"] for item in payload["activated"]}
+        inactive_by_id = {item["memory_id"]: item for item in payload["inactive"]}
+        assert fixed.memory_id in activated_ids
+        assert vector.memory_id in activated_ids
+        assert inactive_by_id[pending.memory_id]["reason"].startswith("vector_not_ready")
+
+        with SessionLocal() as session:
+            config = session.get(ProviderConfig, f"embedding_eval_{suffix}")
+            assert config is not None
+            config.enabled = False
+            session.commit()
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_admin_memory_vector_health_and_reindex() -> None:
+    suffix = uid("reindex")
+    user_id = f"reindex_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        inputs = body["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        return httpx.Response(
+            200,
+            json={"data": [{"index": index, "embedding": [0.2, 0.8, 0.0]} for index, _text in enumerate(inputs)]},
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"embedding_reindex_{suffix}",
+                    kind="embedding",
+                    provider="openai_compatible",
+                    base_url="https://embedding.example/v1",
+                    model="embed-test",
+                    secrets={"api_key": "embed-key"},
+                ),
+            )
+            memory = Memory(
+                memory_id=f"reindex_mem_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                layer="temporary",
+                content="Temporary memory that needs vector indexing.",
+                vector_status="pending",
+            )
+            session.add(memory)
+            session.commit()
+
+        health = client.get(f"/api/admin/memory-vector/health?user_id={user_id}&character_id=atri").json()
+        assert health["summary"]["needs_reindex"] >= 1
+
+        dry_run = client.post(
+            "/api/admin/memory-vector/reindex",
+            json={"user_id": user_id, "character_id": "atri", "statuses": ["pending"], "dry_run": True},
+        ).json()
+        assert dry_run["dry_run"] is True
+        assert dry_run["matched"] >= 1
+
+        result = client.post(
+            "/api/admin/memory-vector/reindex",
+            json={"user_id": user_id, "character_id": "atri", "statuses": ["pending"], "dry_run": False},
+        ).json()
+        assert result["ok"] is True
+        with SessionLocal() as session:
+            indexed = session.get(Memory, f"reindex_mem_{suffix}")
+            assert indexed is not None
+            assert indexed.vector_status == "ready"
+            config = session.get(ProviderConfig, f"embedding_reindex_{suffix}")
+            assert config is not None
+            config.enabled = False
+            session.commit()
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_admin_memory_list_filters_layer_vector_and_hidden() -> None:
+    suffix = uid("memfilter")
+    user_id = f"memory_filter_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        visible_ready = Memory(
+            memory_id=f"visible_ready_{suffix}",
+            user_id=user_id,
+            character_id="atri",
+            layer="event",
+            content="Visible ready event memory.",
+            vector_status="ready",
+        )
+        hidden_error = Memory(
+            memory_id=f"hidden_error_{suffix}",
+            user_id=user_id,
+            character_id="atri",
+            layer="chat",
+            content="Hidden error chat memory.",
+            vector_status="error",
+            hidden=True,
+        )
+        session.add_all([visible_ready, hidden_error])
+        session.commit()
+
+    event_page = client.get(f"/api/admin/users/{user_id}/memories?layer=event&vector_status=ready").json()
+    assert event_page["total"] == 1
+    assert event_page["items"][0]["memory_id"] == f"visible_ready_{suffix}"
+    hidden_page = client.get(f"/api/admin/users/{user_id}/memories?hidden=hidden").json()
+    assert hidden_page["total"] == 1
+    assert hidden_page["items"][0]["memory_id"] == f"hidden_error_{suffix}"
 
 
 def _trend_radar_payload() -> dict[str, object]:
@@ -1552,6 +2062,39 @@ def test_admin_voice_crud_and_character_voice_selection() -> None:
     assert atri["tts_voice_profile_id"] == ""
 
 
+def test_persona_card_structured_atri_sample_keeps_legacy_overrides() -> None:
+    card = normalize_persona_card(
+        {
+            "name": "亚托莉",
+            "personality": ["认真", "温柔"],
+            "relationship_attitudes": {
+                "good": "会更主动分享日程。",
+                "neutral": "保持自然陪伴。",
+                "bad": "先保持距离。",
+            },
+        }
+    )
+    assert card["schema_version"] == 2
+    assert card["personality"] == ["认真", "温柔"]
+    assert card["relationship_attitudes"]["good"] == "会更主动分享日程。"
+    assert "海底" in card["canon_profile"]["summary"]
+    assert card["canon_profile"]["sources"]
+    assert card["growth_rules"]["affection"]["scale"] == "0-1000"
+    assert card["schedule_profile"]["occupation"] == "student"
+    assert card["information_profile"]["platforms"]
+    assert card["repost_profile"]["min_interest_score"] >= 0
+
+
+def test_relationship_state_maps_affection_mood_and_touch_tier() -> None:
+    relation = RelationState(user_id="state_user", character_id="atri", affection=85, trust=60, dependency=35, mood=12)
+    state = relationship_state_summary(relation)
+    assert state["affection"]["label"] == "初识"
+    assert state["mood"]["label"] == "平静"
+    assert state["touch_tier"] == "low"
+    assert touch_tier_for_affection(150) == "mid"
+    assert touch_tier_for_affection(700) == "high"
+
+
 def test_tts_voice_profile_uses_own_resource_and_speaker_and_skips_unreadable_text() -> None:
     requests: list[dict[str, object]] = []
     audio = base64.b64encode(b"ID3" + b"z" * 220).decode()
@@ -2072,6 +2615,7 @@ def test_volc_ark_web_search_404_returns_actionable_diagnostic() -> None:
                     base_url="https://ark.cn-beijing.volces.com/api/v3",
                     model="doubao-response-search",
                     secrets={"api_key": "ark-key"},
+                    enabled=False,
                 ),
             )
             with pytest.raises(ProviderError, match="does not support Responses or Web Search"):
@@ -4147,7 +4691,7 @@ def test_user_message_extracts_simple_clock_reminder_without_commitment_llm() ->
             user.story_completed = True
             user.tts_enabled = False
             session.commit()
-            handle_event(
+            result = handle_event(
                 session,
                 EventIn(
                     event_type="user_message",
@@ -4165,6 +4709,10 @@ def test_user_message_extracts_simple_clock_reminder_without_commitment_llm() ->
             proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
             payload = json.loads(proactive.payload_json)
             assert payload["delivery_timing"] == "on_time"
+            reminder_payload = result.payload["commitment"]
+            assert reminder_payload["commitment_id"] == commitment.commitment_id
+            assert reminder_payload["remind_at"] == commitment.remind_at
+            assert reminder_payload["proactive_event_id"] == proactive.proactive_event_id
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -4216,6 +4764,48 @@ def test_appointment_on_time_fast_path_delivers_without_judge() -> None:
             assert result["event"]["source_type"] == "appointment"
     finally:
         providers.HTTP_TRANSPORT = None
+
+
+def test_appointment_only_ignores_unread_non_appointment_event() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"appointment_only_unread_user_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        user = session.get(User, user_id)
+        user.story_completed = True
+        user.notifications_enabled = True
+        event = create_proactive_event(
+            session,
+            user_id=user_id,
+            character_id="atri",
+            source_type="moment_interaction",
+            source_id=f"moment_{suffix}",
+            title="Moment",
+            text="A non-appointment unread event.",
+            priority=72,
+            dedupe_key=f"moment_unread_{suffix}",
+            scheduled_at=datetime.fromisoformat("2026-06-09T00:00:00+00:00"),
+        )
+        user.proactive_judgement_json = dump_json(
+            {
+                "status": "decided",
+                "should_send": True,
+                "selected_event_id": event.proactive_event_id,
+                "candidate_ids": [event.proactive_event_id],
+            }
+        )
+        session.commit()
+
+        result = pending_proactive_response(
+            session,
+            user_id=user_id,
+            character_id="atri",
+            local_time=datetime.fromisoformat("2026-06-09T14:30:00+08:00"),
+            generate_news=False,
+            generate_weather=False,
+            appointment_only=True,
+        )
+        assert result["event"] is None
 
 
 def test_follow_up_appointment_not_due_during_busy_window() -> None:
@@ -4679,6 +5269,8 @@ def test_news_candidate_does_not_call_disabled_ark_when_trend_radar_has_no_match
             user = session.get(User, user_id)
             user.interest_topics_json = json.dumps(["AI 游戏"], ensure_ascii=False)
             user.news_enabled = True
+            for config in session.execute(select(ProviderConfig).where(ProviderConfig.kind == "search", ProviderConfig.provider == "volc_ark_web_search")).scalars():
+                config.enabled = False
             upsert_provider(
                 session,
                 ProviderConfigIn(
@@ -4688,6 +5280,7 @@ def test_news_candidate_does_not_call_disabled_ark_when_trend_radar_has_no_match
                     base_url="https://ark.cn-beijing.volces.com/api/v3",
                     model="doubao-response-search",
                     secrets={"api_key": "ark-key"},
+                    enabled=False,
                 ),
             )
             upsert_provider(
@@ -4979,6 +5572,73 @@ def test_safe_image_request_policy_builds_supported_kinds_without_content_gate()
         assert "用户给的自拍短提示" in direct_prompt.prompt
 
 
+def test_debug_generate_moment_creates_visible_image_moment_and_trace() -> None:
+    _clear_diagnostics()
+    user_id = f"debug_moment_user_{uid('case')}"
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"d" * 100
+    image_requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, headers={"content-type": "image/png"}, content=image_bytes)
+        body = json.loads(request.content.decode())
+        assert str(request.url) == "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+        assert "Debug classroom window" in body["prompt"]
+        assert "No people" in body["prompt"]
+        image_requests.append(body)
+        return httpx.Response(200, json={"data": [{"url": "https://image.example/debug-moment.png"}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id="test_debug_moment_image",
+                    kind="image",
+                    provider="doubao_seedream",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-seedream-5-0-260128",
+                    secrets={"api_key": "ark-key"},
+                    metadata={"size": "1024x1024", "output_format": "png", "response_format": "url"},
+                ),
+            )
+
+        payload = client.post(
+            "/api/debug/generate-moment",
+            params={"user_id": user_id, "character_id": "atri"},
+            json={
+                "text": "Debug moment image test.",
+                "scene_hint": "Debug classroom window with soft afternoon light.",
+                "image_kind": "scenery",
+            },
+        ).json()
+        assert payload["ok"] is True
+        assert payload["trace_id"].startswith("debug_moment_")
+        assert payload["moment"]["media_asset_id"]
+        assert payload["moment"]["media_url"] == f"/media/{payload['moment']['media_asset_id']}"
+        assert payload["image"]["generated"] is True
+        assert payload["image"]["kind"] == "scenery"
+        assert len(image_requests) == 1
+
+        media_response = client.get(payload["moment"]["media_url"])
+        assert media_response.status_code == 200
+        assert media_response.content == image_bytes
+
+        moments_payload = client.get("/api/moments").json()
+        created = next(item for item in moments_payload["items"] if item["moment_id"] == payload["moment"]["moment_id"])
+        assert created["media_url"] == payload["moment"]["media_url"]
+        assert created["source_payload"]["debug"] is True
+
+        logs = runtime_logs(limit=20, trace_id=payload["trace_id"])
+        assert logs["traces"]
+        assert any(item["feature"] == "朋友圈测试" for item in logs["items"])
+        assert any(item["event"] == "image_request" for item in logs["items"])
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_proactive_image_requires_explicit_generation_flag() -> None:
     with SessionLocal() as session:
         ensure_seed(session, user_id="proactive_no_image_user", character_id="atri")
@@ -5130,6 +5790,34 @@ def test_ensure_schedule_refreshes_elapsed_pending_slots() -> None:
         interrupted = session.get(ScheduleSlot, "slot_test_refresh_interrupted")
         assert elapsed.actual_status == "completed"
         assert interrupted.actual_status == "interrupted"
+
+
+def test_persona_driven_schedule_varies_by_weekend_and_holiday() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"schedule_variation_user_{suffix}"
+
+    def titles_between(slots: list[ScheduleSlot], start_hour: int, end_hour: int) -> set[str]:
+        titles: set[str] = set()
+        for slot in slots:
+            hour = datetime.fromisoformat(slot.start_at).hour
+            if start_hour <= hour < end_hour:
+                titles.add(slot.activity_title)
+        return titles
+
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        weekday = ensure_schedule(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2026-06-10T12:00:00+08:00"))
+        weekend = ensure_schedule(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2026-06-13T12:00:00+08:00"))
+        holiday = ensure_schedule(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2026-06-19T12:00:00+08:00"))
+
+        assert len(weekday) == 96
+        assert len(weekend) == 96
+        assert len(holiday) == 96
+        assert any(slot.activity_type == "study" and "T09:" in slot.start_at for slot in weekday)
+        assert not any(slot.activity_type == "study" and "T09:" in slot.start_at for slot in weekend)
+        assert not any(slot.activity_type == "study" and "T09:" in slot.start_at for slot in holiday)
+        assert titles_between(weekday, 14, 18) != titles_between(weekend, 14, 18)
+        assert titles_between(holiday, 9, 12)
 
 
 def test_daily_cycle_moment_uses_llm_for_npc_interactions() -> None:
@@ -5359,6 +6047,94 @@ def test_daily_cycle_moment_generates_safe_character_selfie() -> None:
         providers.HTTP_TRANSPORT = None
 
 
+def test_daily_cycle_limits_moment_backlog_to_one_post_per_run() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"moment_limit_user_{suffix}"
+    older_slot_id = f"slot_test_moment_limit_old_{suffix}"
+    newer_slot_id = f"slot_test_moment_limit_new_{suffix}"
+    chat_requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        assert str(request.url) == "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        chat_requests.append(body)
+        content = json.dumps(
+            {
+                "text": f"limited moment post {len(chat_requests)}",
+                "mood": "calm",
+                "photo_prompt": "",
+                "likes": ["npc friend"],
+                "comments": [],
+            }
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_moment_limit_llm_task_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            session.merge(
+                ScheduleSlot(
+                    slot_id=older_slot_id,
+                    schedule_date="2026-06-09",
+                    user_id=user_id,
+                    character_id="atri",
+                    start_at="2026-06-09T09:00:00+08:00",
+                    end_at="2026-06-09T10:00:00+08:00",
+                    activity_title="old eligible activity",
+                    activity_type="daily",
+                    location="room",
+                    actual_status="completed",
+                    can_generate_moment=True,
+                    can_generate_photo=False,
+                    salience=95,
+                )
+            )
+            session.merge(
+                ScheduleSlot(
+                    slot_id=newer_slot_id,
+                    schedule_date="2026-06-09",
+                    user_id=user_id,
+                    character_id="atri",
+                    start_at="2026-06-09T17:00:00+08:00",
+                    end_at="2026-06-09T18:00:00+08:00",
+                    activity_title="new eligible activity",
+                    activity_type="daily",
+                    location="library",
+                    actual_status="completed",
+                    can_generate_moment=True,
+                    can_generate_photo=False,
+                    salience=70,
+                )
+            )
+            session.commit()
+
+            result = run_daily_cycle(session, user_id=user_id, character_id="atri", day=datetime.fromisoformat("2026-06-09T20:00:00+08:00"))
+
+            assert result["experiences"] == 1
+            assert result["moments"] == 1
+            assert len(chat_requests) == 1
+            experiences = session.query(Experience).filter(Experience.source_schedule_slot_id.in_([older_slot_id, newer_slot_id])).all()
+            assert len(experiences) == 1
+            assert experiences[0].source_schedule_slot_id == newer_slot_id
+            moment = session.query(Moment).filter(Moment.source_experience_id == experiences[0].experience_id).one_or_none()
+            assert moment is not None
+            assert moment.text == "limited moment post 1"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
 def test_moment_feedback_writes_memory() -> None:
     with SessionLocal() as session:
         moment = Moment(moment_id="moment_test_feedback", text="测试朋友圈")
@@ -5372,6 +6148,139 @@ def test_moment_feedback_writes_memory() -> None:
         proactive = session.query(ProactiveEvent).filter(ProactiveEvent.source_type == "moment_interaction", ProactiveEvent.status == "pending").order_by(ProactiveEvent.created_at.desc()).first()
         assert proactive is not None
         assert "朋友圈" in proactive.text
+
+
+def test_information_circle_repost_creates_moment_and_proactive_event() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"repost_user_{suffix}"
+    title = f"Galgame 机器人少女新作演示 {suffix}"
+    url = f"https://www.bilibili.com/video/BV{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        user = session.get(User, user_id)
+        assert user is not None
+        user.news_enabled = True
+        first = upsert_content_item(
+            session,
+            provider_id="manual_test",
+            platform="bilibili",
+            source_name="B站",
+            title=title,
+            url=url,
+            summary="动画和 Galgame 圈子正在讨论的机器人少女内容。",
+            tags=["Galgame", "动画", "机器人少女"],
+            hot_score=88,
+            interest_score=92,
+        )
+        second = upsert_content_item(
+            session,
+            provider_id="manual_test",
+            platform="bilibili",
+            source_name="B站",
+            title=title,
+            url=url,
+            summary="同一条内容的更新摘要。",
+            tags=["Galgame"],
+            hot_score=90,
+            interest_score=94,
+        )
+        session.commit()
+        assert first.item_id == second.item_id
+        assert session.query(ContentItem).filter(ContentItem.dedupe_key == first.dedupe_key).count() == 1
+
+        event = ensure_repost_candidate(
+            session,
+            user_id=user_id,
+            character_id="atri",
+            local_time=datetime.fromisoformat("2026-06-12T20:00:00+08:00"),
+        )
+        assert event is not None
+        assert event.source_type == "repost"
+        payload = json.loads(event.payload_json)
+        assert payload["platform"] == "bilibili"
+        assert payload["url"] == url
+        moment = session.get(Moment, payload["moment_id"])
+        assert moment is not None
+        assert moment.moment_type == "repost"
+        assert moment.source_platform == "bilibili"
+
+        assert moment.source_title == title
+        assert moment.source_url == url
+
+        second_event = ensure_repost_candidate(
+            session,
+            user_id=user_id,
+            character_id="atri",
+            local_time=datetime.fromisoformat("2026-06-12T21:00:00+08:00"),
+        )
+        if second_event is not None:
+            assert second_event.source_id != first.item_id
+        same_item_events = session.query(ProactiveEvent).filter(
+            ProactiveEvent.user_id == user_id,
+            ProactiveEvent.source_type == "repost",
+            ProactiveEvent.source_id == first.item_id,
+        ).all()
+        assert len(same_item_events) == 1
+
+    response = client.get("/api/moments").json()
+    repost = next(item for item in response["items"] if item["moment_id"] == moment.moment_id)
+    assert repost["moment_type"] == "repost"
+    assert repost["source_platform"] == "bilibili"
+    assert repost["source_payload"]["content_item_id"] == first.item_id
+
+
+def test_upsert_content_item_tolerates_duplicate_dedupe_keys() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    title = f"Duplicate content item {suffix}"
+    url = f"https://example.com/duplicate/{suffix}"
+    with SessionLocal() as session:
+        first = upsert_content_item(
+            session,
+            provider_id="manual_test",
+            platform="web",
+            source_name="Example",
+            title=title,
+            url=url,
+            summary="original",
+            hot_score=20,
+            interest_score=30,
+        )
+        duplicate = ContentItem(
+            item_id=uid("content"),
+            provider_id="manual_test",
+            platform="web",
+            source_name="Example",
+            title=title,
+            url=url,
+            summary="duplicate",
+            tags_json="[]",
+            hot_score=21,
+            interest_score=31,
+            dedupe_key=first.dedupe_key,
+            payload_json="{}",
+            fetched_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        session.add(duplicate)
+        session.commit()
+
+        updated = upsert_content_item(
+            session,
+            provider_id="manual_test",
+            platform="web",
+            source_name="Example",
+            title=title,
+            url=url,
+            summary="newest summary",
+            hot_score=40,
+            interest_score=50,
+        )
+        session.commit()
+
+        assert updated.dedupe_key == first.dedupe_key
+        assert updated.summary == "newest summary"
+        assert session.query(ContentItem).filter(ContentItem.dedupe_key == first.dedupe_key).count() == 2
 
 
 def test_calendar_returns_only_important_events() -> None:
@@ -5392,6 +6301,33 @@ def test_calendar_returns_only_important_events() -> None:
                 source_type="admin",
             )
         )
+        session.add(
+            ScheduleSlot(
+                slot_id=f"slot_calendar_character_{suffix}",
+                schedule_date="2026-06-12",
+                user_id=user_id,
+                character_id="atri",
+                start_at="2026-06-12T10:00:00+08:00",
+                end_at="2026-06-12T11:00:00+08:00",
+                activity_title="角色读书",
+                activity_type="study",
+                location="图书馆",
+                salience=72,
+            )
+        )
+        session.add(
+            UserCommitment(
+                commitment_id=f"commit_calendar_user_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                title="用户看展约定",
+                description="用户和亚托莉约好看展。",
+                event_at="2026-06-12T19:00:00+08:00",
+                remind_at="2026-06-12T18:30:00+08:00",
+                timezone="Asia/Hong_Kong",
+                status="active",
+            )
+        )
         session.commit()
 
     june = client.get(f"/api/calendar?month=2026-06&user_id={user_id}&character_id=atri").json()
@@ -5403,6 +6339,11 @@ def test_calendar_returns_only_important_events() -> None:
     date_event = next(item for item in june["days"] if item["title"] == "第一次约会")
     assert date_event["category"] == "relationship"
     assert date_event["day_note"]
+    unified_titles = [item["title"] for item in june["items"]]
+    assert "角色读书" in unified_titles
+    assert "用户看展约定" in unified_titles
+    assert any(item["calendar_kind"] == "character_schedule" for item in june["categories"]["character_schedule"])
+    assert any(item["calendar_kind"] == "user_commitment" for item in june["categories"]["user_commitments"])
 
     with SessionLocal() as session:
         user = session.get(User, user_id)
@@ -5513,6 +6454,90 @@ def test_normalize_line_text_splits_long_sentence() -> None:
     chunks = _normalize_line_text("这是一句非常非常非常非常非常非常非常非常长的台词，需要被拆开。")
     assert len(chunks) >= 2
     assert all(len(chunk) <= 28 for chunk in chunks)
+
+
+def test_normalize_line_text_merges_orphan_modal_particle() -> None:
+    text = "\u4f60\u662f\u5728\u95ee\u4eca\u5929\u665a\u4e0a\u5403\u4ec0\u4e48\u5417"
+    chunks = _normalize_line_text(text, max_chars=len(text) - 1)
+    assert chunks == [text]
+
+
+def test_dialogue_line_candidates_merge_orphan_modal_particle() -> None:
+    merged = _merge_dialogue_line_candidates(
+        [
+            {"text": "\u4f60\u662f\u5728\u95ee\u665a\u9910", "emotion": "calm", "pose": "idle", "expression": "", "tts_text_ja": ""},
+            {"text": "\u5417", "emotion": "thinking", "pose": "thinking", "expression": "", "tts_text_ja": ""},
+            {"text": "\u90a3\u6211\u60f3\u60f3", "emotion": "calm", "pose": "idle", "expression": "", "tts_text_ja": ""},
+        ]
+    )
+    assert [item["text"] for item in merged] == [
+        "\u4f60\u662f\u5728\u95ee\u665a\u9910\u5417",
+        "\u90a3\u6211\u60f3\u60f3",
+    ]
+
+
+def test_dialogue_pipeline_merges_orphan_modal_particle_before_payload() -> None:
+    suffix = uid("modal")
+    user_id = f"modal_particle_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "test",
+                "lines": [
+                    {"text": "\u4f60\u662f\u5728\u95ee\u665a\u9910", "emotion": "calm", "pose": "idle"},
+                    {"text": "\u5417", "emotion": "thinking", "pose": "thinking"},
+                    {"text": "\u90a3\u6211\u60f3\u60f3", "emotion": "calm", "pose": "idle"},
+                ],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_modal_particle_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            assert user is not None
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="atri",
+                    session_id=f"modal_particle_session_{suffix}",
+                    payload={"text": "\u4eca\u665a\u5403\u4ec0\u4e48"},
+                ),
+            )
+            assert result.event_type == "dialogue"
+            texts = [line["text"] for line in result.payload["lines"]]
+            assert texts == ["\u4f60\u662f\u5728\u95ee\u665a\u9910\u5417", "\u90a3\u6211\u60f3\u60f3"]
+            assert "\u5417" not in texts
+    finally:
+        providers.HTTP_TRANSPORT = None
 
 
 def test_consume_prefers_proactive_over_greeting() -> None:

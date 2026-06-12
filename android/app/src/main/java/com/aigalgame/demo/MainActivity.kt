@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,6 +30,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -100,6 +102,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -122,8 +125,12 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import com.aigalgame.demo.asr.AsrListener
+import com.aigalgame.demo.asr.SherpaDualAsrEngine
 import com.aigalgame.demo.live2d.Live2DBootState
 import com.aigalgame.demo.live2d.OfficialLive2DRendererStatus
 import com.aigalgame.demo.live2d.PersistentLive2DEngine
@@ -150,6 +157,13 @@ private const val SAKURA_NOTIFICATION_CHANNEL_ID = "sakura"
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
     private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val audioPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            viewModel.toggleVoiceInput()
+        } else {
+            viewModel.errorMessage = "麦克风权限被拒绝"
+        }
+    }
     private val locationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         viewModel.syncLocation(force = true)
     }
@@ -165,8 +179,16 @@ class MainActivity : ComponentActivity() {
             ExistingPeriodicWorkPolicy.UPDATE,
             PeriodicWorkRequestBuilder<NotificationWorker>(15, TimeUnit.MINUTES).build()
         )
+        WorkManager.getInstance(this).enqueueUniqueWork(
+            "sakura_widget_poll_now",
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<NotificationWorker>().build()
+        )
         SakuraWidgetProvider.refreshNow(this)
         viewModel.consumeLaunchIntent(intent)
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("debug_register_fcm", false)) {
+            viewModel.debugRegisterPushTokenNow()
+        }
         setContent {
             GalgameTheme {
                 AiGalgameApp(viewModel)
@@ -185,6 +207,14 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    fun requestVoiceInputToggle() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            viewModel.toggleVoiceInput()
         }
     }
 
@@ -219,6 +249,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var foregroundCheckInFlight = false
     private val touchTtsCache = TouchTtsCache(application)
     private var cachedTouchTier = ""
+    private var localAsr: SherpaDualAsrEngine? = null
 
     var baseUrl by mutableStateOf("")
         private set
@@ -231,6 +262,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var isBusy by mutableStateOf(false)
     var errorMessage by mutableStateOf("")
     var storyCompleted by mutableStateOf(false)
+    var composerText by mutableStateOf("")
+        private set
+    var replyInProgress by mutableStateOf(false)
+        private set
+    var lastUserMessage by mutableStateOf("")
+        private set
+    var isVoiceListening by mutableStateOf(false)
+        private set
+    var asrStatus by mutableStateOf("")
+        private set
     var selectedCharacter by mutableStateOf("neko")
     var activeCharacterId by mutableStateOf("atri")
     var characterName by mutableStateOf("角色")
@@ -264,6 +305,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val lines = mutableStateListOf<DialogueLine>()
     val dialogueHistory = mutableStateListOf<DialogueLine>()
+    val currentReplyLines = mutableStateListOf<DialogueLine>()
     val normalReplies = mutableStateListOf<ReplyOption>()
     val keyReplies = mutableStateListOf<ReplyOption>()
     val moments = mutableStateListOf<MomentItem>()
@@ -313,6 +355,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun currentLine(): DialogueLine? = lines.getOrNull(currentLineIndex)
     fun playableLine(): DialogueLine? = currentLine() ?: live2dReactionLine
 
+    fun visibleDialogueHistory(): List<DialogueLine> {
+        val activeReplyIds = currentReplyLines.mapTo(mutableSetOf()) { it.id }
+        val hiddenLineIds = lines
+            .drop((currentLineIndex + 1).coerceAtLeast(0))
+            .mapTo(mutableSetOf()) { it.id }
+        return dialogueHistory.filterNot { it.id in activeReplyIds || it.id in hiddenLineIds }
+    }
+
+    fun visibleCurrentReplyLines(): List<DialogueLine> {
+        if (currentReplyLines.isEmpty()) return emptyList()
+        if (lines.isEmpty()) return currentReplyLines
+        val visibleCount = (currentLineIndex + 1).coerceIn(0, currentReplyLines.size)
+        return currentReplyLines.take(visibleCount)
+    }
+
     fun hasDialoguePriority(): Boolean {
         if (currentLine() != null) return true
         if (awaitingUserReplyResponse) return true
@@ -359,12 +416,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun registerPushTokenIfAvailable() {
+        Log.i("SakuraFCM", "registerPushTokenIfAvailable baseUrlBlank=${baseUrl.isBlank()} notificationsEnabled=$notificationsEnabled")
+        writeFcmDebug(getApplication(), "registerPushTokenIfAvailable baseUrlBlank=${baseUrl.isBlank()} notificationsEnabled=$notificationsEnabled")
         if (baseUrl.isBlank() || !notificationsEnabled) return
         try {
+            FirebaseMessaging.getInstance().isAutoInitEnabled = true
+            Log.i("SakuraFCM", "Requesting FCM token")
+            writeFcmDebug(getApplication(), "requesting FCM token")
             FirebaseMessaging.getInstance().token
-                .addOnSuccessListener { token -> registerPushToken(getApplication(), token) }
-                .addOnFailureListener { }
-        } catch (_: Exception) {
+                .addOnSuccessListener { token ->
+                    Log.i("SakuraFCM", "Obtained FCM token")
+                    writeFcmDebug(getApplication(), "obtained FCM token length=${token.length}")
+                    registerPushToken(getApplication(), token)
+                }
+                .addOnFailureListener { exc ->
+                    Log.w("SakuraFCM", "Failed to obtain FCM token", exc)
+                    writeFcmDebug(getApplication(), "obtain token failed ${exc.javaClass.simpleName}: ${exc.message}")
+                }
+        } catch (exc: Exception) {
+            Log.w("SakuraFCM", "Failed to request FCM token", exc)
+            writeFcmDebug(getApplication(), "request token failed ${exc.javaClass.simpleName}: ${exc.message}")
+        }
+    }
+
+    fun debugRegisterPushTokenNow() {
+        viewModelScope.launch {
+            baseUrl = settings.baseUrl.first()
+            notificationsEnabled = settings.uiSettings.first().notificationsEnabled
+            Log.i("SakuraFCM", "Debug force register push token baseUrlBlank=${baseUrl.isBlank()} notificationsEnabled=$notificationsEnabled")
+            writeFcmDebug(getApplication(), "debug force register baseUrlBlank=${baseUrl.isBlank()} notificationsEnabled=$notificationsEnabled")
+            registerPushTokenIfAvailable()
         }
     }
 
@@ -597,10 +678,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         val urlKey = baseUrl
         if (!force && appOpenedBaseUrl == urlKey) return
-        if (!live2dBootReady) {
-            pendingOpenAfterBoot = true
-            return
-        }
         pendingOpenAfterBoot = false
         launchDialogueEvent {
             if (storyCompleted) {
@@ -647,9 +724,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun advanceLineAfterPlayback(lineId: String) {
+        val line = currentLine()
+        if (line?.id == lineId && currentLineIndex < lines.lastIndex) {
+            currentLineIndex += 1
+        }
+    }
+
     fun selectReply(option: ReplyOption) {
         recordUserActivity()
         val client = api ?: return
+        lines.clear()
+        currentReplyLines.clear()
+        lastUserMessage = option.text
         launchDialogueEvent(awaitingReply = true) {
             val type = if (option.type == "key") "option_selected" else "user_message"
             applyEvent(client.postEvent(type, text = option.text, replyId = option.id, storyIndex = storyIndex))
@@ -657,11 +744,105 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendUserMessage(text: String) {
-        if (text.isBlank()) return
+        val trimmed = text.trim()
+        if (trimmed.isBlank()) return
         recordUserActivity()
         val client = api ?: return
+        lines.clear()
+        currentReplyLines.clear()
+        lastUserMessage = trimmed
+        composerText = ""
         launchDialogueEvent(awaitingReply = true) {
-            applyEvent(client.postEvent("user_message", text = text.trim()))
+            applyEvent(client.postEvent("user_message", text = trimmed))
+        }
+    }
+
+    fun updateComposerText(value: String) {
+        composerText = value
+        recordUserActivity()
+    }
+
+    fun sendComposerMessage() {
+        sendUserMessage(composerText)
+    }
+
+    fun fillComposerFromReply(option: ReplyOption) {
+        composerText = option.text
+        recordUserActivity()
+    }
+
+    fun toggleVoiceInput() {
+        if (isVoiceListening) {
+            stopVoiceInput()
+        } else {
+            startVoiceInput()
+        }
+    }
+
+    fun stopVoiceInput() {
+        if (!isVoiceListening) return
+        isVoiceListening = false
+        asrStatus = "已停止"
+        viewModelScope.launch(Dispatchers.IO) {
+            localAsr?.stop()
+        }
+    }
+
+    private fun startVoiceInput() {
+        if (isVoiceListening) return
+        val context = getApplication<Application>().applicationContext
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            errorMessage = "需要麦克风权限才能使用本地语音输入"
+            return
+        }
+        isVoiceListening = true
+        asrStatus = "正在加载本地 ASR"
+        if (localAsr == null) {
+            localAsr = SherpaDualAsrEngine(
+                context = context,
+                listener = object : AsrListener {
+                    override fun onStatus(status: String) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            asrStatus = when (status) {
+                                "loading Paraformer" -> "加载实时识别"
+                                "loading SenseVoice" -> "加载精修模型"
+                                "listening" -> "正在听"
+                                "stopped" -> "已停止"
+                                else -> status
+                            }
+                        }
+                    }
+
+                    override fun onPartial(text: String) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            composerText = text
+                            asrStatus = "识别中"
+                        }
+                    }
+
+                    override fun onFinal(text: String) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            composerText = text
+                            isVoiceListening = false
+                            asrStatus = "识别完成"
+                        }
+                        viewModelScope.launch(Dispatchers.IO) {
+                            localAsr?.stop()
+                        }
+                    }
+
+                    override fun onError(error: Throwable) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            isVoiceListening = false
+                            asrStatus = "识别失败"
+                            errorMessage = "本地语音识别失败：${error.message ?: error.javaClass.simpleName}"
+                        }
+                    }
+                }
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            localAsr?.start()
         }
     }
 
@@ -1036,6 +1217,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun clearLocalState() {
         lines.clear()
         dialogueHistory.clear()
+        currentReplyLines.clear()
         normalReplies.clear()
         keyReplies.clear()
         moments.clear()
@@ -1044,6 +1226,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         storyIndex = 0
         currentLineIndex = 0
         dialogueMediaUrl = ""
+        composerText = ""
+        lastUserMessage = ""
+        asrStatus = ""
         errorMessage = ""
     }
 
@@ -1060,6 +1245,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val payload = event.optObject("payload")
+        val commitment = payload.optObject("commitment")
+        if (commitment.length() > 0) {
+            scheduleCommitmentReminder(getApplication(), commitment)
+        }
         val mediaAssetId = payload.optString("media_asset_id")
         dialogueMediaUrl = payload.optString("media_url").ifBlank {
             if (mediaAssetId.isNotBlank()) "/media/$mediaAssetId" else ""
@@ -1084,6 +1273,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val newLines = payload.optArray("lines")
         lines.clear()
+        currentReplyLines.clear()
         for (i in 0 until newLines.length()) {
             val item = newLines.optJSONObject(i) ?: continue
             val line = DialogueLine(
@@ -1097,10 +1287,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ttsError = item.optString("tts_error")
             )
             lines.add(line)
+            currentReplyLines.add(line)
             dialogueHistory.add(line)
-        }
-        if (ttsEnabled && lines.size > 1 && lines.any { it.ttsUrl.isBlank() }) {
-            errorMessage = "本次回复有台词缺少语音，已记录诊断。"
         }
         currentLineIndex = 0
         normalReplies.clear()
@@ -1147,14 +1335,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (dialogueEventInFlight) return
         dialogueEventInFlight = true
         awaitingUserReplyResponse = awaitingReply
+        replyInProgress = awaitingReply
         launchBusy {
             try {
                 block()
             } finally {
                 dialogueEventInFlight = false
                 awaitingUserReplyResponse = false
+                replyInProgress = false
             }
         }
+    }
+
+    override fun onCleared() {
+        localAsr?.release()
+        localAsr = null
+        super.onCleared()
     }
 }
 
@@ -1192,14 +1388,14 @@ private val CharacterStageBaseHeight = 650.dp
 @Composable
 fun AiGalgameApp(vm: MainViewModel) {
     AudioLinePlayer(vm)
+    val activity = LocalContext.current as? MainActivity
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         if (vm.baseUrl.isBlank()) {
             ConnectionScreen(vm)
         } else {
             Box(Modifier.fillMaxSize()) {
                 val sharedLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
-                val stageOnPrimaryScreens = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
-                val stageShowsCharacter = !vm.live2dBootReady || stageOnPrimaryScreens
+                val showLegacyStage = vm.screen == AppScreen.DressUp
                 if (vm.live2dBootReady && vm.screen == AppScreen.DressUp) {
                     Box(
                         Modifier
@@ -1209,85 +1405,74 @@ fun AiGalgameApp(vm: MainViewModel) {
                     )
                 }
                 val live2DTapBridge = remember { Live2DTapBridge() }
-                Live2DStage(
-                    background = vm.selectedBackground,
-                    character = vm.selectedCharacter,
-                    emotion = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.emotion ?: "calm",
-                    pose = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.pose ?: "idle",
-                    placement = if (vm.screen == AppScreen.DressUp) vm.currentPlacement() else vm.visiblePlacement(),
-                    speechState = vm.live2dSpeechState,
-                    line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
-                    editable = false,
-                    onPlacementChange = { vm.updatePlacementDraft(it) },
-                    onReaction = { partial ->
-                        vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
-                            vm.applyLive2DReaction(it)
-                        }
-                    },
-                    relation = vm.relation,
-                    stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
-                    showCharacter = stageShowsCharacter,
-                    live2DVisible = vm.selectedCharacter == "neko" && stageShowsCharacter,
-                    onRendererStatus = { vm.updateLive2DBootStatus(it) },
-                    tapBridge = live2DTapBridge,
-                    useInternalTapLayer = vm.screen == AppScreen.DressUp,
-                    remoteHitAreas = vm.live2dHitAreas,
-                    remoteReactions = vm.live2dReactions,
-                    touchCooldownRequest = vm.touchCooldownRequest,
-                    touchReactionsEnabled = vm.canStartTouchReaction(),
+                if (showLegacyStage) {
+                    Live2DStage(
+                        background = vm.selectedBackground,
+                        character = vm.selectedCharacter,
+                        emotion = vm.previewEmotion,
+                        pose = vm.previewEmotion,
+                        placement = vm.currentPlacement(),
+                        speechState = vm.live2dSpeechState,
+                        line = null,
+                        editable = false,
+                        onPlacementChange = { vm.updatePlacementDraft(it) },
+                        onReaction = { },
+                        relation = vm.relation,
+                        stageMode = "dress",
+                        showCharacter = true,
+                        live2DVisible = vm.selectedCharacter == "neko",
+                        onRendererStatus = { vm.updateLive2DBootStatus(it) },
+                        tapBridge = live2DTapBridge,
+                        useInternalTapLayer = true,
+                        remoteHitAreas = vm.live2dHitAreas,
+                        remoteReactions = vm.live2dReactions,
+                        touchCooldownRequest = vm.touchCooldownRequest,
+                        touchReactionsEnabled = false,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(1f)
+                    )
+                }
+                Scaffold(
+                    containerColor = Color.Transparent,
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(1f)
-                )
-                if (!vm.live2dBootReady) {
-                    Live2DBootLoadingScreen(
-                        status = vm.live2dBootStatus,
-                        onRetry = { vm.retryLive2DBoot() },
-                        modifier = Modifier
+                        .zIndex(2f)
+                ) { padding ->
+                    Box(
+                        Modifier
                             .fillMaxSize()
-                            .zIndex(20f)
-                    )
-                } else {
-                    Scaffold(
-                        containerColor = Color.Transparent,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .zIndex(2f),
-                        bottomBar = { AppBottomBar(vm) }
-                    ) { padding ->
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .padding(padding)
-                        ) {
-                            when (vm.screen) {
-                                AppScreen.Home -> HomeScreen(
-                                    vm,
-                                    showStage = false,
-                                    tapBridge = live2DTapBridge,
-                                    modifier = Modifier.zIndex(2f)
-                                )
-                                AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
-                                AppScreen.Settings -> SettingsScreen(vm)
-                                AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
-                                AppScreen.Moments -> MomentsScreen(vm)
-                                AppScreen.Calendar -> CalendarScreen(vm)
-                                AppScreen.Journal -> JournalScreen(vm)
+                            .padding(if (vm.screen == AppScreen.Home) PaddingValues(0.dp) else padding)
+                    ) {
+                        when (vm.screen) {
+                            AppScreen.Home -> HomeScreen(
+                                vm,
+                                showStage = false,
+                                tapBridge = live2DTapBridge,
+                                onVoiceInput = { activity?.requestVoiceInputToggle() },
+                                modifier = Modifier.zIndex(2f)
+                            )
+                            AppScreen.DressUp -> DressUpScreen(vm, showStage = false, modifier = Modifier.zIndex(2f))
+                            AppScreen.Settings -> SettingsScreen(vm)
+                            AppScreen.Live2DSelfTest -> Live2DSelfTestScreen(vm)
+                            AppScreen.Moments -> MomentsScreen(vm)
+                            AppScreen.Calendar -> CalendarScreen(vm)
+                            AppScreen.Journal -> JournalScreen(vm)
+                        }
+                        if (vm.errorMessage.isNotBlank()) {
+                            Card(
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(12.dp)
+                                    .zIndex(10f),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xF4FFF4F6)),
+                                shape = RoundedCornerShape(16.dp)
+                            ) {
+                                Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
                             }
-                            if (vm.errorMessage.isNotBlank()) {
-                                Card(
-                                    modifier = Modifier
-                                        .align(Alignment.TopCenter)
-                                        .padding(12.dp)
-                                        .zIndex(10f),
-                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFECEF))
-                                ) {
-                                    Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
-                                }
-                            }
-                            if (vm.isBusy) {
-                                LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
-                            }
+                        }
+                        if (vm.isBusy && !vm.replyInProgress && vm.screen != AppScreen.Home) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
                         }
                     }
                 }
@@ -1309,9 +1494,14 @@ fun AudioLinePlayer(vm: MainViewModel) {
             .build()
     }
     val line = vm.playableLine()
-    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dBootReady, vm.live2dReactionLine?.id) {
+    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dReactionLine?.id) {
         val url = line?.ttsUrl.orEmpty()
-        if (vm.live2dBootReady && vm.ttsEnabled && url.isNotBlank()) {
+        if (line == null) {
+            player.stop()
+            vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
+            return@LaunchedEffect
+        }
+        if (vm.ttsEnabled && url.isNotBlank()) {
             val playUrl = if (url.startsWith("file://") || url.startsWith("content://")) {
                 url
             } else {
@@ -1330,19 +1520,25 @@ fun AudioLinePlayer(vm: MainViewModel) {
                         break
                     }
                     val active = playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_READY || player.isPlaying
-                    vm.updateLive2DSpeech(
-                        active = active,
-                        mouthOpen = if (active) simulatedSpeechMouthOpen(line?.text.orEmpty(), elapsedMs) else 0f
-                    )
+                    if (vm.live2dBootReady) {
+                        vm.updateLive2DSpeech(
+                            active = active,
+                            mouthOpen = if (active) simulatedSpeechMouthOpen(line.text, elapsedMs) else 0f
+                        )
+                    }
                     delay(45L)
                     elapsedMs += 45L
                 }
+                delay(280L)
+                vm.advanceLineAfterPlayback(line.id)
             } finally {
                 vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
             }
         } else {
             player.stop()
             vm.updateLive2DSpeech(active = false, mouthOpen = 0f)
+            delay(lineFallbackDisplayMs(line.text))
+            vm.advanceLineAfterPlayback(line.id)
         }
     }
     DisposableEffect(player) {
@@ -1358,6 +1554,11 @@ fun AudioLinePlayer(vm: MainViewModel) {
             player.release()
         }
     }
+}
+
+fun lineFallbackDisplayMs(text: String): Long {
+    val base = 1200L + text.length.coerceAtMost(60) * 45L
+    return base.coerceIn(1600L, 4300L)
 }
 
 fun simulatedSpeechMouthOpen(text: String, elapsedMs: Long): Float {
@@ -1492,155 +1693,439 @@ fun HomeScreen(
     vm: MainViewModel,
     showStage: Boolean = true,
     tapBridge: Live2DTapBridge? = null,
+    onVoiceInput: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    var input by remember { mutableStateOf("") }
-    var historyExpanded by remember { mutableStateOf(false) }
-    var headerBottomPx by remember { mutableIntStateOf(0) }
-    var panelTopPx by remember { mutableIntStateOf(0) }
-    val line = vm.currentLine()
-    val dialogueLine = line ?: vm.live2dReactionLine
-    val lastLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
+    var drawerExpanded by remember { mutableStateOf(false) }
     val density = LocalDensity.current
     val keyboardLift = with(density) {
         (WindowInsets.ime.getBottom(this) - WindowInsets.navigationBars.getBottom(this)).coerceAtLeast(0).toDp()
     }
-    LaunchedEffect(vm.baseUrl, vm.storyCompleted, vm.screen, input) {
+    val navigationLift = with(density) {
+        WindowInsets.navigationBars.getBottom(this).toDp()
+    }
+    val currentLine = vm.currentLine() ?: vm.live2dReactionLine
+    LaunchedEffect(vm.baseUrl, vm.storyCompleted, vm.screen, vm.composerText) {
         while (true) {
             delay(30_000)
-            vm.checkForegroundProactive(inputActive = input.isNotBlank())
+            vm.checkForegroundProactive(inputActive = vm.composerText.isNotBlank())
         }
     }
+    LaunchedEffect(currentLine?.id, vm.replyInProgress, vm.normalReplies.size, vm.keyReplies.size) {
+        if (currentLine != null || vm.replyInProgress || vm.normalReplies.isNotEmpty() || vm.keyReplies.isNotEmpty()) {
+            drawerExpanded = true
+        }
+    }
+
     Box(modifier.fillMaxSize()) {
-        if (vm.dialogueMediaUrl.isNotBlank()) {
-            DialogueCgLayer(
-                mediaUrl = vm.resolveUrl(vm.dialogueMediaUrl),
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(0f)
-            )
-        }
-
-        if (showStage) {
-            Live2DStage(
-                background = vm.selectedBackground,
-                character = vm.selectedCharacter,
-                emotion = lastLine?.emotion ?: "calm",
-                pose = lastLine?.pose ?: "idle",
-                placement = vm.visiblePlacement(),
-                speechState = vm.live2dSpeechState,
-                line = lastLine,
-                editable = vm.standeeEditMode,
-                onPlacementChange = { vm.updatePlacementDraft(it) },
-                onReaction = { partial ->
-                    vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
-                        vm.applyLive2DReaction(it)
-                    }
-                },
-                relation = vm.relation,
-                remoteHitAreas = vm.live2dHitAreas,
-                remoteReactions = vm.live2dReactions,
-                touchCooldownRequest = vm.touchCooldownRequest,
-                touchReactionsEnabled = vm.canStartTouchReaction(),
-                tapBridge = tapBridge,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        Column(
+        ObservationSceneBackground(
+            sceneRes = observationSceneRes(vm),
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(0f)
+        )
+        ObservationScrim(Modifier.fillMaxSize().zIndex(1f))
+        ObservationTopBar(
+            vm = vm,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 18.dp)
-                .zIndex(5f)
-                .onGloballyPositioned { coordinates ->
-                    headerBottomPx = coordinates.boundsInRoot().bottom.toInt()
-                }
-        ) {
-            HomeHeader(vm = vm, modifier = Modifier.fillMaxWidth())
-            HomeStandeeEditBar(
-                editing = vm.standeeEditMode,
-                onToggle = { vm.togglePlacementEdit() },
-                onReset = { vm.resetPlacement() },
-                modifier = Modifier
-                    .align(Alignment.End)
-                    .padding(top = 8.dp)
-            )
-        }
-
-        HomeInteractionPanel(
+                .padding(start = 22.dp, top = 46.dp, end = 22.dp, bottom = 0.dp)
+                .zIndex(3f)
+        )
+        ObservationMessageDrawer(
             vm = vm,
-            line = dialogueLine,
-            input = input,
-            onInputChange = {
-                input = it
-                vm.recordUserActivity()
-            },
-            onSend = {
-                vm.sendUserMessage(input)
-                input = ""
-            },
-            onShowHistory = { historyExpanded = true },
+            line = currentLine,
+            expanded = drawerExpanded,
+            onExpandedChange = { drawerExpanded = it },
+            onVoiceInput = onVoiceInput,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(start = 14.dp, top = 12.dp, end = 14.dp, bottom = 12.dp + keyboardLift)
-                .zIndex(5f)
-                .onGloballyPositioned { coordinates ->
-                    panelTopPx = coordinates.boundsInRoot().top.toInt()
-                }
+                .padding(start = 12.dp, end = 12.dp, bottom = 28.dp + navigationLift + keyboardLift)
+                .zIndex(4f)
         )
+    }
+}
 
-        if (vm.standeeEditMode) {
-            StandeeGestureZone(
-                headerBottomPx = headerBottomPx,
-                panelTopPx = panelTopPx,
-                placement = vm.visiblePlacement(),
-                onPlacementChange = { vm.updatePlacementDraft(it) },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(3f)
+fun observationSceneRes(vm: MainViewModel): Int {
+    if (vm.replyInProgress || vm.currentLine() != null) return R.drawable.bg_catgirl_typing
+    val hour = LocalTime.now().hour
+    return when {
+        hour in 22..23 || hour in 0..2 -> R.drawable.bg_catgirl_music
+        hour in 18..21 -> R.drawable.bg_catgirl_gaming
+        hour in 12..17 -> R.drawable.bg_catgirl_reading
+        else -> R.drawable.bg_catgirl_typing
+    }
+}
+
+@Composable
+fun ObservationSceneBackground(sceneRes: Int, modifier: Modifier = Modifier) {
+    Image(
+        painter = painterResource(sceneRes),
+        contentDescription = "猫娘房间",
+        modifier = modifier,
+        contentScale = ContentScale.Crop
+    )
+}
+
+@Composable
+fun ObservationScrim(modifier: Modifier = Modifier) {
+    Box(
+        modifier.background(
+            Brush.verticalGradient(
+                listOf(
+                    Color(0x99060910),
+                    Color(0x1A060910),
+                    Color(0x22060910),
+                    Color(0xCC060910)
+                )
             )
-        } else {
-            GazeDragZone(
-                enabled = tapBridge != null &&
-                    vm.live2dBootReady &&
-                    vm.selectedCharacter == "neko",
-                onGaze = { normalizedX, normalizedY ->
-                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(1f)
+        )
+    )
+}
+
+@Composable
+fun ObservationTopBar(vm: MainViewModel, modifier: Modifier = Modifier) {
+    var now by remember { mutableStateOf(LocalTime.now()) }
+    val today = LocalDate.now()
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = LocalTime.now()
+            delay(30_000)
+        }
+    }
+    Row(modifier, verticalAlignment = Alignment.Top) {
+        Column(
+            Modifier
+                .weight(1f)
+                .clickable {
+                    vm.screen = AppScreen.Calendar
+                    vm.loadCalendar()
+                }
+        ) {
+            Text(
+                now.format(DateTimeFormatter.ofPattern("HH:mm")),
+                color = Color.White,
+                fontSize = 38.sp,
+                fontWeight = FontWeight.Light
             )
-            CharacterTapZone(
-                enabled = tapBridge != null &&
-                    vm.live2dBootReady &&
-                    vm.selectedCharacter == "neko",
-                headerBottomPx = headerBottomPx,
-                panelTopPx = panelTopPx,
-                onTap = { normalizedX, normalizedY ->
-                    tapBridge?.dispatch(normalizedX, normalizedY)
-                },
-                onGaze = { normalizedX, normalizedY ->
-                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(3f)
+            Text(
+                today.format(DateTimeFormatter.ofPattern("MM / dd")),
+                color = Color(0xD9FFFFFF),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium
             )
         }
-
-        if (historyExpanded) {
-            DialogueHistoryOverlay(
-                history = vm.dialogueHistory,
-                characterName = vm.characterName,
-                onDismiss = { historyExpanded = false },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
-                    .zIndex(6f)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            ObservationIconButton(
+                iconRes = R.drawable.ic_moments_24,
+                contentDescription = "朋友圈",
+                accent = Color(0xFF74E7D7),
+                onClick = {
+                    vm.screen = AppScreen.Moments
+                    vm.loadMoments()
+                }
             )
+            ObservationIconButton(
+                iconRes = R.drawable.ic_nav_settings,
+                contentDescription = "设置",
+                accent = Color(0xFFFFC7D6),
+                onClick = { vm.screen = AppScreen.Settings }
+            )
+        }
+    }
+}
+
+@Composable
+fun ObservationIconButton(
+    iconRes: Int,
+    contentDescription: String,
+    accent: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .size(48.dp)
+            .clickable(onClick = onClick),
+        shape = CircleShape,
+        color = Color(0x6621252E),
+        border = BorderStroke(1.dp, Color(0x55FFFFFF))
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Icon(
+                painter = painterResource(iconRes),
+                contentDescription = contentDescription,
+                tint = Color.White,
+                modifier = Modifier.size(25.dp)
+            )
+            Box(
+                Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(7.dp)
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(accent)
+            )
+        }
+    }
+}
+
+@Composable
+fun ObservationMessageDrawer(
+    vm: MainViewModel,
+    line: DialogueLine?,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onVoiceInput: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val quickReplies = if (vm.keyReplies.isNotEmpty()) vm.keyReplies else vm.normalReplies
+    val drawerSizeModifier = if (expanded) {
+        Modifier.fillMaxHeight(0.48f)
+    } else {
+        Modifier.height(if (quickReplies.isNotEmpty()) 138.dp else 96.dp)
+    }
+    Card(
+        modifier = modifier
+            .then(drawerSizeModifier)
+            .pointerInput(expanded) {
+                detectVerticalDragGestures { _, dragAmount ->
+                    when {
+                        dragAmount < -8f -> onExpandedChange(true)
+                        dragAmount > 8f -> onExpandedChange(false)
+                    }
+                }
+            },
+        colors = CardDefaults.cardColors(containerColor = Color(0xD91A1C22)),
+        shape = RoundedCornerShape(28.dp),
+        border = BorderStroke(1.dp, Color(0x33FFFFFF))
+    ) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 9.dp)) {
+            Box(
+                Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .width(42.dp)
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(Color(0x66FFFFFF))
+                    .clickable { onExpandedChange(!expanded) }
+            )
+            if (expanded) {
+                ObservationChatPreview(
+                    vm = vm,
+                    line = line,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(top = 8.dp)
+                )
+            } else if (vm.replyInProgress) {
+                ObservationTypingHint(Modifier.fillMaxWidth().padding(top = 8.dp))
+                Spacer(Modifier.weight(1f))
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+            ObservationInputRow(
+                vm = vm,
+                onVoiceInput = onVoiceInput,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (quickReplies.isNotEmpty()) {
+                QuickReplyFillStrip(
+                    replies = quickReplies,
+                    onPick = vm::fillComposerFromReply,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationChatPreview(vm: MainViewModel, line: DialogueLine?, modifier: Modifier = Modifier) {
+    val previousLines = vm.visibleDialogueHistory()
+        .takeLast(3)
+    val replyLines = vm.visibleCurrentReplyLines()
+    LazyColumn(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 4.dp)
+    ) {
+        items(previousLines, key = { "history_${it.id}" }) { item ->
+            ObservationBubble(text = item.text, mine = false)
+        }
+        if (vm.lastUserMessage.isNotBlank()) {
+            item {
+                ObservationBubble(text = vm.lastUserMessage, mine = true)
+            }
+        }
+        if (vm.replyInProgress && replyLines.isEmpty()) {
+            item {
+                ObservationTypingHint(Modifier.fillMaxWidth())
+            }
+        }
+        items(replyLines, key = { "reply_${it.id}" }) { item ->
+            val canAdvance = item.id == line?.id || vm.live2dReactionLine != null
+            ObservationBubble(
+                text = item.text,
+                mine = false,
+                onClick = if (canAdvance) {
+                    {
+                        if (vm.live2dReactionLine != null) {
+                            vm.clearLive2DReaction()
+                        } else {
+                            vm.advanceLine()
+                        }
+                    }
+                } else {
+                    null
+                }
+            )
+        }
+        if (vm.replyInProgress && replyLines.isNotEmpty()) {
+            item {
+                ObservationTypingHint(Modifier.fillMaxWidth())
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationTypingHint(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = Color(0x331DE8D1),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, Color(0x4459FFE8))
+    ) {
+        Row(
+            Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("她正在回消息", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text("...", color = Color(0xFF74E7D7), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun ObservationBubble(
+    text: String,
+    mine: Boolean,
+    compact: Boolean = false,
+    onClick: (() -> Unit)? = null
+) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(if (mine) 0.78f else 0.86f)
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+            color = if (mine) Color(0xCC1B7C74) else Color(0xD92B2F38),
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.dp, if (mine) Color(0x6679FFF0) else Color(0x22FFFFFF))
+        ) {
+    Text(
+                text = text,
+                color = Color.White,
+                fontSize = if (compact) 14.sp else 16.sp,
+                lineHeight = if (compact) 20.sp else 23.sp,
+                overflow = TextOverflow.Clip,
+                modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun QuickReplyFillStrip(
+    replies: List<ReplyOption>,
+    onPick: (ReplyOption) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        replies.take(6).forEach { option ->
+            Surface(
+                modifier = Modifier
+                    .height(36.dp)
+                    .clickable { onPick(option) },
+                color = if (option.type == "key") Color(0x99E46A8D) else Color(0x552A303B),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, if (option.type == "key") Color(0x88FFD0DC) else Color(0x33FFFFFF))
+            ) {
+                Text(
+                    option.text,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip,
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationInputRow(vm: MainViewModel, onVoiceInput: () -> Unit, modifier: Modifier = Modifier) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        Surface(
+            modifier = Modifier
+                .size(52.dp)
+                .clickable(onClick = onVoiceInput),
+            color = if (vm.isVoiceListening) Color(0xFFE46A8D) else Color(0x552F3540),
+            shape = CircleShape,
+            border = BorderStroke(1.dp, Color(0x33FFFFFF))
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_mic_24),
+                    contentDescription = "语音输入",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+        OutlinedTextField(
+            value = vm.composerText,
+            onValueChange = vm::updateComposerText,
+            placeholder = {
+                Text(
+                    if (vm.isVoiceListening) vm.asrStatus.ifBlank { "正在听..." } else "说点什么...",
+                    color = Color(0xAAFFFFFF)
+                )
+            },
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 54.dp),
+            textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
+            maxLines = 2,
+            shape = RoundedCornerShape(22.dp)
+        )
+        Surface(
+            modifier = Modifier
+                .size(52.dp)
+                .clickable { vm.sendComposerMessage() },
+            color = if (vm.composerText.isBlank()) Color(0x55434854) else Color(0xFFE46A8D),
+            shape = CircleShape
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_send_24),
+                    contentDescription = "发送",
+                    tint = Color.White,
+                    modifier = Modifier.size(23.dp)
+                )
+            }
         }
     }
 }

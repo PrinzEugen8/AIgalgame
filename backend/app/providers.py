@@ -140,6 +140,64 @@ def _json_retry_messages(messages: list[dict[str, str]], content: str, finish_re
     return [*messages, {"role": "user", "content": repair_prompt}]
 
 
+def _token_usage(payload: dict[str, Any]) -> dict[str, int]:
+    usage = payload.get("usage") if isinstance(payload, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+
+    def number(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    prompt_tokens = number("prompt_tokens", "input_tokens", "input_token_count")
+    completion_tokens = number("completion_tokens", "output_tokens", "output_token_count")
+    total_tokens = number("total_tokens")
+    if not total_tokens:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _metadata_price(metadata: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = metadata.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _estimated_token_cost(metadata: dict[str, Any], usage: dict[str, int]) -> float:
+    input_per_million = _metadata_price(metadata, "input_price_per_million", "prompt_price_per_million")
+    output_per_million = _metadata_price(metadata, "output_price_per_million", "completion_price_per_million")
+    total_per_million = _metadata_price(metadata, "total_price_per_million")
+    input_per_1k = _metadata_price(metadata, "input_price_per_1k", "prompt_price_per_1k")
+    output_per_1k = _metadata_price(metadata, "output_price_per_1k", "completion_price_per_1k")
+    total_per_1k = _metadata_price(metadata, "total_price_per_1k")
+    cost = 0.0
+    if total_per_million:
+        cost += usage.get("total_tokens", 0) * total_per_million / 1_000_000
+    elif total_per_1k:
+        cost += usage.get("total_tokens", 0) * total_per_1k / 1_000
+    else:
+        cost += usage.get("prompt_tokens", 0) * input_per_million / 1_000_000
+        cost += usage.get("completion_tokens", 0) * output_per_million / 1_000_000
+        cost += usage.get("prompt_tokens", 0) * input_per_1k / 1_000
+        cost += usage.get("completion_tokens", 0) * output_per_1k / 1_000
+    return round(cost, 8)
+
+
 def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
     suffix = "任务模型" if task else "对话模型"
     return [
@@ -157,6 +215,8 @@ def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
                     _field("model", "Chat Completions 模型", "core", required=True, placeholder="例如 doubao-seed-1-6-250615"),
                     _field("api_key", "Ark API Key", "secret", required=True),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
+                    _field("output_price_per_million", "Output token price / 1M", "advanced", type_="number"),
                     _field("extra_body", "额外 Chat Completions JSON", "advanced", type_="json", default={}),
                 ],
             },
@@ -174,6 +234,8 @@ def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
                     _field("model", "Chat Completions 模型", "core", default="deepseek-chat", required=True),
                     _field("api_key", "DeepSeek API Key", "secret", required=True),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
+                    _field("output_price_per_million", "Output token price / 1M", "advanced", type_="number"),
                     _field("extra_body", "额外 Chat Completions JSON", "advanced", type_="json", default={}),
                 ],
             },
@@ -191,6 +253,8 @@ def _llm_presets(*, task: bool = False) -> list[dict[str, Any]]:
                     _field("model", "Chat Completions 模型", "core", required=True),
                     _field("api_key", "API Key", "secret", required=True),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
+                    _field("output_price_per_million", "Output token price / 1M", "advanced", type_="number"),
                     _field("extra_body", "额外 Chat Completions JSON", "advanced", type_="json", default={}),
                 ],
             },
@@ -218,6 +282,7 @@ def provider_presets() -> dict[str, Any]:
                     _field("batch_size", "批量大小", "metadata", type_="number", default=16),
                     _field("dimensions", "dimensions（可选）", "metadata", type_="number"),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=30),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
                 ],
             },
         ],
@@ -333,6 +398,8 @@ def provider_presets() -> dict[str, Any]:
                     _field("github_dispatch_poll_seconds", "GitHub dispatch poll seconds", "metadata", type_="number", default=15),
                     _field("github_dispatch_timeout_minutes", "GitHub dispatch timeout minutes", "metadata", type_="number", default=25),
                     _field("timeout", "Timeout seconds", "metadata", type_="number", default=20),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
+                    _field("output_price_per_million", "Output token price / 1M", "advanced", type_="number"),
                 ],
             },
             {
@@ -354,6 +421,8 @@ def provider_presets() -> dict[str, Any]:
                     _field("sources", "sources（逗号分隔，可选）", "metadata", placeholder="news,web"),
                     _field("user_location", "user_location JSON（可选）", "advanced", type_="json", default={}),
                     _field("timeout", "请求超时（秒）", "metadata", type_="number", default=40),
+                    _field("input_price_per_million", "Input token price / 1M", "advanced", type_="number"),
+                    _field("output_price_per_million", "Output token price / 1M", "advanced", type_="number"),
                 ],
             },
             {
@@ -689,7 +758,7 @@ def upsert_provider(session: Session, payload: ProviderConfigIn) -> ProviderConf
         secrets["api_key"] = payload.api_key
     if secrets:
         secret_store.set_many(provider_id, secrets)
-    if payload.enabled:
+    if payload.enabled and payload.kind != "search":
         for other in session.execute(
             select(ProviderConfig).where(
                 ProviderConfig.kind == payload.kind,
@@ -716,13 +785,26 @@ def get_enabled_provider(session: Session, kind: str) -> ProviderConfig | None:
     if not configs:
         return None
     selected = max(configs, key=_enabled_provider_score)
-    if len(configs) > 1:
+    if len(configs) > 1 and kind != "search":
         for config in configs:
             if config.provider_id != selected.provider_id:
                 config.enabled = False
                 config.updated_at = utc_now()
         session.commit()
     return selected
+
+
+def get_enabled_providers(session: Session, kind: str, *, provider: str = "") -> list[ProviderConfig]:
+    stmt = select(ProviderConfig).where(ProviderConfig.kind == kind, ProviderConfig.enabled == True)  # noqa: E712
+    if provider:
+        stmt = stmt.where(ProviderConfig.provider == provider)
+    configs = session.execute(stmt).scalars().all()
+    return sorted(configs, key=_enabled_provider_score, reverse=True)
+
+
+def get_enabled_provider_by_provider(session: Session, kind: str, provider: str) -> ProviderConfig | None:
+    configs = get_enabled_providers(session, kind, provider=provider)
+    return configs[0] if configs else None
 
 
 def get_task_llm_provider(session: Session) -> ProviderConfig | None:
@@ -983,12 +1065,16 @@ class OpenAICompatibleClient:
                         )
                         span.add(raw_response=response_payload, raw_content=content, attempts=attempts)
                         raise ProviderError(f"LLM did not return valid JSON: {error_preview}{_json_attempts_preview(attempts)}") from exc
+                    usage = _token_usage(response_payload)
+                    estimated_cost = _estimated_token_cost(self.metadata, usage)
                     span.add(
                         response=parsed,
                         raw_response=response_payload,
                         raw_content=content,
                         finish_reason=finish_reason,
                         keys=list(parsed.keys()),
+                        usage=usage,
+                        estimated_cost=estimated_cost,
                         attempts=attempts,
                         requested_max_tokens=max_tokens,
                         effective_max_tokens=effective_max_tokens,
@@ -1001,6 +1087,8 @@ class OpenAICompatibleClient:
                         elapsed_ms=int((time.monotonic() - started) * 1000),
                         keys=list(parsed.keys()),
                         finish_reason=finish_reason,
+                        usage=usage,
+                        estimated_cost=estimated_cost,
                         raw_preview=str(content)[:120],
                     )
                     return parsed
@@ -1097,11 +1185,15 @@ class OpenAICompatibleClient:
                         requested_max_tokens=requested_max_tokens,
                         retry_max_tokens=retry_max_tokens,
                     )
+            usage = _token_usage(response_payload)
+            estimated_cost = _estimated_token_cost(self.metadata, usage)
             span.add(
                 response_text=content,
                 raw_response=response_payload,
                 finish_reason=finish_reason,
                 chars=len(content),
+                usage=usage,
+                estimated_cost=estimated_cost,
                 attempts=attempts,
             )
             write_diagnostic(
@@ -1111,6 +1203,8 @@ class OpenAICompatibleClient:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 chars=len(content),
                 finish_reason=finish_reason,
+                usage=usage,
+                estimated_cost=estimated_cost,
                 attempts=attempts,
                 raw_preview=content[:120],
             )
@@ -1179,8 +1273,12 @@ class OpenAIEmbeddingClient:
             vectors = [[float(value) for value in (row.get("embedding") or [])] for row in rows if isinstance(row, dict)]
             if len(vectors) != len(cleaned) or any(not vector for vector in vectors):
                 raise ProviderError("Embedding response did not contain one vector per input")
+            usage = _token_usage(payload)
+            estimated_cost = _estimated_token_cost(self.metadata, usage)
             span.add(
                 response={"vector_count": len(vectors), "dimensions": len(vectors[0]) if vectors else 0},
+                usage=usage,
+                estimated_cost=estimated_cost,
             )
             write_diagnostic(
                 "embedding_ok",
@@ -1189,6 +1287,8 @@ class OpenAIEmbeddingClient:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 vector_count=len(vectors),
                 dimensions=len(vectors[0]) if vectors else 0,
+                usage=usage,
+                estimated_cost=estimated_cost,
             )
             return vectors
 
@@ -2122,10 +2222,14 @@ class VolcArkWebSearchClient:
                 message=f"missing sources with {requirement}",
             )
             raise ProviderError(f"Ark Web Search did not return verifiable sources with {requirement}")
+        usage = _token_usage(payload)
+        estimated_cost = _estimated_token_cost(self.metadata, usage)
         result = {
             "summary": _response_text(payload),
             "sources": [item.model_dump() for item in results],
             "tool_usage": (payload.get("usage") or {}).get("tool_usage_details") if isinstance(payload, dict) else None,
+            "usage": usage,
+            "estimated_cost": estimated_cost,
             "raw_id": payload.get("id") if isinstance(payload, dict) else "",
         }
         write_diagnostic(
@@ -2144,6 +2248,8 @@ class VolcArkWebSearchClient:
             elapsed_ms=int((time.monotonic() - started) * 1000),
             response=result,
             raw_response=payload,
+            usage=usage,
+            estimated_cost=estimated_cost,
             source_count=len(results),
         )
         return result

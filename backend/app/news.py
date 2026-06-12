@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .diagnostics import write_diagnostic
 from .models import ProviderConfig, TrendRadarSnapshot
-from .providers import TrendRadarClient, get_enabled_provider, provider_ready
+from .providers import TrendRadarClient, get_enabled_provider_by_provider, provider_ready
 from .utils import dump_json, load_json, uid, utc_now
 
 
@@ -101,7 +101,7 @@ def sync_trend_radar_snapshot(
     local_time: datetime | None = None,
     force: bool = False,
 ) -> TrendRadarSnapshot | None:
-    config = config or get_enabled_provider(session, "search")
+    config = config or get_enabled_provider_by_provider(session, "search", "trend_radar")
     if config is None or config.provider != "trend_radar":
         write_diagnostic("trend_radar_sync_skipped", reason="provider_not_configured")
         return None
@@ -180,7 +180,7 @@ def dispatch_trend_radar_workflow(
     config: ProviderConfig | None = None,
     local_time: datetime | None = None,
 ) -> TrendRadarSnapshot | None:
-    config = config or get_enabled_provider(session, "search")
+    config = config or get_enabled_provider_by_provider(session, "search", "trend_radar")
     if config is None or config.provider != "trend_radar":
         write_diagnostic("trend_radar_dispatch_skipped", reason="provider_not_configured")
         return None
