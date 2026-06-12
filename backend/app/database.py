@@ -83,6 +83,15 @@ def _upgrade_sqlite_schema() -> None:
             for name, definition in additions.items():
                 if name not in columns:
                     conn.execute(text(f"ALTER TABLE memories ADD COLUMN {name} {definition}"))
+        if "messages" in table_names:
+            columns = {item["name"] for item in inspector.get_columns("messages")}
+            additions = {
+                "source_event_id": "VARCHAR DEFAULT ''",
+                "request_fingerprint": "VARCHAR DEFAULT ''",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE messages ADD COLUMN {name} {definition}"))
         if "proactive_events" in table_names:
             columns = {item["name"] for item in inspector.get_columns("proactive_events")}
             additions = {

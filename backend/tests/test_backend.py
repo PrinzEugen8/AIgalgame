@@ -113,6 +113,8 @@ def test_schema_has_persona_profile_and_vector_columns() -> None:
         assert "persona_card_json" in columns("characters")
         memory_columns = columns("memories")
         assert {"tags_json", "metadata_json", "vector_status", "vector_updated_at"}.issubset(memory_columns)
+        message_columns = columns("messages")
+        assert {"source_event_id", "request_fingerprint"}.issubset(message_columns)
 
 
 def test_admin_routes_do_not_expose_secrets() -> None:
@@ -2675,6 +2677,261 @@ def test_light_reply_mode_has_no_options_or_relation_delta() -> None:
             memory = session.query(Memory).filter(Memory.user_id == "light_reply_user", Memory.content.contains("不该成为高权重")).first()
             assert memory is not None
             assert memory.importance <= 0.69
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_profile_mutation_writes_character_override_from_chat() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"profile_mutation_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "用户明确提出养成偏好。",
+                "reply_depth": "normal",
+                "lines": [{"text": "好，我记住这个称呼和你的偏好了。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}], "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_profile_mutation_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            user.profile_json = "{}"
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="atri",
+                    session_id=f"profile_mutation_session_{suffix}",
+                    payload={"text": "以后叫我博士，我喜欢机器人少女，别再说高性能。"},
+                ),
+            )
+            assert result.event_type == "dialogue"
+            session.refresh(user)
+            override = json.loads(user.profile_json)["character_overrides"]["atri"]
+            assert override["editable_overrides"]["preferred_user_name"] == "博士"
+            assert "高性能" in override["editable_overrides"]["disabled_phrases"]
+            assert "机器人少女" in override["information_profile"]["personal_topics"]
+            assert result.payload["profile_mutation"]["changed"] is True
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_reply_continuation_adds_extra_bubbles_for_deep_topic() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"continuation_user_{suffix}"
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            payload = {
+                "reply_mode": "normal",
+                "pace_reason": "用户在说重要情绪话题。",
+                "reply_depth": "multi_bubble",
+                "should_continue": True,
+                "continuation_intent": "再主动补一句安抚和追问。",
+                "lines": [{"text": "我在听，你不用急着把话说漂亮。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            }
+        else:
+            payload = {"lines": [{"text": "先把最难受的那一小块交给我，好吗？", "emotion": "sad", "pose": "thinking"}]}
+        content = json.dumps(payload, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}], "usage": {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_continuation_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="atri",
+                    session_id=f"continuation_session_{suffix}",
+                    payload={"text": "我有点难过，想和你认真聊聊。"},
+                ),
+            )
+            assert calls == 2
+            assert result.payload["continued"] is True
+            assert [line["text"] for line in result.payload["lines"]] == ["我在听，你不用急着把话说漂亮。", "先把最难受的那一小块交给我，好吗？"]
+            assert result.payload["stats"]["llm"]["tokens"]["total_tokens"] == 24
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_holiday_question_uses_calendar_context_in_prompt() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"holiday_calendar_user_{suffix}"
+    seen_prompt = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_prompt
+        body = json.loads(request.content.decode())
+        seen_prompt = body["messages"][1]["content"]
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "依据日历事件回答。",
+                "reply_depth": "normal",
+                "lines": [{"text": "日历上看，一星期后是端午节。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_holiday_calendar_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+
+            result = handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="atri",
+                    session_id=f"holiday_calendar_session_{suffix}",
+                    payload={"text": "再过一个星期是不是要放假了？"},
+                    client_context={"local_time": "2026-06-12T12:00:00+08:00"},
+                ),
+            )
+            assert result.event_type == "dialogue"
+            assert "2026-06-19" in seen_prompt
+            assert "端午节" in seen_prompt
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_duplicate_event_replays_saved_dialogue_without_second_llm_call() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"duplicate_event_user_{suffix}"
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        content = json.dumps(
+            {
+                "reply_mode": "normal",
+                "pace_reason": "普通回复。",
+                "reply_depth": "normal",
+                "lines": [{"text": "这次我只生成一次。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_duplicate_event_llm_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            event = EventIn(
+                event_type="user_message",
+                event_id=f"dup_evt_{suffix}",
+                user_id=user_id,
+                character_id="atri",
+                session_id=f"duplicate_event_session_{suffix}",
+                payload={"text": "这条消息可能会重试。"},
+            )
+            first = handle_event(session, event)
+            second = handle_event(session, event)
+            assert calls == 1
+            assert first.payload["lines"][0]["text"] == second.payload["lines"][0]["text"]
+            assert second.payload["reply_mode"] == "cached_duplicate"
     finally:
         providers.HTTP_TRANSPORT = None
 
@@ -5513,6 +5770,11 @@ def test_normalize_line_text_splits_long_sentence() -> None:
     chunks = _normalize_line_text("这是一句非常非常非常非常非常非常非常非常长的台词，需要被拆开。")
     assert len(chunks) >= 2
     assert all(len(chunk) <= 28 for chunk in chunks)
+
+
+def test_normalize_line_text_keeps_common_words_together() -> None:
+    chunks = _normalize_line_text("……不过看你这么闷，我就勉为其难告诉你，我哪来那么多闲工夫管别人。", max_chars=28)
+    assert chunks == ["……不过看你这么闷，我就勉为其难告诉你", "我哪来那么多闲工夫管别人。"]
 
 
 def test_consume_prefers_proactive_over_greeting() -> None:

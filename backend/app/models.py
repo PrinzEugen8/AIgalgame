@@ -398,6 +398,8 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     message_mode: Mapped[str] = mapped_column(String, default="daily_chat")
     source: Mapped[str] = mapped_column(String, default="")
+    source_event_id: Mapped[str] = mapped_column(String, default="", index=True)
+    request_fingerprint: Mapped[str] = mapped_column(String, default="", index=True)
     relation_delta_json: Mapped[str] = mapped_column(Text, default="{}")
     tts_audio_asset_id: Mapped[str] = mapped_column(String, default="")
     media_asset_id: Mapped[str] = mapped_column(String, default="")

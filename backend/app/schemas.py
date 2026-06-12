@@ -137,6 +137,11 @@ class DialoguePayload(BaseModel):
     media_asset_id: str = ""
     reply_mode: str = "normal"
     pace_reason: str = ""
+    reply_depth: str = "normal"
+    continuation_intent: str = ""
+    continued: bool = False
+    profile_mutation: dict[str, Any] = Field(default_factory=dict)
+    stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class AppEventOut(BaseModel):

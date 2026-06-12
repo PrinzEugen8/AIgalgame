@@ -6,6 +6,7 @@ import mimetypes
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -45,6 +46,75 @@ JSON_RETRY_INSTRUCTION = (
     "matching the schema requested above. Do not include markdown or commentary. "
     'Illustrative example only: {"ok": true}.'
 )
+_RECENT_PROVIDER_REQUESTS: dict[str, float] = {}
+_RECENT_PROVIDER_LOCK = threading.Lock()
+
+
+def _audit_duplicate_provider_request(kind: str, config: ProviderConfig, body: dict[str, Any], stage: str) -> str:
+    fingerprint = stable_hash(kind, config.provider_id, config.provider, config.model, dump_json(body))
+    now = time.monotonic()
+    with _RECENT_PROVIDER_LOCK:
+        previous = _RECENT_PROVIDER_REQUESTS.get(fingerprint)
+        _RECENT_PROVIDER_REQUESTS[fingerprint] = now
+        if len(_RECENT_PROVIDER_REQUESTS) > 512:
+            stale_keys = [key for key, ts in _RECENT_PROVIDER_REQUESTS.items() if now - ts > 60]
+            for key in stale_keys[:256]:
+                _RECENT_PROVIDER_REQUESTS.pop(key, None)
+    if previous is not None and now - previous <= 5:
+        write_diagnostic(
+            "provider_duplicate_request_suspected",
+            feature="请求去重",
+            stage=stage,
+            provider_id=config.provider_id,
+            provider=config.provider,
+            model=config.model,
+            kind=kind,
+            request_fingerprint=fingerprint,
+            seconds_since_previous=round(now - previous, 3),
+        )
+    return fingerprint
+
+
+def _usage_cost_usd(metadata: dict[str, Any], usage: dict[str, Any]) -> float:
+    def price(*keys: str) -> float:
+        for key in keys:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return float(value)
+        return 0.0
+
+    def tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    prompt_tokens = tokens("prompt_tokens", "input_tokens")
+    completion_tokens = tokens("completion_tokens", "output_tokens")
+    input_price = price("input_price_per_million", "prompt_price_per_million", "input_token_price_per_million")
+    output_price = price("output_price_per_million", "completion_price_per_million", "output_token_price_per_million")
+    return (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+
+
+def _collect_provider_stats(diag: dict[str, Any], *, config: ProviderConfig, stage: str, usage: dict[str, Any], elapsed_ms: int, estimated_cost_usd: float) -> None:
+    collector = diag.get("stats_collector")
+    if isinstance(collector, list):
+        collector.append(
+            {
+                "kind": config.kind,
+                "stage": stage,
+                "provider_id": config.provider_id,
+                "provider": config.provider,
+                "model": config.model,
+                "usage": usage,
+                "elapsed_ms": elapsed_ms,
+                "estimated_cost_usd": round(estimated_cost_usd, 8),
+            }
+        )
 
 
 def _client(timeout: float) -> httpx.Client:
@@ -890,6 +960,7 @@ class OpenAICompatibleClient:
         feature = str(diag.get("feature") or "LLM")
         stage = str(diag.get("stage") or "chat_json")
         purpose = str(diag.get("purpose") or "LLM JSON request")
+        request_fingerprint = _audit_duplicate_provider_request("chat_json", self.config, body, stage)
         with diagnostic_span(
             "llm_request",
             feature=feature,
@@ -901,6 +972,7 @@ class OpenAICompatibleClient:
             provider=self.config.provider,
             model=self.config.model,
             endpoint=self._url("chat/completions"),
+            request_fingerprint=request_fingerprint,
             request=body,
             input=diag.get("input") or {},
             references=diag.get("references") or {},
@@ -928,6 +1000,8 @@ class OpenAICompatibleClient:
                         )
                         raise
                     response_payload = response.json()
+                    usage = response_payload.get("usage") if isinstance(response_payload, dict) and isinstance(response_payload.get("usage"), dict) else {}
+                    estimated_cost_usd = _usage_cost_usd(self.metadata, usage)
                     choice = response_payload["choices"][0]
                     message_payload = choice.get("message") or {}
                     content = str(message_payload.get("content") or "")
@@ -988,17 +1062,23 @@ class OpenAICompatibleClient:
                         raw_response=response_payload,
                         raw_content=content,
                         finish_reason=finish_reason,
+                        usage=usage,
+                        estimated_cost_usd=round(estimated_cost_usd, 8),
                         keys=list(parsed.keys()),
                         attempts=attempts,
                         requested_max_tokens=max_tokens,
                         effective_max_tokens=effective_max_tokens,
                         retry_max_tokens=retry_max_tokens,
                     )
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    _collect_provider_stats(diag, config=self.config, stage=stage, usage=usage, elapsed_ms=elapsed_ms, estimated_cost_usd=estimated_cost_usd)
                     write_diagnostic(
                         "llm_ok",
                         provider_id=self.config.provider_id,
                         model=self.config.model,
-                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        elapsed_ms=elapsed_ms,
+                        usage=usage,
+                        estimated_cost_usd=round(estimated_cost_usd, 8),
                         keys=list(parsed.keys()),
                         finish_reason=finish_reason,
                         raw_preview=str(content)[:120],
@@ -1041,6 +1121,7 @@ class OpenAICompatibleClient:
         feature = str(diag.get("feature") or "LLM")
         stage = str(diag.get("stage") or "chat_text")
         purpose = str(diag.get("purpose") or "LLM text request")
+        request_fingerprint = _audit_duplicate_provider_request("chat_text", self.config, body, stage)
         with diagnostic_span(
             "llm_request",
             feature=feature,
@@ -1052,6 +1133,7 @@ class OpenAICompatibleClient:
             provider=self.config.provider,
             model=self.config.model,
             endpoint=self._url("chat/completions"),
+            request_fingerprint=request_fingerprint,
             request=body,
             input=diag.get("input") or {},
             references=diag.get("references") or {},
@@ -1083,6 +1165,7 @@ class OpenAICompatibleClient:
                         )
                         raise
                     response_payload = response.json()
+                    usage = response_payload.get("usage") if isinstance(response_payload, dict) and isinstance(response_payload.get("usage"), dict) else {}
                     choice = response_payload["choices"][0]
                     finish_reason = str(choice.get("finish_reason") or "")
                     content = str(choice["message"].get("content") or "").strip()
@@ -1101,14 +1184,22 @@ class OpenAICompatibleClient:
                 response_text=content,
                 raw_response=response_payload,
                 finish_reason=finish_reason,
+                usage=usage if "usage" in locals() else {},
+                estimated_cost_usd=round(_usage_cost_usd(self.metadata, usage if "usage" in locals() else {}), 8),
                 chars=len(content),
                 attempts=attempts,
             )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            text_usage = usage if "usage" in locals() else {}
+            text_cost = _usage_cost_usd(self.metadata, text_usage)
+            _collect_provider_stats(diag, config=self.config, stage=stage, usage=text_usage, elapsed_ms=elapsed_ms, estimated_cost_usd=text_cost)
             write_diagnostic(
                 "llm_text_ok",
                 provider_id=self.config.provider_id,
                 model=self.config.model,
-                elapsed_ms=int((time.monotonic() - started) * 1000),
+                elapsed_ms=elapsed_ms,
+                usage=text_usage,
+                estimated_cost_usd=round(text_cost, 8),
                 chars=len(content),
                 finish_reason=finish_reason,
                 attempts=attempts,
@@ -2032,6 +2123,7 @@ class VolcArkWebSearchClient:
         }
         if self.metadata.get("max_tool_calls") not in (None, ""):
             body["max_tool_calls"] = _as_int(self.metadata.get("max_tool_calls"), 1)
+        request_fingerprint = _audit_duplicate_provider_request("web_search", self.config, body, "ark_web_search")
         span_id = new_span_id("search")
         started = time.monotonic()
         write_diagnostic(
@@ -2047,6 +2139,7 @@ class VolcArkWebSearchClient:
             provider=self.config.provider,
             model=self.config.model,
             endpoint=self._url(),
+            request_fingerprint=request_fingerprint,
             request=body,
             require_published_at=require_published_at,
         )
