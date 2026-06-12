@@ -968,7 +968,7 @@ def _judge_proactive_delivery(
     try:
         result = OpenAICompatibleClient(config).chat_json(
             _judge_messages(context),
-            max_tokens=2400,
+            max_tokens=4096,
             temperature=0.1,
             diagnostic={
                 "feature": "主动消息判断器",

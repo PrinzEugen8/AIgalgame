@@ -463,12 +463,12 @@ def test_llm_json_request_enforces_deepseek_json_output_contract() -> None:
                     base_url="https://api.deepseek.com",
                     model="deepseek-chat",
                     secrets={"api_key": "deepseek-key"},
-                    metadata={"extra_body": {"response_format": {"type": "text"}, "max_tokens": 1, "top_p": 0.5}},
+                    metadata={"extra_body": {"response_format": {"type": "text"}, "max_tokens": 4096, "top_p": 0.5}},
                 ),
             )
             result = providers.OpenAICompatibleClient(config).chat_json(
                 [{"role": "system", "content": "be concise"}, {"role": "user", "content": "return object"}],
-                max_tokens=80,
+                max_tokens=4096,
             )
             assert result["ok"] is True
     finally:
@@ -476,7 +476,7 @@ def test_llm_json_request_enforces_deepseek_json_output_contract() -> None:
 
     body = bodies[0]
     assert body["response_format"] == {"type": "json_object"}
-    assert body["max_tokens"] >= 256
+    assert body["max_tokens"] == 4096
     assert body["top_p"] == 0.5
     assert body["messages"][1]["content"] == "return object"
     system_prompt = body["messages"][0]["content"]
@@ -514,7 +514,7 @@ def test_llm_json_retries_empty_content_from_json_output_mode() -> None:
             )
             result = providers.OpenAICompatibleClient(config).chat_json(
                 [{"role": "system", "content": "json only"}, {"role": "user", "content": "return json"}],
-                max_tokens=300,
+                max_tokens=4096,
             )
             assert result["reply"] == "retried"
     finally:
@@ -522,7 +522,7 @@ def test_llm_json_retries_empty_content_from_json_output_mode() -> None:
 
     assert len(bodies) == 2
     assert bodies[0]["response_format"] == {"type": "json_object"}
-    assert bodies[1]["max_tokens"] == 600
+    assert bodies[1]["max_tokens"] == 8192
     retry_prompt = bodies[1]["messages"][-1]["content"]
     assert "previous response" in retry_prompt.lower()
     assert "<empty content>" in retry_prompt
@@ -561,7 +561,7 @@ def test_llm_text_retries_empty_content_from_length_finish() -> None:
                     {"role": "system", "content": "Output only Japanese."},
                     {"role": "user", "content": "Chinese line: \u8bf4\u5427\u3002"},
                 ],
-                max_tokens=180,
+                max_tokens=4096,
             )
             assert result == ja_text
     finally:
@@ -569,8 +569,8 @@ def test_llm_text_retries_empty_content_from_length_finish() -> None:
 
     assert len(bodies) == 2
     assert "response_format" not in bodies[0]
-    assert bodies[0]["max_tokens"] == 180
-    assert bodies[1]["max_tokens"] == 1024
+    assert bodies[0]["max_tokens"] == 4096
+    assert bodies[1]["max_tokens"] == 4096
 
 
 def test_user_message_trace_records_reply_judgement() -> None:
@@ -4085,6 +4085,82 @@ def test_user_message_extracts_on_time_call_me_commitment() -> None:
                 ),
             )
             commitment = session.execute(select(UserCommitment).where(UserCommitment.user_id == user_id)).scalar_one()
+            assert commitment.remind_at == commitment.event_at
+            proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
+            payload = json.loads(proactive.payload_json)
+            assert payload["delivery_timing"] == "on_time"
+    finally:
+        providers.HTTP_TRANSPORT = None
+
+
+def test_user_message_extracts_simple_clock_reminder_without_commitment_llm() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"simple_clock_commitment_user_{suffix}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        prompt = body["messages"][1]["content"]
+        if "Extract a future user commitment" in prompt:
+            pytest.fail("simple clock reminder should not call commitment extraction LLM")
+        return _llm_json_response(
+            {
+                "reply_mode": "light",
+                "pace_reason": "remember commitment",
+                "lines": [{"text": "好，10点30我会提醒你。", "emotion": "calm", "pose": "idle"}],
+                "normal_replies": [],
+                "key_reply_score": 0,
+                "key_reply_reason": "",
+                "key_replies": [],
+                "relation_delta": {"affection": 0, "trust": 0, "dependency": 0, "mood": 0},
+                "memory_candidates": [],
+                "interest_topics": [],
+            }
+        )
+
+    providers.HTTP_TRANSPORT = httpx.MockTransport(handler)
+    try:
+        with SessionLocal() as session:
+            ensure_seed(session, user_id=user_id, character_id="atri")
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_simple_clock_commitment_chat_{suffix}",
+                    kind="llm",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-chat",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            upsert_provider(
+                session,
+                ProviderConfigIn(
+                    provider_id=f"test_simple_clock_commitment_task_{suffix}",
+                    kind="llm_task",
+                    provider="volc_ark",
+                    base_url="https://ark.cn-beijing.volces.com/api/v3",
+                    model="doubao-task",
+                    secrets={"api_key": "ark-key"},
+                ),
+            )
+            user = session.get(User, user_id)
+            user.story_completed = True
+            user.tts_enabled = False
+            session.commit()
+            handle_event(
+                session,
+                EventIn(
+                    event_type="user_message",
+                    user_id=user_id,
+                    character_id="atri",
+                    session_id=f"simple_clock_commitment_session_{suffix}",
+                    payload={"text": "一会儿10点30提醒我一下，有事情"},
+                    client_context={"local_time": "2026-06-12T10:20:49+08:00"},
+                ),
+            )
+            commitment = session.execute(select(UserCommitment).where(UserCommitment.user_id == user_id)).scalar_one()
+            assert commitment.title == "有事情"
+            assert commitment.event_at == "2026-06-12T02:30:00+00:00"
             assert commitment.remind_at == commitment.event_at
             proactive = session.execute(select(ProactiveEvent).where(ProactiveEvent.source_id == commitment.commitment_id)).scalar_one()
             payload = json.loads(proactive.payload_json)

@@ -31,8 +31,9 @@ class ProviderError(RuntimeError):
 
 HTTP_TRANSPORT: httpx.BaseTransport | None = None
 JSON_RESPONSE_FORMAT = {"type": "json_object"}
-JSON_MIN_MAX_TOKENS = 256
+JSON_MIN_MAX_TOKENS = 4096
 JSON_RETRY_MAX_TOKENS = 8192
+JSON_RETRY_MIN_MAX_TOKENS = 4096
 TEXT_RETRY_MAX_TOKENS = 4096
 JSON_OUTPUT_INSTRUCTION = (
     "JSON Output mode is required. Return exactly one valid json object matching the user's requested schema. "
@@ -109,7 +110,18 @@ def _json_retry_max_tokens(max_tokens: int, metadata: dict[str, Any]) -> int:
         limit = JSON_RETRY_MAX_TOKENS
     if limit <= max_tokens:
         return max_tokens
-    return min(max_tokens * 2, limit)
+    return min(max(max_tokens * 4, JSON_RETRY_MIN_MAX_TOKENS), limit)
+
+
+def _json_attempts_preview(attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return ""
+    parts = []
+    for attempt in attempts:
+        parts.append(
+            f"{attempt.get('attempt')}:{attempt.get('finish_reason') or 'unknown'}@max_tokens={attempt.get('max_tokens')}"
+        )
+    return "; attempts=" + ",".join(parts)
 
 
 def _json_output_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -851,7 +863,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, str]],
         *,
-        max_tokens: int = 800,
+        max_tokens: int = 4096,
         temperature: float = 0.7,
         diagnostic: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -970,7 +982,7 @@ class OpenAICompatibleClient:
                             finish_reason=finish_reason,
                         )
                         span.add(raw_response=response_payload, raw_content=content, attempts=attempts)
-                        raise ProviderError(f"LLM did not return valid JSON: {error_preview}") from exc
+                        raise ProviderError(f"LLM did not return valid JSON: {error_preview}{_json_attempts_preview(attempts)}") from exc
                     span.add(
                         response=parsed,
                         raw_response=response_payload,
@@ -998,7 +1010,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, str]],
         *,
-        max_tokens: int = 240,
+        max_tokens: int = 4096,
         temperature: float = 0.2,
         diagnostic: dict[str, Any] | None = None,
     ) -> str:
@@ -2558,7 +2570,7 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
                     {"role": "system", "content": "只返回 JSON。"},
                     {"role": "user", "content": '返回 {"ok": true, "reply": "测试通过"}，不要输出多余文字。'},
                 ],
-                max_tokens=80,
+                max_tokens=4096,
             )
             ok = bool(result.get("ok"))
             message = "LLM JSON test passed" if ok else "LLM JSON test returned ok=false"

@@ -162,7 +162,7 @@ def _llm_moment_payload(session: Session, *, user_id: str, character_id: str, sl
     try:
         payload = OpenAICompatibleClient(config).chat_json(
             [{"role": "system", "content": "你是 Galgame 朋友圈内容生成器，只输出 JSON。"}, {"role": "user", "content": prompt}],
-            max_tokens=700,
+            max_tokens=4096,
             temperature=0.8,
             diagnostic={
                 "feature": "日程朋友圈",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,6 +19,7 @@ from .utils import dump_json, stable_hash, uid, utc_now
 
 
 TIME_HINTS = ("明天", "后天", "早上", "上午", "中午", "下午", "晚上", "今晚", "明早", "点", ":", "：")
+COMMITMENT_JSON_MAX_TOKENS = 4096
 COMMITMENT_HINTS = (
     "提醒",
     "记得",
@@ -41,6 +43,13 @@ COMMITMENT_HINTS = (
     "到点",
     "忙完",
     "工作",
+)
+SIMPLE_REMINDER_HINTS = ("提醒", "叫我", "喊我", "通知我", "叫醒", "闹钟", "到点")
+SIMPLE_TIME_RE = re.compile(r"(?P<period>凌晨|早上|上午|中午|下午|晚上|今晚|明早)?\s*(?P<hour>\d{1,2})\s*(?:[:：点时]\s*(?P<minute>\d{1,2})?)")
+SIMPLE_REMINDER_FILLERS_RE = re.compile(
+    r"(一会儿|待会儿|等会儿|帮我|麻烦|请|记得|别忘了?|到点|到时候|"
+    r"提醒我一下|提醒我|提醒一下|提醒|叫我一下|叫我|喊我|通知我|"
+    r"叫醒我|叫醒|设个?闹钟|闹钟|一下)"
 )
 
 
@@ -67,6 +76,66 @@ def _user_zone(user: User) -> ZoneInfo:
 def _looks_like_commitment(text: str) -> bool:
     normalized = str(text or "").strip()
     return bool(normalized) and any(item in normalized for item in TIME_HINTS) and any(item in normalized for item in COMMITMENT_HINTS)
+
+
+def _adjust_hour_for_period(hour: int, period: str) -> int:
+    if period in {"下午", "晚上", "今晚"} and 1 <= hour < 12:
+        return hour + 12
+    if period == "中午" and 1 <= hour < 11:
+        return hour + 12
+    if period in {"凌晨", "早上", "上午", "明早"} and hour == 12:
+        return 0
+    return hour
+
+
+def _simple_reminder_title(text: str, time_match: re.Match[str]) -> str:
+    cleaned = f"{text[: time_match.start()]}{text[time_match.end() :]}"
+    cleaned = SIMPLE_REMINDER_FILLERS_RE.sub("", cleaned)
+    cleaned = cleaned.strip(" \t\r\n，,。.!！？?；;：:")
+    return " ".join(cleaned.split())[:120] or "提醒"
+
+
+def _extract_simple_reminder(text: str, now_local: datetime) -> dict[str, Any] | None:
+    normalized = str(text or "").strip()
+    if not normalized or not any(item in normalized for item in SIMPLE_REMINDER_HINTS):
+        return None
+    match = SIMPLE_TIME_RE.search(normalized)
+    if match is None:
+        return None
+    try:
+        hour = int(match.group("hour"))
+        minute_text = match.group("minute")
+        minute = int(minute_text) if minute_text not in {None, ""} else 0
+    except (TypeError, ValueError):
+        return None
+    if minute_text in {None, ""} and normalized[match.end() :].lstrip().startswith("半"):
+        minute = 30
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    period = match.group("period") or ""
+    hour = _adjust_hour_for_period(hour, period)
+    if not (0 <= hour <= 23):
+        return None
+
+    days = 0
+    if "后天" in normalized:
+        days = 2
+    elif "明天" in normalized or "明早" in normalized:
+        days = 1
+    event_at = (now_local + timedelta(days=days)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if days == 0 and event_at <= now_local:
+        event_at += timedelta(days=1)
+
+    title = _simple_reminder_title(normalized, match)
+    return {
+        "has_commitment": True,
+        "title": title,
+        "description": normalized,
+        "event_at": event_at.isoformat(),
+        "remind_at": event_at.isoformat(),
+        "delivery_timing": "on_time",
+        "confidence": 0.9,
+    }
 
 
 def _fallback_remind_at(event_at: datetime, delivery_timing: str) -> datetime:
@@ -152,48 +221,58 @@ def extract_user_commitment(
     user = session.get(User, event.user_id)
     if user is None:
         return None
-    config = get_task_llm_provider(session)
-    if config is None:
-        write_diagnostic("commitment_extract_skipped", reason="llm_not_configured", user_id=event.user_id)
-        return None
     zone = _user_zone(user)
     now_local = local_time.astimezone(zone) if local_time and local_time.tzinfo else (local_time.replace(tzinfo=zone) if local_time else datetime.now(zone))
-    prompt = {
-        "task": "Extract a future user commitment/reminder from the message. Return JSON only.",
-        "now_local": now_local.isoformat(),
-        "timezone": user.timezone,
-        "message": text,
-        "user_availability_today": get_user_availability(user, now_local),
-        "schema": {
-            "has_commitment": "boolean",
-            "title": "short title",
-            "description": "details",
-            "event_at": "ISO datetime with timezone",
-            "remind_at": "ISO datetime with timezone; optional",
-            "delivery_timing": "on_time | advance | follow_up",
-            "busy_start": "ISO datetime with timezone; for follow_up when user is busy",
-            "busy_end": "ISO datetime with timezone; for follow_up when user becomes free",
-            "confidence": "0..1",
-        },
-    }
-    try:
-        result = OpenAICompatibleClient(config).chat_json(
-            [
-                {"role": "system", "content": "You extract explicit future appointments and reminders from user messages. Return JSON only."},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ],
-            max_tokens=500,
-            temperature=0.0,
-            diagnostic={
-                "feature": "commitment_extraction",
-                "stage": "extract",
-                "purpose": "Extract user commitment from chat message",
-                "input": {"user_id": event.user_id, "text": text, "now_local": now_local.isoformat()},
-            },
+    result = _extract_simple_reminder(text, now_local)
+    if result is not None:
+        write_diagnostic(
+            "commitment_extract_simple",
+            user_id=event.user_id,
+            text=text,
+            event_at=result["event_at"],
+            title=result["title"],
         )
-    except Exception as exc:  # noqa: BLE001
-        write_diagnostic("commitment_extract_error", user_id=event.user_id, error_type=type(exc).__name__, message=str(exc))
-        return None
+    else:
+        config = get_task_llm_provider(session)
+        if config is None:
+            write_diagnostic("commitment_extract_skipped", reason="llm_not_configured", user_id=event.user_id)
+            return None
+        prompt = {
+            "task": "Extract a future user commitment/reminder from the message. Return JSON only.",
+            "now_local": now_local.isoformat(),
+            "timezone": user.timezone,
+            "message": text,
+            "user_availability_today": get_user_availability(user, now_local),
+            "schema": {
+                "has_commitment": "boolean",
+                "title": "short title",
+                "description": "details",
+                "event_at": "ISO datetime with timezone",
+                "remind_at": "ISO datetime with timezone; optional",
+                "delivery_timing": "on_time | advance | follow_up",
+                "busy_start": "ISO datetime with timezone; for follow_up when user is busy",
+                "busy_end": "ISO datetime with timezone; for follow_up when user becomes free",
+                "confidence": "0..1",
+            },
+        }
+        try:
+            result = OpenAICompatibleClient(config).chat_json(
+                [
+                    {"role": "system", "content": "You extract explicit future appointments and reminders from user messages. Return JSON only."},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                max_tokens=COMMITMENT_JSON_MAX_TOKENS,
+                temperature=0.0,
+                diagnostic={
+                    "feature": "commitment_extraction",
+                    "stage": "extract",
+                    "purpose": "Extract user commitment from chat message",
+                    "input": {"user_id": event.user_id, "text": text, "now_local": now_local.isoformat()},
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            write_diagnostic("commitment_extract_error", user_id=event.user_id, error_type=type(exc).__name__, message=str(exc))
+            return None
     if not bool(result.get("has_commitment")):
         return None
     try:

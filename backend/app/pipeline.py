@@ -693,7 +693,7 @@ def _japanese_tts_text(session: Session, character: Character, text: str, candid
                         ),
                     },
                 ],
-                max_tokens=1024,
+                max_tokens=4096,
                 temperature=0.2,
                 diagnostic={
                     "feature": "日文 TTS 修复",
@@ -1125,7 +1125,7 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             )
         result = client.chat_json(
             [{"role": "system", "content": "你是 Galgame 台词与状态 JSON 生成器。"}, {"role": "user", "content": attempt_prompt}],
-            max_tokens=1100,
+            max_tokens=4096,
             diagnostic={
                 "feature": "回复模块",
                 "stage": "llm_dialogue",
