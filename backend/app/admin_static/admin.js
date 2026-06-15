@@ -43,6 +43,7 @@ const state = {
   calendarPage: { page: 1, pageSize: 10, total: 0, q: "" },
   proactivePage: { page: 1, pageSize: 10, total: 0, q: "" },
   activeUserId: "",
+  activeUserCharacterId: "",
   activeCharacterId: "atri",
   editingVoiceId: "",
   editingCalendarEventId: "",
@@ -648,11 +649,72 @@ function activeUser() {
   return state.users.find((item) => item.user_id === state.activeUserId) || state.users[0] || null;
 }
 
+function defaultCharacterId() {
+  return state.activeCharacterId || state.characters[0]?.character_id || "atri";
+}
+
+function activeUserRelations() {
+  const user = activeUser();
+  if (!user) return [];
+  return state.relations.filter((item) => item.user_id === user.user_id);
+}
+
+function syncActiveUserCharacter(preferredId = state.activeUserCharacterId) {
+  const fallback = defaultCharacterId();
+  const relations = activeUserRelations();
+  if (preferredId && relations.some((item) => item.character_id === preferredId)) {
+    state.activeUserCharacterId = preferredId;
+    return state.activeUserCharacterId;
+  }
+  state.activeUserCharacterId = relations.find((item) => item.character_id === fallback)?.character_id
+    || relations[0]?.character_id
+    || fallback;
+  return state.activeUserCharacterId;
+}
+
+function selectedUserCharacterId() {
+  return state.activeUserCharacterId || syncActiveUserCharacter();
+}
+
+function characterSelectOptions(selectedId) {
+  const items = [...state.characters];
+  if (selectedId && !items.some((item) => item.character_id === selectedId)) {
+    items.unshift({ character_id: selectedId, name: selectedId });
+  }
+  if (!items.length) {
+    const fallback = defaultCharacterId();
+    items.push({ character_id: fallback, name: fallback });
+  }
+  return items.map((character) => {
+    const value = character.character_id;
+    const label = character.name || character.character_id;
+    return `<option value="${escapeHtml(value)}" ${value === selectedId ? "selected" : ""}>${escapeHtml(label)} (${escapeHtml(value)})</option>`;
+  }).join("");
+}
+
+async function changeActiveUserCharacter(characterId) {
+  state.activeUserCharacterId = characterId || defaultCharacterId();
+  state.memoryPage.page = 1;
+  state.calendarPage.page = 1;
+  state.proactivePage.page = 1;
+  state.editingCalendarEventId = "";
+  state.proactiveActionResult = null;
+  if (!state.activeUserId) {
+    renderTestData();
+    return;
+  }
+  await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/relation`, {
+    method: "PUT",
+    body: JSON.stringify({ character_id: state.activeUserCharacterId }),
+  });
+  await loadTestData();
+}
+
 function activeRelation() {
   const user = activeUser();
   if (!user) return null;
-  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === "atri")
-    || state.relations.find((item) => item.user_id === user.user_id)
+  const characterId = selectedUserCharacterId();
+  return state.relations.find((item) => item.user_id === user.user_id && item.character_id === characterId)
     || null;
 }
 
@@ -673,10 +735,11 @@ function renderUserTabs() {
     `;
     row.addEventListener("click", async () => {
       state.activeUserId = user.user_id;
+      syncActiveUserCharacter();
       state.memoryPage.page = 1;
       state.calendarPage.page = 1;
       state.proactivePage.page = 1;
-      await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents()]);
+      await Promise.all([loadMemories(), loadCalendarEvents(), loadProactiveEvents(), loadAiSchedule()]);
       renderTestData();
     });
     tbody.appendChild(row);
@@ -697,6 +760,7 @@ function renderUserEditor() {
   node.innerHTML = `
     <form class="compact-form" id="userForm">
       <label><span>user_id</span><input name="user_id" value="${escapeHtml(user.user_id)}" disabled></label>
+      <label><span>当前角色</span><select id="userCharacterSelect" name="active_character_id">${characterSelectOptions(selectedUserCharacterId())}</select></label>
       <label><span>显示名</span><input name="display_name" value="${escapeHtml(user.display_name || "")}"></label>
       <label><span>时区</span><input name="timezone" value="${escapeHtml(user.timezone || "Asia/Hong_Kong")}"></label>
       <label><span>主动消息频率</span><input name="proactive_daily_limit" value="${escapeHtml(user.proactive_daily_limit || "unlimited")}"></label>
@@ -715,6 +779,13 @@ function renderUserEditor() {
     </form>
   `;
   $("#userForm").addEventListener("submit", saveUser);
+  $("#userCharacterSelect").addEventListener("change", async (event) => {
+    try {
+      await changeActiveUserCharacter(event.target.value);
+    } catch (error) {
+      node.insertAdjacentHTML("beforeend", `<pre>${escapeHtml(pretty({ ok: false, message: error.message }))}</pre>`);
+    }
+  });
   $("#deleteUser").addEventListener("click", deleteUser);
 }
 
@@ -766,7 +837,7 @@ function renderMemoryEditor() {
       <label><span>层级</span><input name="layer" value="chat"></label>
       <label><span>重要度</span><input name="importance" type="number" step="0.01" value="0.5"></label>
       <label><span>置信度</span><input name="confidence" type="number" step="0.01" value="0.8"></label>
-      <label><span>角色</span><input name="character_id" value="atri"></label>
+      <label><span>角色</span><select name="character_id">${characterSelectOptions(selectedUserCharacterId())}</select></label>
       <label><span>Tags（逗号分隔）</span><input name="tags" placeholder="interest,event"></label>
       <label class="wide"><span>内容</span><textarea name="content"></textarea></label>
       <label class="wide"><span>Metadata JSON</span><textarea name="metadata">{}</textarea></label>
@@ -945,7 +1016,7 @@ function renderProactiveEditor() {
     </article>
   `).join("");
   node.innerHTML = `
-    <div class="proactive-current-user">当前用户：<strong>${escapeHtml(user.display_name || user.user_id)}</strong><span>${escapeHtml(user.user_id)}</span></div>
+    <div class="proactive-current-user">当前用户：<strong>${escapeHtml(user.display_name || user.user_id)}</strong><span>${escapeHtml(user.user_id)}</span><span>角色：${escapeHtml(selectedUserCharacterId())}</span></div>
     <form class="compact-form" id="proactiveGenerateForm">
       <label><span>主动来源</span><select name="source_type">${sourceOptions}</select></label>
       <label><span>AI 日程 slot</span><select name="slot_id"><option value="">自动选择</option>${slotOptions}</select></label>
@@ -1000,7 +1071,7 @@ function renderProactiveEditor() {
   $("#proactivePrewarm").addEventListener("click", async () => {
     state.proactiveActionResult = await api("/api/admin/proactive-events/prewarm", {
       method: "POST",
-      body: JSON.stringify({ user_id: state.activeUserId, character_id: "atri", limit: 4 }),
+      body: JSON.stringify({ user_id: state.activeUserId, character_id: selectedUserCharacterId(), limit: 4 }),
     });
     await loadProactiveEvents();
     renderProactiveEditor();
@@ -1056,6 +1127,7 @@ async function loadUsers() {
   if (!state.activeUserId || !state.users.some((item) => item.user_id === state.activeUserId)) {
     state.activeUserId = state.users[0]?.user_id || "";
   }
+  syncActiveUserCharacter();
 }
 
 async function loadMemories() {
@@ -1067,6 +1139,7 @@ async function loadMemories() {
   const params = new URLSearchParams({
     page: String(state.memoryPage.page),
     page_size: String(state.memoryPage.pageSize),
+    character_id: selectedUserCharacterId(),
     q: state.memoryPage.q,
   });
   const payload = await api(`/api/admin/users/${encodeURIComponent(state.activeUserId)}/memories?${params.toString()}`);
@@ -1084,7 +1157,7 @@ async function loadCalendarEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: selectedUserCharacterId(),
     page: String(state.calendarPage.page),
     page_size: String(state.calendarPage.pageSize),
     q: state.calendarPage.q,
@@ -1104,7 +1177,7 @@ async function loadProactiveEvents() {
   }
   const params = new URLSearchParams({
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: selectedUserCharacterId(),
     page: String(state.proactivePage.page),
     page_size: String(state.proactivePage.pageSize),
     q: state.proactivePage.q,
@@ -1121,7 +1194,7 @@ async function loadAiSchedule() {
     state.aiSchedule = [];
     return;
   }
-  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: "atri" });
+  const params = new URLSearchParams({ user_id: state.activeUserId, character_id: selectedUserCharacterId() });
   const payload = await api(`/api/admin/ai-schedule/today?${params.toString()}`);
   state.aiSchedule = payload.items || [];
 }
@@ -1136,7 +1209,7 @@ function proactiveFormPayload() {
   const form = $("#proactiveGenerateForm");
   return {
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: selectedUserCharacterId(),
     source_type: form.elements.source_type.value,
     slot_id: form.elements.slot_id.value,
     priority: Number(form.elements.priority.value || 80),
@@ -1171,8 +1244,10 @@ async function judgeProactiveNow() {
 }
 
 async function createUser() {
-  const created = await api("/api/admin/users", { method: "POST", body: JSON.stringify({ display_name: "测试用户", story_completed: true }) });
+  const characterId = selectedUserCharacterId();
+  const created = await api("/api/admin/users", { method: "POST", body: JSON.stringify({ display_name: "测试用户", story_completed: true, character_id: characterId }) });
   state.activeUserId = created.user_id;
+  state.activeUserCharacterId = characterId;
   state.userPage.page = 1;
   state.userPage.q = "";
   await loadTestData();
@@ -1213,7 +1288,7 @@ async function saveRelation(event) {
   event.preventDefault();
   const form = $("#relationForm");
   const payload = {
-    character_id: "atri",
+    character_id: selectedUserCharacterId(),
     affection: Number(form.elements.affection.value || 0),
     trust: Number(form.elements.trust.value || 0),
     dependency: Number(form.elements.dependency.value || 0),
@@ -1229,7 +1304,7 @@ async function createMemory(event) {
   const form = $("#memoryForm");
   try {
     const payload = {
-      character_id: form.elements.character_id.value.trim() || "atri",
+      character_id: form.elements.character_id.value.trim() || selectedUserCharacterId(),
       layer: form.elements.layer.value.trim() || "chat",
       content: form.elements.content.value.trim(),
       importance: Number(form.elements.importance.value || 0.5),
@@ -1264,7 +1339,7 @@ async function saveCalendarEvent(event) {
   const form = $("#calendarEventForm");
   const payload = {
     user_id: state.activeUserId,
-    character_id: "atri",
+    character_id: selectedUserCharacterId(),
     date: form.elements.date.value,
     title: form.elements.title.value.trim(),
     category: form.elements.category.value,

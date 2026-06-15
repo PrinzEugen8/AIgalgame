@@ -140,6 +140,16 @@ def test_admin_static_moves_proactive_debug_out_of_user_data() -> None:
     assert 'id="proactiveDebugManager"' in debug_section
 
 
+def test_admin_static_exposes_user_character_switcher() -> None:
+    script = client.get("/admin/assets/admin.js").text
+    user_data_script = script.split("function activeUser()", 1)[1].split("const LIVE2D_AREA_COLORS", 1)[0]
+    assert "activeUserCharacterId" in user_data_script
+    assert 'id="userCharacterSelect"' in user_data_script
+    assert "selectedUserCharacterId()" in user_data_script
+    assert 'character_id: "atri"' not in user_data_script
+    assert 'value="atri"' not in user_data_script
+
+
 def test_runtime_logs_redact_and_reconstruct_spans() -> None:
     _clear_diagnostics()
     with diagnostic_span(
@@ -5729,13 +5739,28 @@ def test_admin_user_relation_memory_and_calendar_event_crud() -> None:
     assert memory["tags"] == ["manual", "test"]
     assert memory["metadata"]["kind"] == "admin"
     assert memory["vector_status"] in {"ready", "error", "hidden", "pending"}
+    other_memory = client.post(
+        f"/api/admin/users/{user_id}/memories",
+        json={
+            "character_id": "debug_character",
+            "content": "admin alternate character memory",
+            "layer": "core",
+            "importance": 0.6,
+        },
+    ).json()
+    assert other_memory["character_id"] == "debug_character"
     memories_page = client.get(f"/api/admin/users/{user_id}/memories?q=测试记忆&page=1&page_size=5").json()
     assert memories_page["total"] == 1
     assert memories_page["items"][0]["memory_id"] == memory["memory_id"]
     assert memories_page["items"][0]["tags"] == ["manual", "test"]
+    atri_memories_page = client.get(f"/api/admin/users/{user_id}/memories?character_id=atri&page=1&page_size=5").json()
+    assert {item["memory_id"] for item in atri_memories_page["items"]} == {memory["memory_id"]}
+    alternate_memories_page = client.get(f"/api/admin/users/{user_id}/memories?character_id=debug_character&page=1&page_size=5").json()
+    assert {item["memory_id"] for item in alternate_memories_page["items"]} == {other_memory["memory_id"]}
     hidden = client.put(f"/api/admin/memories/{memory['memory_id']}", json={"hidden": True}).json()
     assert hidden["hidden"] is True
     assert client.delete(f"/api/admin/memories/{memory['memory_id']}").json()["ok"] is True
+    assert client.delete(f"/api/admin/memories/{other_memory['memory_id']}").json()["ok"] is True
 
     event = client.post(
         "/api/admin/calendar-events",

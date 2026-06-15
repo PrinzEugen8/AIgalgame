@@ -586,8 +586,17 @@ def admin_update_relation(user_id: str, payload: dict[str, Any], session: Sessio
 
 
 @app.get("/api/admin/users/{user_id}/memories")
-def admin_memories(user_id: str, page: int = 1, page_size: int = 20, q: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+def admin_memories(
+    user_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     stmt = select(Memory).where(Memory.user_id == user_id)
+    if character_id:
+        stmt = stmt.where(Memory.character_id == character_id)
     query = q.strip()
     if query:
         like = f"%{query}%"
