@@ -69,23 +69,30 @@ class Live2DConfigTest {
     }
 
     @Test
-    fun live2DHostStaysPersistentAcrossUiState() {
+    fun observationHomeKeepsLive2DRendererAvailableForDressUp() {
         val stageKt = File("src/main/java/com/aigalgame/demo/Live2DStage.kt").readText()
         val mainKt = File("src/main/java/com/aigalgame/demo/MainActivity.kt").readText()
         val viewJava = File("src/main/java/com/aigalgame/demo/live2d/OfficialLive2DView.java").readText()
         val engineJava = File("src/main/java/com/aigalgame/demo/live2d/PersistentLive2DEngine.java").readText()
 
         assertTrue(mainKt.contains("Live2DBootLoadingScreen"))
-        assertTrue(mainKt.contains("!vm.live2dBootReady || stageOnPrimaryScreens"))
-        assertTrue(mainKt.contains("modifier = Modifier\r\n                        .fillMaxSize()\r\n                        .zIndex(1f)") ||
-            mainKt.contains("modifier = Modifier\n                        .fillMaxSize()\n                        .zIndex(1f)"))
-        assertTrue(mainKt.contains("StandeeGestureZone"))
+        assertTrue(mainKt.contains("val showLive2DStage = vm.screen == AppScreen.DressUp"))
+        assertTrue(mainKt.contains("if (showLive2DStage)"))
+        assertTrue(mainKt.contains("if (showLive2DStage && !vm.live2dBootReady)"))
+        assertTrue(mainKt.contains("ObservationSceneBackground"))
+        assertTrue(mainKt.contains("ObservationMessageDrawer"))
+        assertTrue(mainKt.contains("QuickReplyFillStrip"))
+        assertTrue(mainKt.contains("R.drawable.bg_catgirl_typing"))
+        assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_typing.png").exists())
+        assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_reading.png").exists())
+        assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_gaming.png").exists())
+        assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_music.png").exists())
+        assertFalse(mainKt.contains("stageOnPrimaryScreens"))
+        assertTrue(mainKt.contains("Live2DStage("))
+        assertTrue(mainKt.contains(".zIndex(1f)"))
         assertTrue(mainKt.contains("editable = false"))
-        assertTrue(mainKt.contains("CharacterTapZone"))
-        assertTrue(mainKt.contains("HomeStandeeEditBar"))
         assertFalse(mainKt.contains("padding(top = 104.dp, end = 18.dp)"))
         assertFalse(mainKt.contains("padding(start = 16.dp, top = 88.dp, end = 16.dp)"))
-        assertFalse(mainKt.contains("Color(0x22FFFFFF)"))
         assertTrue(stageKt.contains("showCharacter"))
         assertTrue(stageKt.contains("live2DVisible"))
         assertTrue(stageKt.contains("clearStageListener()"))

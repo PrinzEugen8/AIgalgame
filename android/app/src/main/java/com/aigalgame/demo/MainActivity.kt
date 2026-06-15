@@ -29,6 +29,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -86,8 +87,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.layout.boundsInRoot
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -100,6 +99,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -231,6 +231,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var isBusy by mutableStateOf(false)
     var errorMessage by mutableStateOf("")
     var storyCompleted by mutableStateOf(false)
+    var replyInProgress by mutableStateOf(false)
+        private set
+    var lastUserMessage by mutableStateOf("")
+        private set
     var selectedCharacter by mutableStateOf("neko")
     var activeCharacterId by mutableStateOf("atri")
     var characterName by mutableStateOf("角色")
@@ -597,7 +601,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         val urlKey = baseUrl
         if (!force && appOpenedBaseUrl == urlKey) return
-        if (!live2dBootReady) {
+        if (screen == AppScreen.DressUp && !live2dBootReady) {
             pendingOpenAfterBoot = true
             return
         }
@@ -650,6 +654,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectReply(option: ReplyOption) {
         recordUserActivity()
         val client = api ?: return
+        lastUserMessage = option.text
         launchDialogueEvent(awaitingReply = true) {
             val type = if (option.type == "key") "option_selected" else "user_message"
             applyEvent(client.postEvent(type, text = option.text, replyId = option.id, storyIndex = storyIndex))
@@ -658,10 +663,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendUserMessage(text: String) {
         if (text.isBlank()) return
+        val trimmed = text.trim()
         recordUserActivity()
         val client = api ?: return
+        lastUserMessage = trimmed
         launchDialogueEvent(awaitingReply = true) {
-            applyEvent(client.postEvent("user_message", text = text.trim()))
+            applyEvent(client.postEvent("user_message", text = trimmed))
         }
     }
 
@@ -1044,6 +1051,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         storyIndex = 0
         currentLineIndex = 0
         dialogueMediaUrl = ""
+        lastUserMessage = ""
         errorMessage = ""
     }
 
@@ -1147,12 +1155,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (dialogueEventInFlight) return
         dialogueEventInFlight = true
         awaitingUserReplyResponse = awaitingReply
+        replyInProgress = awaitingReply
         launchBusy {
             try {
                 block()
             } finally {
                 dialogueEventInFlight = false
                 awaitingUserReplyResponse = false
+                replyInProgress = false
             }
         }
     }
@@ -1197,9 +1207,7 @@ fun AiGalgameApp(vm: MainViewModel) {
             ConnectionScreen(vm)
         } else {
             Box(Modifier.fillMaxSize()) {
-                val sharedLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
-                val stageOnPrimaryScreens = vm.screen == AppScreen.Home || vm.screen == AppScreen.DressUp
-                val stageShowsCharacter = !vm.live2dBootReady || stageOnPrimaryScreens
+                val showLive2DStage = vm.screen == AppScreen.DressUp
                 if (vm.live2dBootReady && vm.screen == AppScreen.DressUp) {
                     Box(
                         Modifier
@@ -1209,37 +1217,35 @@ fun AiGalgameApp(vm: MainViewModel) {
                     )
                 }
                 val live2DTapBridge = remember { Live2DTapBridge() }
-                Live2DStage(
-                    background = vm.selectedBackground,
-                    character = vm.selectedCharacter,
-                    emotion = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.emotion ?: "calm",
-                    pose = if (vm.screen == AppScreen.DressUp) vm.previewEmotion else sharedLine?.pose ?: "idle",
-                    placement = if (vm.screen == AppScreen.DressUp) vm.currentPlacement() else vm.visiblePlacement(),
-                    speechState = vm.live2dSpeechState,
-                    line = if (vm.screen == AppScreen.DressUp) null else sharedLine,
-                    editable = false,
-                    onPlacementChange = { vm.updatePlacementDraft(it) },
-                    onReaction = { partial ->
-                        vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
-                            vm.applyLive2DReaction(it)
-                        }
-                    },
-                    relation = vm.relation,
-                    stageMode = if (vm.screen == AppScreen.DressUp) "dress" else "home",
-                    showCharacter = stageShowsCharacter,
-                    live2DVisible = vm.selectedCharacter == "neko" && stageShowsCharacter,
-                    onRendererStatus = { vm.updateLive2DBootStatus(it) },
-                    tapBridge = live2DTapBridge,
-                    useInternalTapLayer = vm.screen == AppScreen.DressUp,
-                    remoteHitAreas = vm.live2dHitAreas,
-                    remoteReactions = vm.live2dReactions,
-                    touchCooldownRequest = vm.touchCooldownRequest,
-                    touchReactionsEnabled = vm.canStartTouchReaction(),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .zIndex(1f)
-                )
-                if (!vm.live2dBootReady) {
+                if (showLive2DStage) {
+                    Live2DStage(
+                        background = vm.selectedBackground,
+                        character = vm.selectedCharacter,
+                        emotion = vm.previewEmotion,
+                        pose = vm.previewEmotion,
+                        placement = vm.currentPlacement(),
+                        speechState = vm.live2dSpeechState,
+                        line = null,
+                        editable = false,
+                        onPlacementChange = { vm.updatePlacementDraft(it) },
+                        onReaction = { },
+                        relation = vm.relation,
+                        stageMode = "dress",
+                        showCharacter = true,
+                        live2DVisible = vm.selectedCharacter == "neko",
+                        onRendererStatus = { vm.updateLive2DBootStatus(it) },
+                        tapBridge = live2DTapBridge,
+                        useInternalTapLayer = true,
+                        remoteHitAreas = vm.live2dHitAreas,
+                        remoteReactions = vm.live2dReactions,
+                        touchCooldownRequest = vm.touchCooldownRequest,
+                        touchReactionsEnabled = false,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(1f)
+                    )
+                }
+                if (showLive2DStage && !vm.live2dBootReady) {
                     Live2DBootLoadingScreen(
                         status = vm.live2dBootStatus,
                         onRetry = { vm.retryLive2DBoot() },
@@ -1253,12 +1259,16 @@ fun AiGalgameApp(vm: MainViewModel) {
                         modifier = Modifier
                             .fillMaxSize()
                             .zIndex(2f),
-                        bottomBar = { AppBottomBar(vm) }
+                        bottomBar = {
+                            if (vm.screen != AppScreen.Home) {
+                                AppBottomBar(vm)
+                            }
+                        }
                     ) { padding ->
                         Box(
                             Modifier
                                 .fillMaxSize()
-                                .padding(padding)
+                                .padding(if (vm.screen == AppScreen.Home) PaddingValues(0.dp) else padding)
                         ) {
                             when (vm.screen) {
                                 AppScreen.Home -> HomeScreen(
@@ -1285,7 +1295,7 @@ fun AiGalgameApp(vm: MainViewModel) {
                                     Text(vm.errorMessage, Modifier.padding(12.dp), color = Color(0xFF7B2535))
                                 }
                             }
-                            if (vm.isBusy) {
+                            if (vm.isBusy && !vm.replyInProgress && vm.screen != AppScreen.Home) {
                                 LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter).zIndex(10f))
                             }
                         }
@@ -1495,82 +1505,55 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
     var input by remember { mutableStateOf("") }
-    var historyExpanded by remember { mutableStateOf(false) }
-    var headerBottomPx by remember { mutableIntStateOf(0) }
-    var panelTopPx by remember { mutableIntStateOf(0) }
-    val line = vm.currentLine()
-    val dialogueLine = line ?: vm.live2dReactionLine
-    val lastLine = vm.currentLine() ?: vm.live2dReactionLine ?: vm.lines.lastOrNull()
+    var drawerExpanded by remember { mutableStateOf(false) }
     val density = LocalDensity.current
     val keyboardLift = with(density) {
         (WindowInsets.ime.getBottom(this) - WindowInsets.navigationBars.getBottom(this)).coerceAtLeast(0).toDp()
     }
+    val navigationLift = with(density) {
+        WindowInsets.navigationBars.getBottom(this).toDp()
+    }
+    val currentLine = vm.currentLine() ?: vm.live2dReactionLine
     LaunchedEffect(vm.baseUrl, vm.storyCompleted, vm.screen, input) {
         while (true) {
             delay(30_000)
             vm.checkForegroundProactive(inputActive = input.isNotBlank())
         }
     }
+    LaunchedEffect(currentLine?.id, vm.replyInProgress, vm.normalReplies.size, vm.keyReplies.size) {
+        if (currentLine != null || vm.replyInProgress || vm.normalReplies.isNotEmpty() || vm.keyReplies.isNotEmpty()) {
+            drawerExpanded = true
+        }
+    }
     Box(modifier.fillMaxSize()) {
+        ObservationSceneBackground(
+            sceneRes = observationSceneRes(vm),
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(0f)
+        )
         if (vm.dialogueMediaUrl.isNotBlank()) {
             DialogueCgLayer(
                 mediaUrl = vm.resolveUrl(vm.dialogueMediaUrl),
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(0f)
+                    .zIndex(0.5f)
             )
         }
-
-        if (showStage) {
-            Live2DStage(
-                background = vm.selectedBackground,
-                character = vm.selectedCharacter,
-                emotion = lastLine?.emotion ?: "calm",
-                pose = lastLine?.pose ?: "idle",
-                placement = vm.visiblePlacement(),
-                speechState = vm.live2dSpeechState,
-                line = lastLine,
-                editable = vm.standeeEditMode,
-                onPlacementChange = { vm.updatePlacementDraft(it) },
-                onReaction = { partial ->
-                    vm.requestTouchReaction(partial.hitArea, partial.motion, partial.expression) {
-                        vm.applyLive2DReaction(it)
-                    }
-                },
-                relation = vm.relation,
-                remoteHitAreas = vm.live2dHitAreas,
-                remoteReactions = vm.live2dReactions,
-                touchCooldownRequest = vm.touchCooldownRequest,
-                touchReactionsEnabled = vm.canStartTouchReaction(),
-                tapBridge = tapBridge,
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-
-        Column(
+        ObservationScrim(Modifier.fillMaxSize().zIndex(1f))
+        ObservationTopBar(
+            vm = vm,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 18.dp)
-                .zIndex(5f)
-                .onGloballyPositioned { coordinates ->
-                    headerBottomPx = coordinates.boundsInRoot().bottom.toInt()
-                }
-        ) {
-            HomeHeader(vm = vm, modifier = Modifier.fillMaxWidth())
-            HomeStandeeEditBar(
-                editing = vm.standeeEditMode,
-                onToggle = { vm.togglePlacementEdit() },
-                onReset = { vm.resetPlacement() },
-                modifier = Modifier
-                    .align(Alignment.End)
-                    .padding(top = 8.dp)
-            )
-        }
-
-        HomeInteractionPanel(
+                .padding(start = 22.dp, top = 46.dp, end = 22.dp, bottom = 0.dp)
+                .zIndex(3f)
+        )
+        ObservationMessageDrawer(
             vm = vm,
-            line = dialogueLine,
+            line = currentLine,
+            expanded = drawerExpanded,
+            onExpandedChange = { drawerExpanded = it },
             input = input,
             onInputChange = {
                 input = it
@@ -1580,67 +1563,403 @@ fun HomeScreen(
                 vm.sendUserMessage(input)
                 input = ""
             },
-            onShowHistory = { historyExpanded = true },
+            onPickReply = {
+                input = it.text
+                vm.recordUserActivity()
+            },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(start = 14.dp, top = 12.dp, end = 14.dp, bottom = 12.dp + keyboardLift)
-                .zIndex(5f)
-                .onGloballyPositioned { coordinates ->
-                    panelTopPx = coordinates.boundsInRoot().top.toInt()
-                }
+                .padding(start = 12.dp, end = 12.dp, bottom = 28.dp + navigationLift + keyboardLift)
+                .zIndex(4f)
         )
+    }
+}
 
-        if (vm.standeeEditMode) {
-            StandeeGestureZone(
-                headerBottomPx = headerBottomPx,
-                panelTopPx = panelTopPx,
-                placement = vm.visiblePlacement(),
-                onPlacementChange = { vm.updatePlacementDraft(it) },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(3f)
+fun observationSceneRes(vm: MainViewModel): Int {
+    if (vm.replyInProgress || vm.currentLine() != null) return R.drawable.bg_catgirl_typing
+    val hour = LocalTime.now().hour
+    return when {
+        hour in 22..23 || hour in 0..2 -> R.drawable.bg_catgirl_music
+        hour in 18..21 -> R.drawable.bg_catgirl_gaming
+        hour in 12..17 -> R.drawable.bg_catgirl_reading
+        else -> R.drawable.bg_catgirl_typing
+    }
+}
+
+@Composable
+fun ObservationSceneBackground(sceneRes: Int, modifier: Modifier = Modifier) {
+    Image(
+        painter = painterResource(sceneRes),
+        contentDescription = "观察房间",
+        modifier = modifier,
+        contentScale = ContentScale.Crop
+    )
+}
+
+@Composable
+fun ObservationScrim(modifier: Modifier = Modifier) {
+    Box(
+        modifier.background(
+            Brush.verticalGradient(
+                listOf(
+                    Color(0x99060910),
+                    Color(0x1A060910),
+                    Color(0x22060910),
+                    Color(0xCC060910)
+                )
             )
-        } else {
-            GazeDragZone(
-                enabled = tapBridge != null &&
-                    vm.live2dBootReady &&
-                    vm.selectedCharacter == "neko",
-                onGaze = { normalizedX, normalizedY ->
-                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(1f)
+        )
+    )
+}
+
+@Composable
+fun ObservationTopBar(vm: MainViewModel, modifier: Modifier = Modifier) {
+    var now by remember { mutableStateOf(LocalTime.now()) }
+    val today = LocalDate.now()
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = LocalTime.now()
+            delay(30_000)
+        }
+    }
+    Row(modifier, verticalAlignment = Alignment.Top) {
+        Column(
+            Modifier
+                .weight(1f)
+                .clickable {
+                    vm.screen = AppScreen.Calendar
+                    vm.loadCalendar()
+                }
+        ) {
+            Text(
+                now.format(DateTimeFormatter.ofPattern("HH:mm")),
+                color = Color.White,
+                fontSize = 38.sp,
+                fontWeight = FontWeight.Light
             )
-            CharacterTapZone(
-                enabled = tapBridge != null &&
-                    vm.live2dBootReady &&
-                    vm.selectedCharacter == "neko",
-                headerBottomPx = headerBottomPx,
-                panelTopPx = panelTopPx,
-                onTap = { normalizedX, normalizedY ->
-                    tapBridge?.dispatch(normalizedX, normalizedY)
-                },
-                onGaze = { normalizedX, normalizedY ->
-                    tapBridge?.dispatchGaze(normalizedX, normalizedY)
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .zIndex(3f)
+            Text(
+                today.format(DateTimeFormatter.ofPattern("MM / dd")),
+                color = Color(0xD9FFFFFF),
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium
             )
         }
-
-        if (historyExpanded) {
-            DialogueHistoryOverlay(
-                history = vm.dialogueHistory,
-                characterName = vm.characterName,
-                onDismiss = { historyExpanded = false },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
-                    .zIndex(6f)
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            ObservationIconButton(
+                iconRes = R.drawable.ic_moments_24,
+                contentDescription = "朋友圈",
+                accent = Color(0xFF74E7D7),
+                onClick = {
+                    vm.screen = AppScreen.Moments
+                    vm.loadMoments()
+                }
             )
+            ObservationIconButton(
+                iconRes = R.drawable.ic_nav_settings,
+                contentDescription = "设置",
+                accent = Color(0xFFFFC7D6),
+                onClick = { vm.screen = AppScreen.Settings }
+            )
+        }
+    }
+}
+
+@Composable
+fun ObservationIconButton(
+    iconRes: Int,
+    contentDescription: String,
+    accent: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .size(48.dp)
+            .clickable(onClick = onClick),
+        shape = CircleShape,
+        color = Color(0x6621252E),
+        border = BorderStroke(1.dp, Color(0x55FFFFFF))
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Icon(
+                painter = painterResource(iconRes),
+                contentDescription = contentDescription,
+                tint = Color.White,
+                modifier = Modifier.size(25.dp)
+            )
+            Box(
+                Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(7.dp)
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(accent)
+            )
+        }
+    }
+}
+
+@Composable
+fun ObservationMessageDrawer(
+    vm: MainViewModel,
+    line: DialogueLine?,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    input: String,
+    onInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onPickReply: (ReplyOption) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val quickReplies = if (vm.keyReplies.isNotEmpty()) vm.keyReplies else vm.normalReplies
+    val drawerSizeModifier = if (expanded) {
+        Modifier.fillMaxHeight(0.48f)
+    } else {
+        Modifier.height(if (quickReplies.isNotEmpty()) 138.dp else 96.dp)
+    }
+    Card(
+        modifier = modifier
+            .then(drawerSizeModifier)
+            .pointerInput(expanded) {
+                detectVerticalDragGestures { _, dragAmount ->
+                    when {
+                        dragAmount < -8f -> onExpandedChange(true)
+                        dragAmount > 8f -> onExpandedChange(false)
+                    }
+                }
+            },
+        colors = CardDefaults.cardColors(containerColor = Color(0xD91A1C22)),
+        shape = RoundedCornerShape(28.dp),
+        border = BorderStroke(1.dp, Color(0x33FFFFFF))
+    ) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 9.dp)) {
+            Box(
+                Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .width(42.dp)
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(Color(0x66FFFFFF))
+                    .clickable { onExpandedChange(!expanded) }
+            )
+            if (expanded) {
+                ObservationChatPreview(
+                    vm = vm,
+                    line = line,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(top = 8.dp)
+                )
+            } else if (vm.replyInProgress) {
+                ObservationTypingHint(Modifier.fillMaxWidth().padding(top = 8.dp))
+                Spacer(Modifier.weight(1f))
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+            ObservationInputRow(
+                input = input,
+                onInputChange = onInputChange,
+                onSend = onSend,
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (quickReplies.isNotEmpty()) {
+                QuickReplyFillStrip(
+                    replies = quickReplies,
+                    onPick = onPickReply,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationChatPreview(vm: MainViewModel, line: DialogueLine?, modifier: Modifier = Modifier) {
+    val currentLineIds = vm.lines.mapTo(mutableSetOf()) { it.id }
+    val previousLines = vm.dialogueHistory
+        .filterNot { it.id in currentLineIds }
+        .takeLast(3)
+    val visibleCount = (vm.currentLineIndex + 1).coerceIn(0, vm.lines.size)
+    val replyLines = vm.lines.take(visibleCount)
+    LazyColumn(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 4.dp)
+    ) {
+        items(previousLines, key = { "history_${it.id}" }) { item ->
+            ObservationBubble(text = item.text, mine = false)
+        }
+        if (vm.lastUserMessage.isNotBlank()) {
+            item {
+                ObservationBubble(text = vm.lastUserMessage, mine = true)
+            }
+        }
+        if (vm.replyInProgress && replyLines.isEmpty()) {
+            item {
+                ObservationTypingHint(Modifier.fillMaxWidth())
+            }
+        }
+        items(replyLines, key = { "reply_${it.id}" }) { item ->
+            val canAdvance = item.id == line?.id || vm.live2dReactionLine != null
+            ObservationBubble(
+                text = item.text,
+                mine = false,
+                onClick = if (canAdvance) {
+                    {
+                        if (vm.live2dReactionLine != null) {
+                            vm.clearLive2DReaction()
+                        } else {
+                            vm.advanceLine()
+                        }
+                    }
+                } else {
+                    null
+                }
+            )
+        }
+        if (vm.replyInProgress && replyLines.isNotEmpty()) {
+            item {
+                ObservationTypingHint(Modifier.fillMaxWidth())
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationTypingHint(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = Color(0x331DE8D1),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, Color(0x4459FFE8))
+    ) {
+        Row(
+            Modifier.padding(horizontal = 13.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("她正在回消息", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text("...", color = Color(0xFF74E7D7), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun ObservationBubble(
+    text: String,
+    mine: Boolean,
+    compact: Boolean = false,
+    onClick: (() -> Unit)? = null
+) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(if (mine) 0.78f else 0.86f)
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+            color = if (mine) Color(0xCC1B7C74) else Color(0xD92B2F38),
+            shape = RoundedCornerShape(18.dp),
+            border = BorderStroke(1.dp, if (mine) Color(0x6679FFF0) else Color(0x22FFFFFF))
+        ) {
+            Text(
+                text = text,
+                color = Color.White,
+                fontSize = if (compact) 14.sp else 16.sp,
+                lineHeight = if (compact) 20.sp else 23.sp,
+                overflow = TextOverflow.Clip,
+                modifier = Modifier.padding(horizontal = 13.dp, vertical = 10.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun QuickReplyFillStrip(
+    replies: List<ReplyOption>,
+    onPick: (ReplyOption) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        replies.take(6).forEach { option ->
+            Surface(
+                modifier = Modifier
+                    .height(36.dp)
+                    .clickable { onPick(option) },
+                color = if (option.type == "key") Color(0x99E46A8D) else Color(0x552A303B),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, if (option.type == "key") Color(0x88FFD0DC) else Color(0x33FFFFFF))
+            ) {
+                Text(
+                    option.text,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ObservationInputRow(
+    input: String,
+    onInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        Surface(
+            modifier = Modifier.size(52.dp),
+            color = Color(0x552F3540),
+            shape = CircleShape,
+            border = BorderStroke(1.dp, Color(0x33FFFFFF))
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_mic_24),
+                    contentDescription = "语音输入",
+                    tint = Color(0xAAFFFFFF),
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+        OutlinedTextField(
+            value = input,
+            onValueChange = onInputChange,
+            placeholder = {
+                Text("说点什么...", color = Color(0xAAFFFFFF))
+            },
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 54.dp),
+            textStyle = TextStyle(color = Color.White, fontSize = 16.sp),
+            maxLines = 2,
+            shape = RoundedCornerShape(22.dp)
+        )
+        Surface(
+            modifier = Modifier
+                .size(52.dp)
+                .clickable(enabled = input.isNotBlank()) { onSend() },
+            color = if (input.isBlank()) Color(0x55434854) else Color(0xFFE46A8D),
+            shape = CircleShape
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_send_24),
+                    contentDescription = "发送",
+                    tint = Color.White,
+                    modifier = Modifier.size(23.dp)
+                )
+            }
         }
     }
 }
