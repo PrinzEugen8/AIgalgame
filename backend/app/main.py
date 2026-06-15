@@ -287,6 +287,7 @@ def _user_to_out(user: User) -> dict[str, Any]:
         "sleep_end": user.sleep_end,
         "interest_topics": load_json(user.interest_topics_json, []),
         "profile": load_json(user.profile_json, {}),
+        "active_character_id": user.active_character_id,
         "proactive_daily_limit": user.proactive_daily_limit,
         "proactive_next_check_at": user.proactive_next_check_at,
         "proactive_judgement": load_json(user.proactive_judgement_json, {}),
@@ -482,10 +483,31 @@ def _ensure_relation(session: Session, user_id: str, character_id: str = DEFAULT
     return relation
 
 
+def _resolve_active_character(
+    session: Session,
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+    persist: bool = False,
+) -> str:
+    requested = str(character_id or "").strip()
+    user = session.get(User, user_id)
+    candidate = requested or (user.active_character_id if user is not None else "") or DEFAULT_CHARACTER_ID
+    resolved = ensure_seed(session, user_id=user_id, character_id=candidate)
+    user = session.get(User, user_id)
+    if user is not None and (persist or requested or not user.active_character_id) and user.active_character_id != resolved:
+        user.active_character_id = resolved
+        user.updated_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        session.commit()
+    return resolved
+
+
 def _update_user_fields(user: User, payload: dict[str, Any]) -> None:
     for field in ("display_name", "timezone", "sleep_start", "sleep_end"):
         if field in payload:
             setattr(user, field, str(payload.get(field) or "").strip())
+    if "active_character_id" in payload:
+        user.active_character_id = str(payload.get("active_character_id") or "").strip()
     if "proactive_daily_limit" in payload:
         user.proactive_daily_limit = str(payload.get("proactive_daily_limit") or "unlimited").strip() or "unlimited"
     for field in ("notifications_enabled", "widget_bubbles_enabled", "news_enabled", "tts_enabled", "story_completed"):
@@ -533,7 +555,11 @@ def admin_create_user(payload: dict[str, Any], session: Session = Depends(get_se
     _update_user_fields(user, payload)
     session.add(user)
     session.commit()
-    ensure_seed(session, user_id=user_id, character_id=str(payload.get("character_id") or DEFAULT_CHARACTER_ID))
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(payload.get("character_id") or ""), persist=True)
+    created = session.get(User, user_id)
+    if created is not None:
+        created.active_character_id = character_id
+        session.commit()
     return _user_to_out(session.get(User, user_id))
 
 
@@ -569,9 +595,9 @@ def admin_delete_user(user_id: str, session: Session = Depends(get_session)) -> 
 
 @app.put("/api/admin/users/{user_id}/relation")
 def admin_update_relation(user_id: str, payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
-    character_id = str(payload.get("character_id") or DEFAULT_CHARACTER_ID)
     if session.get(User, user_id) is None:
         raise HTTPException(status_code=404, detail="user not found")
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(payload.get("character_id") or ""), persist=True)
     relation = _ensure_relation(session, user_id, character_id)
     for field in ("affection", "trust", "dependency"):
         if field in payload:
@@ -1092,11 +1118,11 @@ def update_character(character_id: str, payload: CharacterAdminIn, session: Sess
 @app.get("/api/bootstrap")
 def bootstrap(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     user = session.get(User, user_id)
     character = session.get(Character, character_id)
     relation = session.execute(
@@ -1141,11 +1167,11 @@ def bootstrap(
 @app.get("/api/live2d/config")
 def live2d_config(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     live2d = live2d_bootstrap_payload(session, appearance_id=appearance_id)
     live2d["touch_pool_version"] = touch_pool_version(
         session,
@@ -1159,11 +1185,11 @@ def live2d_config(
 @app.get("/api/live2d/touch/bundle")
 def live2d_touch_bundle(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     appearance_id: str = DEFAULT_LIVE2D_APPEARANCE_ID,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     ensure_default_hit_areas(session, appearance_id=appearance_id)
     session.commit()
     try:
@@ -1181,10 +1207,9 @@ def live2d_touch_bundle(
 def live2d_touch(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
-    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(body.get("character_id") or ""))
     appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
     hit_area = str(body.get("hit_area") or "")
-    ensure_seed(session, user_id=user_id, character_id=character_id)
     try:
         return consume_touch_reaction(
             session,
@@ -1211,9 +1236,8 @@ def live2d_touch_refresh(
 ) -> dict[str, Any]:
     body = payload or {}
     user_id = str(body.get("user_id") or DEFAULT_USER_ID)
-    character_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(body.get("character_id") or ""))
     appearance_id = str(body.get("appearance_id") or body.get("live2d_appearance_id") or DEFAULT_LIVE2D_APPEARANCE_ID)
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     hit_area = str(body.get("hit_area") or "")
     force = bool(body.get("force"))
     tts_only = bool(body.get("tts_only"))
@@ -1429,7 +1453,7 @@ def provider_models(provider_id: str, session: Session = Depends(get_session)) -
 @app.post("/api/events")
 def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
-        character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+        character_id = _resolve_active_character(session, user_id=event.user_id, character_id=event.character_id)
         event = event.model_copy(update={"character_id": character_id})
         result = handle_event(session, event)
         write_diagnostic("event_ok", event_type=event.event_type, session_id=event.session_id, result_type=result.event_type)
@@ -1546,11 +1570,11 @@ def weather_refresh(
 @app.get("/api/proactive/pending")
 def proactive_pending(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     local_time: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     return pending_proactive_response(
         session,
         user_id=user_id,
@@ -1671,15 +1695,15 @@ def proactive_consume(event_id: str, session: Session = Depends(get_session)) ->
 def opening_prepare(
     payload: dict[str, Any] | None = None,
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
     body = payload or {}
-    body_character_id = ensure_seed(session, user_id=str(body.get("user_id") or user_id), character_id=str(body.get("character_id") or character_id))
+    body_user_id = str(body.get("user_id") or user_id)
+    body_character_id = _resolve_active_character(session, user_id=body_user_id, character_id=str(body.get("character_id") or character_id))
     return prepare_opening(
         session,
-        user_id=str(body.get("user_id") or user_id),
+        user_id=body_user_id,
         character_id=body_character_id,
         local_time=_parse_client_time(str(body.get("local_time") or "")),
         proactive_event_id=str(body.get("proactive_event_id") or ""),
@@ -1690,13 +1714,13 @@ def opening_prepare(
 @app.get("/api/opening/ready")
 def opening_ready(
     user_id: str = DEFAULT_USER_ID,
-    character_id: str = DEFAULT_CHARACTER_ID,
+    character_id: str = "",
     session_id: str = "android",
     local_time: str = "",
     proactive_event_id: str = "",
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     result = consume_ready_opening(
         session,
         user_id=user_id,
@@ -1721,7 +1745,7 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
             event = EventIn(**payload, user_id=payload.get("user_id") or user_id)
             with next(get_session()) as session:
                 try:
-                    character_id = ensure_seed(session, user_id=event.user_id, character_id=event.character_id)
+                    character_id = _resolve_active_character(session, user_id=event.user_id, character_id=event.character_id)
                     event = event.model_copy(update={"character_id": character_id})
                     result = handle_event(session, event)
                     await websocket.send_json(result.model_dump())
@@ -1741,8 +1765,8 @@ async def app_ws(websocket: WebSocket, user_id: str = DEFAULT_USER_ID, device_id
 
 
 @app.get("/api/state/home")
-def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+def home_state(user_id: str = DEFAULT_USER_ID, character_id: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     ensure_schedule(session, user_id=user_id, character_id=character_id, day=datetime.now())
     relation = session.execute(
         select(RelationState).where(RelationState.user_id == user_id, RelationState.character_id == character_id)
@@ -1909,8 +1933,8 @@ def comment_moment(moment_id: str, payload: dict[str, Any], user_id: str = DEFAU
 
 
 @app.get("/api/calendar")
-def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = DEFAULT_CHARACTER_ID, session: Session = Depends(get_session)) -> dict[str, Any]:
-    character_id = ensure_seed(session, user_id=user_id, character_id=character_id)
+def calendar(month: str = "", user_id: str = DEFAULT_USER_ID, character_id: str = "", session: Session = Depends(get_session)) -> dict[str, Any]:
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
     day = datetime.now()
     prefix = month or day.strftime("%Y-%m")
     items = calendar_items(session, user_id=user_id, character_id=character_id, month=prefix)

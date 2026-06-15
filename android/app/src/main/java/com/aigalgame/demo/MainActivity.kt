@@ -219,6 +219,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var foregroundCheckInFlight = false
     private val touchTtsCache = TouchTtsCache(application)
     private var cachedTouchTier = ""
+    private var pendingCharacterOverride = false
 
     var baseUrl by mutableStateOf("")
         private set
@@ -236,7 +237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var lastUserMessage by mutableStateOf("")
         private set
     var selectedCharacter by mutableStateOf("neko")
-    var activeCharacterId by mutableStateOf("atri")
+    var activeCharacterId by mutableStateOf("")
     var characterName by mutableStateOf("角色")
     var selectedBackground by mutableStateOf("classroom")
     var previewEmotion by mutableStateOf("calm")
@@ -288,6 +289,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     syncLocation()
                     registerPushTokenIfAvailable()
                     val ui = settings.uiSettings.first()
+                    selectedCharacter = ui.selectedCharacter
+                    activeCharacterId = ui.activeCharacterId
                     val syncState = settings.readLive2dSyncState()
                     val needsLive2dRefresh = syncState.configVersion.isBlank() ||
                         syncState.appearanceId != ui.selectedCharacter
@@ -304,6 +307,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.uiSettings.collect { saved ->
                 selectedCharacter = saved.selectedCharacter
+                activeCharacterId = saved.activeCharacterId
                 selectedBackground = saved.selectedBackground
                 previewEmotion = saved.previewEmotion
                 ttsEnabled = saved.ttsEnabled
@@ -488,11 +492,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         launchBusy {
             try {
                 val boot = client.bootstrap(
-                    characterId = activeCharacterId,
+                    characterId = if (pendingCharacterOverride) activeCharacterId else "",
                     appearanceId = selectedCharacter,
                 )
                 val characterJson = boot.optObject("character")
-                activeCharacterId = characterJson.optString("character_id", activeCharacterId).ifBlank { activeCharacterId }
+                val resolvedCharacterId = characterJson.optString("character_id", activeCharacterId).ifBlank { activeCharacterId }
+                activeCharacterId = resolvedCharacterId
+                if (resolvedCharacterId.isNotBlank()) {
+                    settings.saveActiveCharacterId(resolvedCharacterId)
+                }
                 characterName = characterJson.optString("name", characterName).ifBlank { activeCharacterId }
                 val rel = boot.optObject("relation")
                 relation = RelationState(
@@ -507,6 +515,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 touchPoolVersion = live2d.optString("touch_pool_version")
                 applyLive2dBootstrap(live2d)
                 settings.saveLive2dSyncState(selectedCharacter, live2dConfigVersion)
+                pendingCharacterOverride = false
                 bootstrappedBaseUrl = urlKey
                 syncLocation()
                 if (storyCompleted) {
@@ -581,7 +590,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 client.consumeProactive(eventId)
             } catch (_: Exception) {
             }
-            applyIncomingDialogue(client.openingReady(eventId))
+            applyIncomingDialogue(client.openingReady(eventId, characterId = activeCharacterId))
             appOpenedBaseUrl = baseUrl
         }
         if (inReplyWaiting || (dialogueEventInFlight && !awaitingUserReplyResponse)) {
@@ -608,9 +617,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         pendingOpenAfterBoot = false
         launchDialogueEvent {
             if (storyCompleted) {
-                applyEvent(client.openingReady())
+                applyEvent(client.openingReady(characterId = activeCharacterId))
             } else {
-                applyEvent(client.postEvent("app_opened", storyIndex = storyIndex))
+                applyEvent(client.postEvent("app_opened", storyIndex = storyIndex, characterId = activeCharacterId))
             }
             appOpenedBaseUrl = urlKey
         }
@@ -657,7 +666,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lastUserMessage = option.text
         launchDialogueEvent(awaitingReply = true) {
             val type = if (option.type == "key") "option_selected" else "user_message"
-            applyEvent(client.postEvent(type, text = option.text, replyId = option.id, storyIndex = storyIndex))
+            applyEvent(client.postEvent(type, text = option.text, replyId = option.id, storyIndex = storyIndex, characterId = activeCharacterId))
         }
     }
 
@@ -668,7 +677,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         lastUserMessage = trimmed
         launchDialogueEvent(awaitingReply = true) {
-            applyEvent(client.postEvent("user_message", text = trimmed))
+            applyEvent(client.postEvent("user_message", text = trimmed, characterId = activeCharacterId))
         }
     }
 
@@ -864,7 +873,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun loadCalendar(month: String = "") {
         val client = api ?: return
         launchBusy {
-            val rows = client.calendar(month).optArray("days")
+            val rows = client.calendar(month, characterId = activeCharacterId).optArray("days")
             calendar.clear()
             for (i in 0 until rows.length()) {
                 val item = rows.optJSONObject(i) ?: continue
@@ -887,8 +896,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun chooseCharacter(value: String) {
         selectedCharacter = value
+        val nextActiveCharacterId = activeCharacterForAppearance(value, activeCharacterId)
+        val shouldOverrideCharacter = nextActiveCharacterId.isNotBlank() && nextActiveCharacterId != activeCharacterId
+        if (shouldOverrideCharacter) {
+            activeCharacterId = nextActiveCharacterId
+            pendingCharacterOverride = true
+            bootstrappedBaseUrl = ""
+        }
         viewModelScope.launch {
-            settings.saveSelectedCharacter(value)
+            if (nextActiveCharacterId.isNotBlank()) {
+                settings.saveCharacterSelection(value, nextActiveCharacterId)
+            } else {
+                settings.saveSelectedCharacter(value)
+            }
             api?.let { client ->
                 refreshBootstrap(openAfterBootstrap = false, force = true)
                 maybeRefreshTouchAssets(client, force = true)
@@ -1186,6 +1206,14 @@ fun defaultOutfitPlacement(character: String): OutfitPlacement {
         "neko" -> OutfitPlacement(scale = 1.10f, offsetY = -10f, bottomInset = 30f)
         "murasame" -> OutfitPlacement(scale = 1.08f, offsetY = -6f, bottomInset = 42f)
         else -> OutfitPlacement(scale = 1.14f, offsetY = -12f, bottomInset = 34f)
+    }
+}
+
+fun activeCharacterForAppearance(appearanceId: String, currentCharacterId: String): String {
+    return when (appearanceId) {
+        "atri" -> "atri"
+        "murasame" -> "miyu"
+        else -> currentCharacterId
     }
 }
 

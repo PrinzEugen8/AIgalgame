@@ -18,6 +18,7 @@ class SettingsStore(private val context: Context) {
     private object Keys {
         val ServerAddress = stringPreferencesKey("server_address")
         val SelectedCharacter = stringPreferencesKey("selected_character")
+        val ActiveCharacterId = stringPreferencesKey("active_character_id")
         val SelectedBackground = stringPreferencesKey("selected_background")
         val PreviewEmotion = stringPreferencesKey("preview_emotion")
         val TtsEnabled = booleanPreferencesKey("tts_enabled")
@@ -34,6 +35,7 @@ class SettingsStore(private val context: Context) {
     val uiSettings: Flow<LocalUiSettings> = context.settingsDataStore.data.map { prefs ->
         LocalUiSettings(
             selectedCharacter = prefs[Keys.SelectedCharacter] ?: "neko",
+            activeCharacterId = prefs[Keys.ActiveCharacterId] ?: "",
             selectedBackground = prefs[Keys.SelectedBackground] ?: "classroom",
             previewEmotion = prefs[Keys.PreviewEmotion] ?: "calm",
             ttsEnabled = prefs[Keys.TtsEnabled] ?: true,
@@ -54,6 +56,19 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveSelectedCharacter(value: String) {
         context.settingsDataStore.edit { prefs -> prefs[Keys.SelectedCharacter] = value }
+    }
+
+    suspend fun saveActiveCharacterId(value: String) {
+        context.settingsDataStore.edit { prefs -> prefs[Keys.ActiveCharacterId] = value }
+    }
+
+    suspend fun saveCharacterSelection(selectedCharacter: String, activeCharacterId: String) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.SelectedCharacter] = selectedCharacter
+            if (activeCharacterId.isNotBlank()) {
+                prefs[Keys.ActiveCharacterId] = activeCharacterId
+            }
+        }
     }
 
     suspend fun saveSelectedBackground(value: String) {
@@ -128,6 +143,7 @@ data class Live2dSyncState(
 
 data class LocalUiSettings(
     val selectedCharacter: String,
+    val activeCharacterId: String,
     val selectedBackground: String,
     val previewEmotion: String,
     val ttsEnabled: Boolean,

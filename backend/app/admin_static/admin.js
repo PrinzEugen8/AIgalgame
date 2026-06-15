@@ -660,10 +660,15 @@ function activeUserRelations() {
 }
 
 function syncActiveUserCharacter(preferredId = state.activeUserCharacterId) {
+  const user = activeUser();
   const fallback = defaultCharacterId();
   const relations = activeUserRelations();
   if (preferredId && relations.some((item) => item.character_id === preferredId)) {
     state.activeUserCharacterId = preferredId;
+    return state.activeUserCharacterId;
+  }
+  if (user?.active_character_id && (relations.length === 0 || relations.some((item) => item.character_id === user.active_character_id))) {
+    state.activeUserCharacterId = user.active_character_id;
     return state.activeUserCharacterId;
   }
   state.activeUserCharacterId = relations.find((item) => item.character_id === fallback)?.character_id

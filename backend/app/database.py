@@ -60,6 +60,8 @@ def _upgrade_sqlite_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN proactive_judgement_json TEXT DEFAULT '{}'"))
             if "profile_json" not in columns:
                 conn.execute(text("ALTER TABLE users ADD COLUMN profile_json TEXT DEFAULT '{}'"))
+            if "active_character_id" not in columns:
+                conn.execute(text("ALTER TABLE users ADD COLUMN active_character_id VARCHAR DEFAULT ''"))
         if "moment_interactions" in table_names:
             columns = {item["name"] for item in inspector.get_columns("moment_interactions")}
             if "actor_name" not in columns:

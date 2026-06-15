@@ -104,12 +104,43 @@ def test_appearance_id_does_not_create_character() -> None:
         assert session.get(Character, "murasame") is None
 
 
+def test_user_active_character_drives_bootstrap_when_character_is_omitted() -> None:
+    user_id = f"active_character_{uid('test')}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        atri = session.get(Character, "atri")
+        assert atri is not None
+        if session.get(Character, "miyu") is None:
+            session.add(
+                Character(
+                    character_id="miyu",
+                    name="小鸟游弥柚",
+                    persona_prompt=atri.persona_prompt,
+                    persona_card_json=atri.persona_card_json,
+                    speech_style=atri.speech_style,
+                    relationship_boundary=atri.relationship_boundary,
+                )
+            )
+            session.commit()
+
+    relation = client.put(f"/api/admin/users/{user_id}/relation", json={"character_id": "miyu", "affection": 234}).json()
+    assert relation["character_id"] == "miyu"
+    users_page = client.get(f"/api/admin/users?q={user_id}&page=1&page_size=5").json()
+    user = next(item for item in users_page["items"] if item["user_id"] == user_id)
+    assert user["active_character_id"] == "miyu"
+
+    boot = client.get("/api/bootstrap", params={"user_id": user_id, "appearance_id": "neko"}).json()
+    assert boot["character"]["character_id"] == "miyu"
+    assert boot["relation"]["affection"] == 234
+
+
 def test_schema_has_persona_profile_and_vector_columns() -> None:
     with SessionLocal() as session:
         def columns(table: str) -> set[str]:
             return {str(row[1]) for row in session.connection().exec_driver_sql(f"PRAGMA table_info({table})").all()}
 
         assert "profile_json" in columns("users")
+        assert "active_character_id" in columns("users")
         assert "persona_card_json" in columns("characters")
         memory_columns = columns("memories")
         assert {"tags_json", "metadata_json", "vector_status", "vector_updated_at"}.issubset(memory_columns)

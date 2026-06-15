@@ -97,7 +97,7 @@ class EventIn(BaseModel):
     event_type: str
     event_id: str | None = None
     user_id: str = "demo_user"
-    character_id: str = "atri"
+    character_id: str = ""
     session_id: str = "default"
     payload: dict[str, Any] = Field(default_factory=dict)
     client_context: dict[str, Any] = Field(default_factory=dict)

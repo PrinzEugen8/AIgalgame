@@ -41,21 +41,22 @@ class ApiClient(private val baseUrl: String) {
     }
 
     suspend fun health(): JSONObject = get("/api/health")
-    suspend fun bootstrap(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
-        return get("/api/bootstrap?character_id=$characterId&appearance_id=$appearanceId")
+    suspend fun bootstrap(characterId: String = "", appearanceId: String = "neko"): JSONObject {
+        return get("/api/bootstrap?${queryString(characterId, "appearance_id" to appearanceId)}")
     }
 
-    suspend fun fetchLive2dConfig(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
-        return get("/api/live2d/config?character_id=$characterId&appearance_id=$appearanceId")
+    suspend fun fetchLive2dConfig(characterId: String = "", appearanceId: String = "neko"): JSONObject {
+        return get("/api/live2d/config?${queryString(characterId, "appearance_id" to appearanceId)}")
     }
     suspend fun homeState(): JSONObject = get("/api/state/home")
     suspend fun moments(): JSONObject = get("/api/moments")
-    suspend fun calendar(month: String = ""): JSONObject {
-        return if (month.isBlank()) get("/api/calendar") else get("/api/calendar?month=$month")
+    suspend fun calendar(month: String = "", characterId: String = ""): JSONObject {
+        val query = queryString(characterId, *listOfNotNull(if (month.isBlank()) null else "month" to month).toTypedArray())
+        return if (query.isBlank()) get("/api/calendar") else get("/api/calendar?$query")
     }
     suspend fun journal(): JSONObject = get("/api/journal")
     suspend fun widgetState(): JSONObject = get("/api/widget/state")
-    suspend fun proactivePending(): JSONObject = get("/api/proactive/pending?local_time=${encodedLocalTime()}")
+    suspend fun proactivePending(characterId: String = ""): JSONObject = get("/api/proactive/pending?${queryString(characterId, "local_time" to OffsetDateTime.now().toString())}")
     suspend fun registerDevice(deviceId: String, pushToken: String, notificationsEnabled: Boolean): JSONObject {
         val body = JSONObject()
             .put("device_id", deviceId)
@@ -107,7 +108,7 @@ class ApiClient(private val baseUrl: String) {
 
     suspend fun fetchTouchReaction(
         hitArea: String,
-        characterId: String = "atri",
+        characterId: String = "",
         appearanceId: String = "neko",
     ): JSONObject {
         return post(
@@ -124,7 +125,7 @@ class ApiClient(private val baseUrl: String) {
         hitArea: String = "",
         force: Boolean = false,
         ttsOnly: Boolean = false,
-        characterId: String = "atri",
+        characterId: String = "",
         appearanceId: String = "neko",
     ): JSONObject {
         return post(
@@ -139,8 +140,8 @@ class ApiClient(private val baseUrl: String) {
         )
     }
 
-    suspend fun fetchTouchBundle(characterId: String = "atri", appearanceId: String = "neko"): JSONObject {
-        return get("/api/live2d/touch/bundle?character_id=$characterId&appearance_id=$appearanceId")
+    suspend fun fetchTouchBundle(characterId: String = "", appearanceId: String = "neko"): JSONObject {
+        return get("/api/live2d/touch/bundle?${queryString(characterId, "appearance_id" to appearanceId)}")
     }
 
     suspend fun updateLocation(latitude: Double, longitude: Double, accuracyM: Float, provider: String): JSONObject {
@@ -154,12 +155,12 @@ class ApiClient(private val baseUrl: String) {
         return post("/api/location", body)
     }
 
-    suspend fun openingReady(proactiveEventId: String = ""): JSONObject {
+    suspend fun openingReady(proactiveEventId: String = "", characterId: String = ""): JSONObject {
         val suffix = if (proactiveEventId.isBlank()) "" else "&proactive_event_id=${encode(proactiveEventId)}"
-        return get("/api/opening/ready?session_id=android&local_time=${encodedLocalTime()}$suffix")
+        return get("/api/opening/ready?${queryString(characterId, "session_id" to "android", "local_time" to OffsetDateTime.now().toString())}$suffix")
     }
 
-    suspend fun postEvent(type: String, text: String = "", replyId: String = "", storyIndex: Int = 0, proactiveEventId: String = ""): JSONObject {
+    suspend fun postEvent(type: String, text: String = "", replyId: String = "", storyIndex: Int = 0, proactiveEventId: String = "", characterId: String = ""): JSONObject {
         val payload = JSONObject()
         if (text.isNotBlank()) payload.put("text", text)
         if (replyId.isNotBlank()) payload.put("reply_id", replyId)
@@ -170,16 +171,18 @@ class ApiClient(private val baseUrl: String) {
             .put("session_id", "android")
             .put("payload", payload)
             .put("client_context", JSONObject().put("app_state", "foreground").put("local_time", OffsetDateTime.now().toString()))
+        if (characterId.isNotBlank()) body.put("character_id", characterId)
         return post("/api/events", body)
     }
 
     suspend fun markProactiveDelivered(eventId: String): JSONObject = post("/api/proactive/$eventId/delivered", JSONObject())
     suspend fun consumeProactive(eventId: String): JSONObject = post("/api/proactive/$eventId/consume", JSONObject())
-    suspend fun prepareOpening(proactiveEventId: String = ""): JSONObject {
+    suspend fun prepareOpening(proactiveEventId: String = "", characterId: String = ""): JSONObject {
         val body = JSONObject()
             .put("local_time", OffsetDateTime.now().toString())
             .put("allow_llm", proactiveEventId.isNotBlank())
         if (proactiveEventId.isNotBlank()) body.put("proactive_event_id", proactiveEventId)
+        if (characterId.isNotBlank()) body.put("character_id", characterId)
         return post("/api/opening/prepare", body)
     }
 
@@ -199,6 +202,17 @@ class ApiClient(private val baseUrl: String) {
 
     private fun encode(value: String): String {
         return URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+    }
+
+    private fun queryString(characterId: String = "", vararg params: Pair<String, String>): String {
+        val items = mutableListOf<String>()
+        if (characterId.isNotBlank()) {
+            items.add("character_id=${encode(characterId)}")
+        }
+        params.forEach { (key, value) ->
+            items.add("${encode(key)}=${encode(value)}")
+        }
+        return items.joinToString("&")
     }
 
     private suspend fun request(method: String, path: String, json: JSONObject?): JSONObject = withContext(Dispatchers.IO) {
