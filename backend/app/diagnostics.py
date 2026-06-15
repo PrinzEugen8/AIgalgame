@@ -237,7 +237,7 @@ def _status_for_point(item: dict[str, Any]) -> str:
     event = str(item.get("event") or "").lower()
     if any(part in event for part in ("error", "failed", "fail")):
         return "error"
-    if any(part in event for part in ("skipped", "rejected", "blocked")):
+    if any(part in event for part in ("rejected", "blocked")):
         return "warn"
     return "ok"
 

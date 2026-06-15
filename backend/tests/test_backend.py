@@ -228,6 +228,18 @@ def test_admin_runtime_logs_route_filters() -> None:
     assert "过滤模块" in payload["features"]
 
 
+def test_runtime_logs_treat_expected_skips_as_ok() -> None:
+    _clear_diagnostics()
+    write_diagnostic("proactive_judge_skipped", feature="开场预热", reason="no_due_event", user_id="demo_user")
+    write_diagnostic("tts_translate_rejected", feature="TTS", reason="invalid_language")
+
+    payload = runtime_logs(limit=20)
+    skipped = next(item for item in payload["items"] if item["event"] == "proactive_judge_skipped")
+    rejected = next(item for item in payload["items"] if item["event"] == "tts_translate_rejected")
+    assert skipped["status"] == "ok"
+    assert rejected["status"] == "warn"
+
+
 def test_runtime_logs_legacy_cache_before_and_flow() -> None:
     _clear_diagnostics()
     _append_diagnostic_raw({"ts": 1000.0, "event": "legacy_old", "summary": "older legacy"})

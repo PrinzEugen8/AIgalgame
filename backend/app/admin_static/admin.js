@@ -1468,7 +1468,7 @@ function runtimeStatusLabel(item) {
   if (item.stale || item.status === "stale") return "可能中断";
   if (item.running || item.status === "running") return "运行中";
   if (item.status === "error") return "错误";
-  if (item.status === "warn") return "提醒";
+  if (item.status === "warn") return "注意";
   return "成功";
 }
 
