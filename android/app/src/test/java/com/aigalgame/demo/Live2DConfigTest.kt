@@ -87,6 +87,8 @@ class Live2DConfigTest {
         assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_reading.png").exists())
         assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_gaming.png").exists())
         assertTrue(File("src/main/res/drawable-nodpi/bg_catgirl_music.png").exists())
+        assertTrue(mainKt.contains("line != null && vm.ttsEnabled && url.isNotBlank()"))
+        assertFalse(mainKt.contains("vm.live2dBootReady && vm.ttsEnabled && url.isNotBlank()"))
         assertFalse(mainKt.contains("stageOnPrimaryScreens"))
         assertTrue(mainKt.contains("Live2DStage("))
         assertTrue(mainKt.contains(".zIndex(1f)"))

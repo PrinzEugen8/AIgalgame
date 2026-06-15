@@ -1319,9 +1319,9 @@ fun AudioLinePlayer(vm: MainViewModel) {
             .build()
     }
     val line = vm.playableLine()
-    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dBootReady, vm.live2dReactionLine?.id) {
+    LaunchedEffect(line?.id, line?.ttsUrl, vm.ttsEnabled, vm.live2dReactionLine?.id) {
         val url = line?.ttsUrl.orEmpty()
-        if (vm.live2dBootReady && vm.ttsEnabled && url.isNotBlank()) {
+        if (line != null && vm.ttsEnabled && url.isNotBlank()) {
             val playUrl = if (url.startsWith("file://") || url.startsWith("content://")) {
                 url
             } else {
