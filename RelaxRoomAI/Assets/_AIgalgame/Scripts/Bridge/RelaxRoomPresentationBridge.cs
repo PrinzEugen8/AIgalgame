@@ -69,6 +69,7 @@ namespace AIgalgame.Motion
         private bool readySent;
         private bool roomReadySent;
         private bool environmentReadySent;
+        private bool pendingAmbientAudio;
 
         public void SetTargets(
             AIGalgameChatdollController targetController,
@@ -110,6 +111,7 @@ namespace AIgalgame.Motion
                 touchController.TouchFinished += OnTouchFinished;
             }
 
+            AIGalgameStartupDiagnostics.Log("bridge_set_targets_end");
             SendRoomReady();
         }
 
@@ -265,6 +267,7 @@ namespace AIgalgame.Motion
 
         private void ApplyConfigure(BridgeEnvelope envelope)
         {
+            AIGalgameStartupDiagnostics.Log("configure_received");
             backendBaseUrl = FirstNonEmpty(envelope.backend_base_url, defaultBackendBaseUrl);
             defaultUserId = FirstNonEmpty(envelope.user_id, defaultUserId);
             defaultCharacterId = FirstNonEmpty(envelope.character_id, defaultCharacterId);
@@ -272,7 +275,7 @@ namespace AIgalgame.Motion
             defaultAppearanceId = FirstNonEmpty(envelope.appearance_id, defaultAppearanceId);
             touchController?.ConfigureBackend(backendBaseUrl, defaultUserId, defaultCharacterId, defaultAppearanceId);
 #if RELAXROOM_RN
-            motionDirector?.StartAmbientAudio();
+            pendingAmbientAudio = true;
 #endif
             SendRoomReady();
         }
@@ -372,6 +375,29 @@ namespace AIgalgame.Motion
         {
             yield return null;
             AIGalgameStartupDiagnostics.Log("first_frame");
+            yield return null;
+            AIGalgameStartupDiagnostics.Log("stable_frame");
+
+            var elapsedMs = Mathf.RoundToInt(AIGalgameStartupDiagnostics.ElapsedSeconds * 1000f);
+            Emit(new BridgeEvent
+            {
+                evt = "stable_frame",
+                state = elapsedMs.ToString()
+            });
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            asrController?.PrepareRecognizerAfterStartup();
+#endif
+
+#if RELAXROOM_RN
+            if (pendingAmbientAudio)
+            {
+                pendingAmbientAudio = false;
+                motionDirector?.StartAmbientAudio();
+                AIGalgameStartupDiagnostics.Log("configure_ambient_audio_started");
+            }
+#endif
+
             AIGalgameStartupDiagnostics.SendTimelineSummary();
         }
 

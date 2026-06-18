@@ -35,13 +35,14 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            AIGalgameStartupDiagnostics.Log($"bootstrap_begin scene={scene.name}");
+            AIGalgameStartupDiagnostics.Log("bootstrap_begin", $"scene={scene.name}");
 
             if (AIGalgameRelaxRoomMobileRenderOptimizer.ShouldApply())
             {
                 AIGalgameRelaxRoomMobileRenderOptimizer.Apply();
             }
 
+            AIGalgameStartupDiagnostics.Log("character_search_begin");
             var animator = FindCharacterAnimator();
             if (animator == null)
             {
@@ -51,6 +52,7 @@ namespace AIgalgame.Motion
             if (animator == null)
             {
                 Debug.LogWarning($"AIgalgame RelaxRoom UI did not find a humanoid Animator in scene '{scene.name}'.");
+                AIGalgameStartupDiagnostics.Log("character_search_failed", $"scene={scene.name}");
                 return;
             }
 
@@ -63,6 +65,22 @@ namespace AIgalgame.Motion
             }
 
             player.SetAnimator(animator);
+            AIGalgameStartupDiagnostics.Log("motion_player_ready");
+
+            var phoneAttachment = animator.GetComponent<AIGalgameRelaxRoomPhoneAttachmentController>();
+            if (phoneAttachment == null)
+            {
+                phoneAttachment = animator.gameObject.AddComponent<AIGalgameRelaxRoomPhoneAttachmentController>();
+            }
+            phoneAttachment.SetAnimator(animator);
+
+            var phonePickup = animator.GetComponent<AIGalgameRelaxRoomPhonePickupController>();
+            if (phonePickup == null)
+            {
+                phonePickup = animator.gameObject.AddComponent<AIGalgameRelaxRoomPhonePickupController>();
+            }
+            phonePickup.SetTargets(animator, player, phoneAttachment);
+            AIGalgameStartupDiagnostics.Log("phone_pickup_ready");
 
             var director = animator.GetComponent<AIGalgameRelaxRoomMotionDirector>();
             if (director == null)
@@ -70,6 +88,7 @@ namespace AIgalgame.Motion
                 director = animator.gameObject.AddComponent<AIGalgameRelaxRoomMotionDirector>();
             }
             director.SetTargets(animator, player);
+            AIGalgameStartupDiagnostics.Log("motion_director_ready");
 
             var controller = animator.GetComponent<AIGalgameChatdollController>();
             if (controller == null)
@@ -85,6 +104,7 @@ namespace AIgalgame.Motion
 
             var vrm = animator.GetComponent<Vrm10Instance>() ?? animator.GetComponentInChildren<Vrm10Instance>() ?? animator.GetComponentInParent<Vrm10Instance>();
             controller.SetTargets(vrm, player, animator, audioSource, director);
+            AIGalgameStartupDiagnostics.Log("chatdoll_controller_ready");
 
             var touch = animator.GetComponent<AIGalgameRelaxRoomTouchController>();
             if (touch == null)
@@ -92,30 +112,7 @@ namespace AIgalgame.Motion
                 touch = animator.gameObject.AddComponent<AIGalgameRelaxRoomTouchController>();
             }
             touch.SetTargets(controller, director, animator, audioSource);
-
-            var motionUi = Object.FindFirstObjectByType<AIGalgameMotionTestUI>();
-            if (motionUi != null)
-            {
-                motionUi.SetPlayer(player);
-                motionUi.SetStartVisible(false);
-            }
-
-            var demo = Object.FindFirstObjectByType<AIGalgameChatdollDemoUI>();
-            if (demo != null)
-            {
-                demo.SetController(controller);
-                demo.SetStartVisible(false);
-            }
-
-            var mainUi = Object.FindFirstObjectByType<AIGalgameRelaxRoomUI>();
-            if (mainUi != null)
-            {
-                mainUi.SetTargets(controller, motionUi, demo, audioSource, director, touch);
-                if (mainUi.gameObject.activeSelf)
-                {
-                    mainUi.gameObject.SetActive(false);
-                }
-            }
+            AIGalgameStartupDiagnostics.Log("touch_controller_ready");
 
             var expressionDirector = animator.GetComponent<AIGalgameRelaxRoomExpressionDirector>();
             if (expressionDirector == null)
@@ -133,6 +130,8 @@ namespace AIgalgame.Motion
 
             controller.SetVisualDirectors(expressionDirector, gazeDirector);
             director.SetVisualDirectors(gazeDirector, expressionDirector);
+            director.SetTargets(animator, player);
+            AIGalgameStartupDiagnostics.Log("visual_directors_ready");
 
             var bridgeRoot = GameObject.Find("RelaxRoomBridge");
             if (bridgeRoot == null)
@@ -145,8 +144,9 @@ namespace AIgalgame.Motion
             {
                 bridge = bridgeRoot.AddComponent<RelaxRoomPresentationBridge>();
             }
+            AIGalgameStartupDiagnostics.Log("bridge_spawned");
 
-            AIGalgameStartupDiagnostics.Log("components_wired");
+            AIGalgameStartupDiagnostics.Log("bridge_set_targets_begin");
             bridge.SetTargets(controller, director, expressionDirector, gazeDirector, touch, audioSource);
             AIGalgameStartupDiagnostics.Log("bootstrap_done");
         }

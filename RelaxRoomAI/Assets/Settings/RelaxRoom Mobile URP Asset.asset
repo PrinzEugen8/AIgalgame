@@ -19,7 +19,6 @@ MonoBehaviour:
   m_RendererDataList:
   - {fileID: 11400000, guid: b8e4f2a19c3d4e5f6a7b8c9d0e1f2a3c, type: 2}
   m_DefaultRendererIndex: 0
-  m_RequireRayTracing: 0
   m_RequireDepthTexture: 0
   m_RequireOpaqueTexture: 0
   m_OpaqueDownsampling: 1
@@ -52,7 +51,6 @@ MonoBehaviour:
   m_AdditionalLightsShadowResolutionTierLow: 128
   m_AdditionalLightsShadowResolutionTierMedium: 256
   m_AdditionalLightsShadowResolutionTierHigh: 512
-  m_SkyReflectionSize: 256
   m_ReflectionProbeBlending: 1
   m_ReflectionProbeBoxProjection: 0
   m_ShadowDistance: 35
@@ -68,14 +66,6 @@ MonoBehaviour:
   m_ConservativeEnclosingSphere: 1
   m_NumIterationsEnclosingSphere: 32
   m_SoftShadowQuality: 1
-  m_POShadowMaxObjectsCount: 16
-  m_POShadowMaxDrawDistance: 500
-  m_POShadowShadowMapResolution: 1024
-  m_POShadowExcludeLayer:
-    serializedVersion: 0
-    m_Bits: 2
-  m_POShadowDepthBias: 2
-  m_POShadowNormalBias: 3
   m_AdditionalLightsCookieResolution: 1024
   m_AdditionalLightsCookieFormat: 3
   m_UseSRPBatcher: 1
@@ -139,6 +129,8 @@ MonoBehaviour:
   m_PrefilterScreenCoord: 1
   m_PrefilterNativeRenderPass: 1
   m_PrefilterUseLegacyLightmaps: 0
+  m_PrefilterReflectionProbeBlending: 0
+  m_PrefilterReflectionProbeBoxProjection: 1
   m_ShaderVariantLogLevel: 0
   m_ShadowCascades: 0
   m_Textures:

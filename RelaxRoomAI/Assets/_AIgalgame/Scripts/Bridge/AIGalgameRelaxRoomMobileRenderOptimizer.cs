@@ -20,7 +20,7 @@ namespace AIgalgame.Motion
         public static bool ShouldApply()
         {
 #if RELAXROOM_RN
-            return true;
+            return false;
 #else
             return Application.isMobilePlatform;
 #endif

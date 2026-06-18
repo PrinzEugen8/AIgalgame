@@ -84,6 +84,9 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
     signingConfigs {
         debug {
@@ -105,6 +108,10 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    androidResources {
+        noCompress = ['.unity3d', '.ress', '.resource', '.obb', '.bundle', '.unityexp'] +
+            (project.findProperty('unityStreamingAssets') ?: '').tokenize(', ')
+    }
 }
 
 dependencies {
@@ -112,6 +119,8 @@ dependencies {
     implementation("com.facebook.react:react-android")
 
     def unityLibraryDir = file("../../unity/builds/android/unityLibrary")
+    implementation fileTree(dir: 'libs', include: ['*.aar'])
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
     if (unityLibraryDir.exists()) {
         implementation project(':unityLibrary')
     }

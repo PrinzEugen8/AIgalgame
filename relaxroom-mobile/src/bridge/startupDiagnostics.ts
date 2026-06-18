@@ -13,6 +13,7 @@ type StartupStage =
   | 'unity_view_mount'
   | 'session_ready'
   | 'unity_ready'
+  | 'stable_frame'
   | 'unity_load_timeout'
   | 'room_ready'
   | 'environment_ready'
@@ -20,7 +21,24 @@ type StartupStage =
   | 'bridge_queue_flushed';
 
 const milestones: TimelineEntry[] = [];
+const milestoneKeys = new Set<string>();
 let summaryLogged = false;
+
+function isRepeatableStage(stage: string) {
+  return (
+    stage.includes('loading') ||
+    stage.includes('heartbeat') ||
+    stage.startsWith('splash_') ||
+    stage === 'native_unity_stage'
+  );
+}
+
+function milestoneKey(source: MilestoneSource, stage: string, detail?: string) {
+  if (isRepeatableStage(stage)) {
+    return `${source}:${stage}:${detail ?? milestones.length}`;
+  }
+  return `${source}:${stage}`;
+}
 
 function formatDetail(detail?: string) {
   return detail ? ` detail=${detail}` : '';
@@ -36,6 +54,12 @@ export function recordMilestone(
   elapsedMs: number,
   detail?: string,
 ) {
+  const key = milestoneKey(source, stage, detail);
+  if (milestoneKeys.has(key)) {
+    return;
+  }
+
+  milestoneKeys.add(key);
   milestones.push({source, stage, elapsedMs, detail});
   console.log(
     `[RelaxRoomStartup] layer=${source} stage=${stage} elapsed_ms=${elapsedMs}${formatDetail(detail)}`,
@@ -48,7 +72,6 @@ export function mergeUnityTimeline(
   for (const entry of stages) {
     recordMilestone('unity', entry.stage, entry.elapsed_ms);
   }
-  maybeLogStartupSummary('unity_timeline');
 }
 
 export function buildStartupSummary() {
@@ -84,11 +107,11 @@ export function maybeLogStartupSummary(trigger: string) {
 
   const hasNative = milestones.some(item => item.source === 'native');
   const hasUnity = milestones.some(item => item.source === 'unity');
-  const hasRnReady = milestones.some(
-    item => item.source === 'rn' && item.stage === 'environment_ready',
+  const hasRnStable = milestones.some(
+    item => item.source === 'rn' && item.stage === 'stable_frame',
   );
 
-  if (!hasNative || !hasUnity || !hasRnReady) {
+  if (!hasNative || !hasUnity || !hasRnStable) {
     return;
   }
 

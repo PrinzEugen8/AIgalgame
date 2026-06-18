@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "preandroid": "powershell -ExecutionPolicy Bypass -File ./scripts/patch-unity-export.ps1 -SherpaOnly",
     "android": "react-native run-android",
     "ios": "react-native run-ios",
     "lint": "eslint .",

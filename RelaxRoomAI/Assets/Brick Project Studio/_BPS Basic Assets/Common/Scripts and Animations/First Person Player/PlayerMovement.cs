@@ -59,28 +59,4 @@ namespace SojaExiles
 #endif
         }
     }
-
-    public static class InputCompat
-    {
-        public static bool GetMouseButtonDown(int button)
-        {
-#if ENABLE_INPUT_SYSTEM
-            var mouse = Mouse.current;
-            if (mouse == null)
-            {
-                return false;
-            }
-
-            return button switch
-            {
-                0 => mouse.leftButton.wasPressedThisFrame,
-                1 => mouse.rightButton.wasPressedThisFrame,
-                2 => mouse.middleButton.wasPressedThisFrame,
-                _ => false
-            };
-#else
-            return Input.GetMouseButtonDown(button);
-#endif
-        }
-    }
 }

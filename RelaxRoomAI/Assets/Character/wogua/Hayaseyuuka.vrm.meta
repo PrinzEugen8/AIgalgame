@@ -52,7 +52,7 @@ ScriptedImporter:
       type: UniVRM10:VRM10Object
       assembly: VRM10
       name: _vrm1_
-    second: {fileID: 5929401533440927806, guid: 69d5ad381c6b2894c96b30e59da2fc2a, type: 3}
+    second: {instanceID: 0}
   - first:
       type: UnityEngine:Material
       assembly: UnityEngine.CoreModule
@@ -89,4 +89,4 @@ ScriptedImporter:
   assetBundleVariant: 
   script: {fileID: 11500000, guid: f66ead3390398f443aa127b741826ad9, type: 3}
   MigrateToVrm1: 1
-  RenderPipeline: 0
+  RenderPipeline: 2

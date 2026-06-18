@@ -1,0 +1,38 @@
+<linker>
+  <assembly fullname="Assembly-CSharp">
+    <type fullname="AIgalgame.Motion.AIGalgameStartupDiagnostics" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameMotionTestBootstrap" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgamePlayableMotionPlayer" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameHumanoidIKAdjuster" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameChatdollController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomMotionDirector" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomPhoneAttachmentController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomPhonePickupController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomPhoneScreenController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomTouchArea" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomTouchController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomExpressionDirector" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomGazeDirector" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomRnAsrController" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomAudioConfig" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameLocalAsrClient" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameLocalAsrResult" preserve="all" />
+    <type fullname="AIgalgame.Motion.RelaxRoomPresentationBridge" preserve="all" />
+    <type fullname="AIgalgame.Motion.ReactNativeMessenger" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameDialogueControllerCommand" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameDialogueVisualCue" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameDialogueLine" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameDialoguePayload" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameAvatarCommand" preserve="all" />
+    <type fullname="AIgalgame.Motion.MotionClipEntry" preserve="all" />
+    <type fullname="AIgalgame.Motion.MotionAdjustmentData" preserve="all" />
+    <type fullname="AIgalgame.Motion.MotionAdjustmentDatabase" preserve="all" />
+    <type fullname="AIgalgame.Motion.RelaxRoomPresentationBridge+BridgeEnvelope" preserve="all" />
+    <type fullname="AIgalgame.Motion.RelaxRoomPresentationBridge+BridgeEvent" preserve="all" />
+    <type fullname="AIgalgame.Motion.AIGalgameRelaxRoomTouchController+TouchReactionResponse" preserve="all" />
+  </assembly>
+
+  <assembly fullname="VRM10">
+    <type fullname="UniVRM10.Vrm10Instance" preserve="all" />
+  </assembly>
+</linker>

@@ -24,12 +24,16 @@ public class UPlayer {
 
         try {
             playerClass = Class.forName("com.unity3d.player.UnityPlayerForActivityOrService");
+            RelaxRoomStartupNativeLog.mark("native_unity_class_resolved", "UnityPlayerForActivityOrService");
         } catch (ClassNotFoundException e) {
             playerClass = Class.forName("com.unity3d.player.UnityPlayer");
+            RelaxRoomStartupNativeLog.mark("native_unity_class_resolved", "UnityPlayer");
         }
 
+        RelaxRoomStartupNativeLog.mark("native_unity_player_new_begin");
         unityPlayer = createUnityPlayer(playerClass, activity, callback);
-        RelaxRoomStartupNativeLog.mark("native_player_ctor_end", playerClass.getSimpleName());
+        RelaxRoomStartupNativeLog.mark("native_unity_player_new_end");
+        RelaxRoomStartupNativeLog.markPlayerCtorEnd(playerClass.getSimpleName());
     }
 
     private static UnityPlayer createUnityPlayer(

@@ -28,6 +28,7 @@ android/.kotlin/
 # Unity generated/local files
 RelaxRoomAI/Library/
 RelaxRoomAI/Temp/
+RelaxRoomAI/.utmp/
 RelaxRoomAI/Logs/
 RelaxRoomAI/obj/
 RelaxRoomAI/.vs/
@@ -47,6 +48,7 @@ relaxroom-mobile/android/build/
 relaxroom-mobile/android-current-screen.png
 relaxroom-mobile/_bundle/
 relaxroom-mobile/unity/builds/android/
+relaxroom-mobile/unity/build-artifacts.json
 relaxroom-mobile/unity/export.log
 RelaxRoomAI/Android/
 template.tgz

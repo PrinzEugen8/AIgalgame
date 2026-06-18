@@ -16,7 +16,10 @@ namespace AIgalgame.Motion
         private AIGalgameLocalAsrClient localAsrClient;
         private bool recordingVoice;
         private bool asrInFlight;
+        private bool asrPrepareStarted;
+        private bool asrReady;
         private Coroutine startVoiceRoutine;
+        private Coroutine prepareAsrRoutine;
         private AudioClip recordedClip;
         private int recordedSamplePosition;
         private string activeMicrophoneDevice;
@@ -25,6 +28,50 @@ namespace AIgalgame.Motion
         public void BindBridge(RelaxRoomPresentationBridge targetBridge)
         {
             bridge = targetBridge;
+        }
+
+        public void PrepareRecognizerAfterStartup()
+        {
+            if (asrPrepareStarted || asrReady || prepareAsrRoutine != null)
+            {
+                return;
+            }
+
+            prepareAsrRoutine = StartCoroutine(PrepareRecognizer());
+        }
+
+        private IEnumerator PrepareRecognizer()
+        {
+            asrPrepareStarted = true;
+            AIGalgameStartupDiagnostics.Log("asr_prepare_begin");
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            localAsrClient ??= new AIGalgameLocalAsrClient();
+            localAsrClient.Configure(asrLanguage, asrThreads);
+            var prepareTask = localAsrClient.PrepareAndroidAsync();
+            while (!prepareTask.IsCompleted)
+            {
+                yield return null;
+            }
+
+            prepareAsrRoutine = null;
+            var result = prepareTask.IsFaulted
+                ? AIGalgameLocalAsrResult.Fail(prepareTask.Exception?.GetBaseException().Message ?? "Android ASR prepare failed")
+                : prepareTask.Result;
+
+            if (result.Ok)
+            {
+                asrReady = true;
+                AIGalgameStartupDiagnostics.Log("asr_ready");
+                yield break;
+            }
+
+            AIGalgameStartupDiagnostics.Log("asr_prepare_failed", result.Error);
+#else
+            yield return null;
+            prepareAsrRoutine = null;
+            AIGalgameStartupDiagnostics.Log("asr_prepare_failed", "Android only");
+#endif
         }
 
         public void StartRecording(string requestId)

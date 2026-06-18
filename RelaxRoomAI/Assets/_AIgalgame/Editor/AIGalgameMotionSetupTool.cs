@@ -30,69 +30,10 @@ public static class AIGalgameMotionSetupTool
     private static readonly Vector3 TestCharacterEuler = new(0f, 189.595f, 0f);
     private static readonly Vector3 TestCharacterScale = new(1.4f, 1.4f, 1.4f);
 
-    [MenuItem("Tools/AIgalgame/Motion/Setup Scene_01 Motion Test UI")]
-    public static void SetupScene01MotionTestUi()
+    [MenuItem("Tools/AIgalgame/Motion/Setup Scene_01 Character Components")]
+    public static void SetupScene01MotionCharacterComponents()
     {
-        PrepareAllFbxMotions();
         SetupScene01RelaxRoomCharacterComponents();
-
-        var scene = EditorSceneManager.OpenScene(Scene01Path, OpenSceneMode.Single);
-        var animator = FindSceneCharacterAnimator();
-        if (animator == null)
-        {
-            animator = CreateSceneTestCharacter();
-        }
-
-        if (animator == null)
-        {
-            Debug.LogError("Could not find or create a humanoid Animator in Scene_01.");
-            return;
-        }
-
-        var player = animator.GetComponent<AIGalgamePlayableMotionPlayer>();
-        if (player == null)
-        {
-            player = Undo.AddComponent<AIGalgamePlayableMotionPlayer>(animator.gameObject);
-        }
-
-        var playerSo = new SerializedObject(player);
-        playerSo.FindProperty("animator").objectReferenceValue = animator;
-        playerSo.ApplyModifiedProperties();
-        player.RefreshClipCatalog();
-        EditorUtility.SetDirty(player);
-
-        var uiRoot = GameObject.Find("AIgalgame_MotionTestUI");
-        if (uiRoot == null)
-        {
-            uiRoot = new GameObject("AIgalgame_MotionTestUI");
-            Undo.RegisterCreatedObjectUndo(uiRoot, "Create Motion Test UI");
-        }
-
-        var ui = uiRoot.GetComponent<AIGalgameMotionTestUI>();
-        if (ui == null)
-        {
-            ui = Undo.AddComponent<AIGalgameMotionTestUI>(uiRoot);
-        }
-
-        var uiSo = new SerializedObject(ui);
-        uiSo.FindProperty("player").objectReferenceValue = player;
-        uiSo.ApplyModifiedProperties();
-        EditorUtility.SetDirty(ui);
-
-        EditorSceneManager.MarkSceneDirty(scene);
-        EditorSceneManager.SaveScene(scene);
-        Selection.activeGameObject = uiRoot;
-        Debug.Log("Scene_01 motion test UI is ready. Enter Play Mode in Scene_01 to test FBX motion switching.");
-    }
-
-    [MenuItem("Tools/AIgalgame/RelaxRoom/Setup Scene_01 RelaxRoom UI")]
-    public static void SetupScene01RelaxRoomUi()
-    {
-        var scene = EditorSceneManager.OpenScene(Scene01Path, OpenSceneMode.Single);
-        AIGalgameMotionTestBootstrap.Install(scene);
-        EditorSceneManager.MarkSceneDirty(scene);
-        EditorSceneManager.SaveScene(scene);
-        Debug.Log("Scene_01 RelaxRoom UI components are installed. Enter Play Mode in Scene_01 to see the chat canvas.");
     }
 
     [MenuItem("Tools/AIgalgame/RelaxRoom/Setup Scene_01 Character Components")]

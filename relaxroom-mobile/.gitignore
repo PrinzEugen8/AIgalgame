@@ -2,6 +2,7 @@ node_modules/
 android/.gradle/
 android/app/.cxx/
 android/app/build/
+android/app/libs/*.aar
 android/build/
 android/local.properties
 android-current-screen.png

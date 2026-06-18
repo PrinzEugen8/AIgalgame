@@ -199,11 +199,12 @@ export function RelaxRoomScreen() {
 
     const unsubscribe = subscribeUnityEvents(event => {
       if (event.evt === 'room_ready' || event.evt === 'ready') {
+        logStartupStage('unity_ready', event.state);
+        setEnvironmentReady(true);
+
         if (!unityReadyRef.current) {
           unityReadyRef.current = true;
-          logStartupStage('unity_ready', event.state);
           setUnityReady(true);
-          setEnvironmentReady(true);
           setLoadTimedOut(false);
           setStatusText('');
         }
@@ -212,6 +213,11 @@ export function RelaxRoomScreen() {
           unityConfiguredRef.current = true;
           configureUnity(getSession());
         }
+        return;
+      }
+
+      if (event.evt === 'stable_frame') {
+        logStartupStage('stable_frame', event.state);
         return;
       }
 
@@ -302,7 +308,7 @@ export function RelaxRoomScreen() {
     <View style={styles.root}>
       <UnityView
         ref={unityRef}
-        style={StyleSheet.absoluteFillObject}
+        style={[StyleSheet.absoluteFillObject, {opacity: unityReady ? 1 : 0}]}
         androidKeepPlayerMounted={true}
         fullScreen={true}
         onUnityMessage={event => handleUnityMessage(event.nativeEvent.message)}
@@ -391,7 +397,7 @@ export function RelaxRoomScreen() {
           <Text style={styles.loadingText}>
             {loadTimedOut
               ? 'Unity 房间加载失败，请重启 App'
-              : '首次加载可能需要 1 到 2 分钟'}
+              : '首次加载可能需要 30 到 60 秒'}
           </Text>
           {__DEV__ && devStartupSummary ? (
             <Text style={styles.devSummaryText}>{devStartupSummary}</Text>
@@ -426,7 +432,7 @@ const styles = StyleSheet.create({
     elevation: 100,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(6, 8, 14, 0.58)',
+    backgroundColor: colors.background,
     paddingHorizontal: 24,
   },
   loadingTitle: {

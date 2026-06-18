@@ -168,7 +168,9 @@ namespace AIgalgame.Motion
         {
             MigrateSerializedDefaults();
             ResolveReferences();
+            AIGalgameStartupDiagnostics.Log("motion_director_awake");
             LoadAudioConfigIfNeeded();
+            AIGalgameStartupDiagnostics.Log("motion_director_audio_loaded");
             ConfigureAnimatorRootMotion();
             if (useAnimatorControllerStateMachine)
             {
@@ -183,12 +185,14 @@ namespace AIgalgame.Motion
                 motionPlayer.RefreshClipCatalog();
             }
 
+            AIGalgameStartupDiagnostics.Log("motion_director_start_begin");
 #if RELAXROOM_RN
             SetIdle(0f);
 #else
             PlayBgmIfNeeded();
             SetIdle(0f);
 #endif
+            AIGalgameStartupDiagnostics.Log("motion_director_idle_set");
         }
 
         private void Update()

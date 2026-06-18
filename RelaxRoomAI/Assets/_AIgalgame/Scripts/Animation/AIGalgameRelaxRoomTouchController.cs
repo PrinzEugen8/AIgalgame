@@ -2,7 +2,6 @@ using System;
 using System.Collections;
 using System.Text;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using UnityEngine.Networking;
 
 namespace AIgalgame.Motion
@@ -606,14 +605,7 @@ namespace AIgalgame.Motion
 
         private static bool IsPointerOverUi(int pointerId = -1)
         {
-            if (EventSystem.current == null)
-            {
-                return false;
-            }
-
-            return pointerId >= 0
-                ? EventSystem.current.IsPointerOverGameObject(pointerId)
-                : EventSystem.current.IsPointerOverGameObject();
+            return false;
         }
 
         private static AudioType AudioTypeForUrl(string url)

@@ -38,6 +38,10 @@ public class ReactNativeUnity {
 
     private static boolean creatingPlayer;
 
+    private static UnityPlayerCallback pendingCreateCallback;
+
+    private static boolean _hasUnityRuntimeResumed;
+
     public static boolean _isUnityReady;
 
     public static boolean _isUnityPaused;
@@ -102,11 +106,9 @@ public class ReactNativeUnity {
 
 
 
-    private static void resumePlayerIfAttached(UPlayer player) {
+    private static void resumeUnityRuntimeEarly(UPlayer player, String source) {
 
-        if (!isUnityViewAttached()) {
-
-            Log.d(TAG, "Defer Unity resume until view is attached to ReactNativeUnityView");
+        if (player == null || _hasUnityRuntimeResumed) {
 
             return;
 
@@ -115,6 +117,50 @@ public class ReactNativeUnity {
 
 
         player.resume();
+
+        _hasUnityRuntimeResumed = true;
+
+        _isUnityPaused = false;
+
+        RelaxRoomStartupNativeLog.mark("native_first_resume", source);
+
+    }
+
+
+
+    private static void resumePlayerIfAttached(UPlayer player, String source) {
+
+        if (player == null) {
+
+            return;
+
+        }
+
+
+
+        if (_hasUnityRuntimeResumed) {
+
+            RelaxRoomStartupNativeLog.mark("native_player_resumed", "already_resumed");
+
+            return;
+
+        }
+
+
+
+        if (!isUnityViewAttached()) {
+
+            resumeUnityRuntimeEarly(player, source + "_prewarm");
+
+            return;
+
+        }
+
+
+
+        resumeUnityRuntimeEarly(player, source);
+
+        RelaxRoomStartupNativeLog.mark("native_player_resumed", source);
 
     }
 
@@ -136,6 +182,8 @@ public class ReactNativeUnity {
 
             Log.d(TAG, "Unity player creation already in progress");
 
+            pendingCreateCallback = callback;
+
             return;
 
         }
@@ -144,7 +192,7 @@ public class ReactNativeUnity {
 
         if (activity != null) {
 
-            RelaxRoomStartupNativeLog.beginNativeTiming();
+            RelaxRoomStartupNativeLog.beginNativeTimingIfNeeded();
 
             creatingPlayer = true;
 
@@ -153,6 +201,8 @@ public class ReactNativeUnity {
                 @Override
 
                 public void run() {
+
+                    RelaxRoomStartupNativeLog.mark("native_create_player_ui_begin");
 
                     activity.getWindow().setFormat(PixelFormat.RGBA_8888);
 
@@ -163,6 +213,8 @@ public class ReactNativeUnity {
 
 
                     try {
+
+                        RelaxRoomStartupNativeLog.mark("native_player_ctor_invoke");
 
                         unityPlayer = new UPlayer(activity, callback);
 
@@ -192,13 +244,15 @@ public class ReactNativeUnity {
 
                     unityPlayer.configureSurfaceViewZOrderForOverlay();
 
-
+                    RelaxRoomStartupNativeLog.mark("native_finish_setup_scheduled", "delay_ms=50");
 
                     final Runnable finishPlayerSetup = new Runnable() {
 
                         @Override
 
                         public void run() {
+
+                            RelaxRoomStartupNativeLog.mark("native_finish_setup_begin");
 
                             unityPlayer.windowFocusChanged(true);
 
@@ -216,7 +270,7 @@ public class ReactNativeUnity {
 
 
 
-                            resumePlayerIfAttached(unityPlayer);
+                            resumePlayerIfAttached(unityPlayer, "prewarm");
 
 
 
@@ -235,6 +289,7 @@ public class ReactNativeUnity {
                             creatingPlayer = false;
 
                             RelaxRoomStartupNativeLog.mark("native_player_ready");
+                            RelaxRoomStartupNativeLog.mark("native_finish_setup_end");
 
 
 
@@ -248,6 +303,10 @@ public class ReactNativeUnity {
 
                             }
 
+
+
+                            notifyPendingCreateCallback();
+
                         }
 
                     };
@@ -259,6 +318,36 @@ public class ReactNativeUnity {
                 }
 
             });
+
+        }
+
+    }
+
+
+
+    private static void notifyPendingCreateCallback() {
+
+        if (pendingCreateCallback == null) {
+
+            return;
+
+        }
+
+
+
+        UnityPlayerCallback pending = pendingCreateCallback;
+
+        pendingCreateCallback = null;
+
+
+
+        try {
+
+            pending.onReady();
+
+        } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
+
+            Log.e(TAG, "Pending Unity ready callback failed", e);
 
         }
 
@@ -284,9 +373,9 @@ public class ReactNativeUnity {
 
         if (unityPlayer != null) {
 
-            unityPlayer.resume();
+            resumeUnityRuntimeEarly(unityPlayer, "manual");
 
-            _isUnityPaused = false;
+            RelaxRoomStartupNativeLog.mark("native_player_resumed", "manual");
 
         }
 
@@ -301,6 +390,8 @@ public class ReactNativeUnity {
             unityPlayer.unload();
 
             _isUnityPaused = false;
+
+            _hasUnityRuntimeResumed = false;
 
         }
 
@@ -356,19 +447,19 @@ public class ReactNativeUnity {
 
         }
 
-
-
-        if (unityPlayer.getParentPlayer() != null) {
-
-            ((ViewGroup) unityPlayer.getParentPlayer()).removeView(unityPlayer.requestFrame());
-
+        View unityFrame = unityPlayer.requestFrame();
+        Object currentParent = unityPlayer.getParentPlayer();
+        if (currentParent == group) {
+            RelaxRoomStartupNativeLog.mark("native_view_attached", "already_attached");
+            resumePlayerIfAttached(unityPlayer, "attach");
+            return;
         }
 
+        if (currentParent != null) {
 
+            ((ViewGroup) currentParent).removeView(unityFrame);
 
-        View unityFrame = unityPlayer.requestFrame();
-
-        unityPlayer.configureSurfaceViewZOrderForOverlay();
+        }
 
         ViewGroup.LayoutParams layoutParams = new ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT);
 
@@ -382,7 +473,7 @@ public class ReactNativeUnity {
 
         final UPlayer player = unityPlayer;
 
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        final Runnable attachResume = new Runnable() {
 
             @Override
 
@@ -394,11 +485,7 @@ public class ReactNativeUnity {
 
                     player.requestFocusPlayer();
 
-                    player.resume();
-
-                    player.configureSurfaceViewZOrderForOverlay();
-
-                    RelaxRoomStartupNativeLog.mark("native_player_resumed");
+                    resumePlayerIfAttached(player, "attach");
 
                 } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
 
@@ -408,7 +495,9 @@ public class ReactNativeUnity {
 
             }
 
-        }, 100);
+        };
+
+        new Handler(Looper.getMainLooper()).post(attachResume);
 
     }
 
@@ -423,5 +512,4 @@ public class ReactNativeUnity {
         void onQuit();
     }
 }
-
 

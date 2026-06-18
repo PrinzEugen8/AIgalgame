@@ -161,9 +161,15 @@ public static class ApartmentMaterialConverter
         }
 
         var shaderName = material.shader.name;
-        return shaderName == "Standard"
-            || shaderName == "Standard (Specular setup)"
-            || shaderName.StartsWith("Legacy Shaders/", StringComparison.Ordinal);
+        if (shaderName.StartsWith("Universal Render Pipeline/", StringComparison.Ordinal)
+            || shaderName.StartsWith("Hidden/Universal Render Pipeline/", StringComparison.Ordinal)
+            || shaderName.StartsWith("AIgalgame/", StringComparison.Ordinal)
+            || shaderName.StartsWith("VRM10/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private static Shader FindUrpLitShader()
@@ -213,12 +219,12 @@ public static class ApartmentMaterialConverter
 
     private static void ConvertMaterialToUrpLit(Material material)
     {
-        var mainTexture = GetTexture(material, "_MainTex");
-        var mainTextureScale = GetTextureScale(material, "_MainTex");
-        var mainTextureOffset = GetTextureOffset(material, "_MainTex");
-        var normalTexture = GetTexture(material, "_BumpMap");
-        var normalTextureScale = GetTextureScale(material, "_BumpMap");
-        var normalTextureOffset = GetTextureOffset(material, "_BumpMap");
+        var mainTexture = GetTexture(material, "_MainTex") ?? GetTexture(material, "_BaseMap");
+        var mainTextureScale = GetTexture(material, "_MainTex") != null ? GetTextureScale(material, "_MainTex") : GetTextureScale(material, "_BaseMap");
+        var mainTextureOffset = GetTexture(material, "_MainTex") != null ? GetTextureOffset(material, "_MainTex") : GetTextureOffset(material, "_BaseMap");
+        var normalTexture = GetTexture(material, "_BumpMap") ?? GetTexture(material, "_NormalMap");
+        var normalTextureScale = GetTexture(material, "_BumpMap") != null ? GetTextureScale(material, "_BumpMap") : GetTextureScale(material, "_NormalMap");
+        var normalTextureOffset = GetTexture(material, "_BumpMap") != null ? GetTextureOffset(material, "_BumpMap") : GetTextureOffset(material, "_NormalMap");
         var metallicGlossTexture = GetTexture(material, "_MetallicGlossMap");
         var metallicGlossTextureScale = GetTextureScale(material, "_MetallicGlossMap");
         var metallicGlossTextureOffset = GetTextureOffset(material, "_MetallicGlossMap");
@@ -228,8 +234,8 @@ public static class ApartmentMaterialConverter
         var emissionTexture = GetTexture(material, "_EmissionMap");
         var emissionTextureScale = GetTextureScale(material, "_EmissionMap");
         var emissionTextureOffset = GetTextureOffset(material, "_EmissionMap");
-        var color = GetColor(material, "_Color", Color.white);
-        var emissionColor = GetColor(material, "_EmissionColor", Color.black);
+        var color = GetColor(material, "_Color", GetColor(material, "_BaseColor", Color.white));
+        var emissionColor = GetColor(material, "_EmissionColor", GetColor(material, "_EmissionCol", Color.black));
         var metallic = GetFloat(material, "_Metallic", 0f);
         var smoothness = GetFloat(material, "_Glossiness", GetFloat(material, "_Smoothness", 0.5f));
         var smoothnessScale = GetFloat(material, "_GlossMapScale", 1f);
@@ -261,6 +267,144 @@ public static class ApartmentMaterialConverter
         ConfigureKeyword(material, "_METALLICSPECGLOSSMAP", metallicGlossTexture != null);
         ConfigureKeyword(material, "_OCCLUSIONMAP", occlusionTexture != null);
         ConfigureKeyword(material, "_EMISSION", emissionTexture != null || emissionColor.maxColorComponent > 0.001f);
+    }
+
+    [InitializeOnLoad]
+    private static class OneShotConversionRunner
+    {
+        private const string MarkerAssetPath = "Assets/_AIgalgame/Editor/RunApartmentMaterialConversion.flag";
+        private const string LockFilePath = "Library/ApartmentMaterialConversion.lock";
+        private const string SessionKey = "AIgalgame.ApartmentMaterialConverter.OneShot";
+
+        static OneShotConversionRunner()
+        {
+            if (!File.Exists(MarkerAssetPath) || SessionState.GetBool(SessionKey, false))
+            {
+                return;
+            }
+
+            SessionState.SetBool(SessionKey, true);
+            EditorApplication.delayCall += RunIfMarked;
+        }
+
+        private static void RunIfMarked()
+        {
+            if (!File.Exists(MarkerAssetPath))
+            {
+                return;
+            }
+
+            FileStream lockStream = null;
+            try
+            {
+                lockStream = new FileStream(LockFilePath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                ConvertApartmentMaterialsToUrpLitBatch();
+                DeleteMarker();
+                Debug.Log("Apartment Material Converter: one-shot URP material conversion completed.");
+            }
+            catch (IOException)
+            {
+                Debug.Log("Apartment Material Converter: another editor instance is already running the one-shot conversion.");
+            }
+            catch (Exception error)
+            {
+                Debug.LogError($"Apartment Material Converter: one-shot conversion failed: {error}");
+                SessionState.SetBool(SessionKey, false);
+            }
+            finally
+            {
+                if (lockStream != null)
+                {
+                    lockStream.Dispose();
+                    if (File.Exists(LockFilePath))
+                    {
+                        File.Delete(LockFilePath);
+                    }
+                }
+            }
+        }
+
+        private static void DeleteMarker()
+        {
+            if (AssetDatabase.DeleteAsset(MarkerAssetPath))
+            {
+                AssetDatabase.Refresh();
+                return;
+            }
+
+            File.Delete(MarkerAssetPath);
+            var metaPath = MarkerAssetPath + ".meta";
+            if (File.Exists(metaPath))
+            {
+                File.Delete(metaPath);
+            }
+
+            AssetDatabase.Refresh();
+        }
+    }
+
+    [InitializeOnLoad]
+    private static class OneShotImportRefreshRunner
+    {
+        private const string MarkerAssetPath = "Assets/_AIgalgame/Editor/RunMaterialImportRefresh.flag";
+        private const string SessionKey = "AIgalgame.MaterialImportRefresh.OneShot";
+
+        static OneShotImportRefreshRunner()
+        {
+            if (!File.Exists(MarkerAssetPath) || SessionState.GetBool(SessionKey, false))
+            {
+                return;
+            }
+
+            SessionState.SetBool(SessionKey, true);
+            EditorApplication.delayCall += RunIfMarked;
+        }
+
+        private static void RunIfMarked()
+        {
+            if (!File.Exists(MarkerAssetPath))
+            {
+                return;
+            }
+
+            try
+            {
+                var options = ImportAssetOptions.ForceUpdate
+                    | ImportAssetOptions.ForceSynchronousImport
+                    | ImportAssetOptions.ImportRecursive;
+
+                AssetDatabase.ImportAsset("Assets/Brick Project Studio", options);
+                AssetDatabase.ImportAsset("Assets/Item", options);
+                AssetDatabase.ImportAsset("Assets/Character/keyi", options);
+                AssetDatabase.ImportAsset("Assets/Character/wogua", options);
+                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                DeleteMarker();
+                Debug.Log("Apartment Material Converter: forced material import refresh completed.");
+            }
+            catch (Exception error)
+            {
+                Debug.LogError($"Apartment Material Converter: forced material import refresh failed: {error}");
+                SessionState.SetBool(SessionKey, false);
+            }
+        }
+
+        private static void DeleteMarker()
+        {
+            if (AssetDatabase.DeleteAsset(MarkerAssetPath))
+            {
+                AssetDatabase.Refresh();
+                return;
+            }
+
+            File.Delete(MarkerAssetPath);
+            var metaPath = MarkerAssetPath + ".meta";
+            if (File.Exists(metaPath))
+            {
+                File.Delete(metaPath);
+            }
+
+            AssetDatabase.Refresh();
+        }
     }
 
     private static Texture GetTexture(Material material, string property)

@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d0353a89b1f911e48b9e16bdc9f2e058, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  version: 9
+  version: 10
 --- !u!21 &2100000
 Material:
   serializedVersion: 8
@@ -21,32 +21,28 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: hair
-  m_Shader: {fileID: 4800000, guid: 1ba21efcdd32ecc4aaa395955a37914a, type: 3}
+  m_Shader: {fileID: 4800000, guid: 933532a4fcc9baf4fa0491de14d08ed7, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords:
+  - _METALLICSPECGLOSSMAP
+  m_InvalidKeywords:
+  - 
   - FLAG_HAIRMASK
-  - _SHADOW_RAMP
-  m_InvalidKeywords: []
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 0
   m_CustomRenderQueue: -1
-  stringTagMap: {}
+  stringTagMap:
+    RenderType: Opaque
   disabledShaderPasses:
   - MOTIONVECTORS
-  - CharacterTransparent
-  - CharacterOutline
   m_LockedProperties: 
   m_SavedProperties:
     serializedVersion: 3
     m_TexEnvs:
     - _BaseMap:
         m_Texture: {fileID: 6058237400354152629, guid: 69d5ad381c6b2894c96b30e59da2fc2a, type: 3}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    - _BaseMapOutter:
-        m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _BumpMap:
@@ -69,44 +65,20 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _FaceLightMap:
-        m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    - _HairSpecTex:
-        m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    - _IndirSpecCubemap:
-        m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
     - _MainTex:
-        m_Texture: {fileID: 0}
+        m_Texture: {fileID: 6058237400354152629, guid: 69d5ad381c6b2894c96b30e59da2fc2a, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _MetallicGlossMap:
-        m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    - _NormalMap:
-        m_Texture: {fileID: 0}
+        m_Texture: {fileID: 6058237400354152629, guid: 69d5ad381c6b2894c96b30e59da2fc2a, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _OcclusionMap:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _PBRMask:
-        m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
     - _ParallaxMap:
         m_Texture: {fileID: 0}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    - _ShadowRampTex:
-        m_Texture: {fileID: 2800000, guid: afea1fed01220fc4491569f42c01f3f4, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     - _SpecGlossMap:
@@ -129,13 +101,9 @@ Material:
     m_Floats:
     - _AddPrecomputedVelocity: 0
     - _AlphaClip: 0
-    - _AlphaOutter: 1
     - _AlphaToMask: 0
-    - _AnisotropicOffset: -0.03
-    - _AnisotropicSlide: 0.22
     - _Blend: 0
     - _BlendModePreserveSpecular: 1
-    - _BlinnPhongPow: 18
     - _BumpScale: 1
     - _ClearCoatMask: 0
     - _ClearCoatSmoothness: 0
@@ -143,86 +111,29 @@ Material:
     - _Cutoff: 0.5
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
-    - _DirectOcclusion: 0.28
-    - _DirectRimWidth: 4.6
     - _DstBlend: 0
     - _DstBlendAlpha: 0
-    - _EnvColorLerp: 0.44
     - _EnvironmentReflections: 1
-    - _FoldoutDirectLight: 0
-    - _FoldoutDirectLightEnd: 0
-    - _FoldoutEmissRim: 0
-    - _FoldoutEmissRimEnd: 0
-    - _FoldoutEyelash: 0
-    - _FoldoutEyelashEnd: 0
-    - _FoldoutHairSpec: 0
-    - _FoldoutHairSpecEnd: 0
-    - _FoldoutIndirectLight: 0
-    - _FoldoutIndirectLightEnd: 0
-    - _FoldoutOutline: 0
-    - _FoldoutOutlineEnd: 0
-    - _FoldoutPBRProp: 0
-    - _FoldoutPBRPropEnd: 0
-    - _FoldoutShadowRamp: 0
-    - _FoldoutShadowRampEnd: 0
-    - _FoldoutTex: 0
-    - _FoldoutTexEnd: 0
-    - _FringeShadowSource: 0
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
-    - _INDIR_CUBEMAP: 0
-    - _IndirDiffIntensity: 0.86
-    - _IndirDiffUpDirSH: 0
-    - _IndirSpecCubeWeight: 0.5
-    - _IndirSpecIntensity: 1.85
-    - _MainLightColorLerp: 0.32
     - _Metallic: 0
-    - _NormalScale: 1
-    - _NoseSpecMax: 0.5
-    - _NoseSpecMin: 0
-    - _NoseSpecSlider: 0
-    - _Occlusion: 1
     - _OcclusionStrength: 1
-    - _OutLineNormalSource: 0
-    - _OutlineClampScale: 1
-    - _OutlineDirectLightingOffset: -1
-    - _OutlinePunctualLightingOffset: -1
-    - _OutlineWidth: 0.68
     - _Parallax: 0.005
-    - _PunctualRimWidth: 4.9
     - _QueueOffset: 0
     - _ReceiveShadows: 1
-    - _SHADOW_RAMP: 1
-    - _ShadowOffset: 0.48
-    - _ShadowSmoothNdotL: 0.16
-    - _ShadowSmoothScene: 0.22
-    - _ShadowStrength: 0.86
-    - _Smoothness: 0.62
+    - _Smoothness: 0.5
     - _SmoothnessTextureChannel: 0
-    - _SpecMinimum: 0.16
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
     - _Surface: 0
-    - _ToonFlagsKeywords: 2
     - _WorkflowMode: 1
     - _ZWrite: 1
     m_Colors:
     - _BaseColor: {r: 1, g: 1, b: 1, a: 1}
-    - _BaseColorOutter: {r: 1, g: 1, b: 1, a: 1}
     - _Color: {r: 1, g: 1, b: 1, a: 1}
-    - _DirectRimBackCol: {r: 0.36, g: 0.44, b: 0.8, a: 0.7}
-    - _DirectRimFrontCol: {r: 1.08, g: 0.82, b: 1.12, a: 0.5}
-    - _EmissionCol: {r: 0, g: 0, b: 0, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
-    - _NoseSpecColor: {r: 0, g: 0, b: 0, a: 1}
-    - _OutlineColor: {r: 0.035, g: 0.03, b: 0.06, a: 0.86}
-    - _OutlineDirectLightingColor: {r: 0.55, g: 0.48, b: 0.72, a: 0.45}
-    - _OutlinePunctualLightingColor: {r: 0.34, g: 0.45, b: 0.8, a: 0.45}
-    - _SelfEnvColor: {r: 0.28, g: 0.32, b: 0.48, a: 0.58}
-    - _SelfLight: {r: 1.02, g: 0.96, b: 1.08, a: 1}
-    - _ShadowColor: {r: 0.16, g: 0.14, b: 0.26, a: 1}
-    - _SpecColor: {r: 0.95, g: 0.88, b: 1.1, a: 1}
+    - _SpecColor: {r: 0.19999996, g: 0.19999996, b: 0.19999996, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

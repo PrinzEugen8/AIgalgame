@@ -48,9 +48,10 @@ public class ReactNativeUnityViewManager extends ReactNativeUnityViewManagerSpec
   @NonNull
   @Override
   public ReactNativeUnityView createViewInstance(@NonNull ThemedReactContext context) {
-    RelaxRoomStartupNativeLog.mark("native_view_create");
+    RelaxRoomStartupNativeLog.beginNativeTimingIfNeeded();
     view = new ReactNativeUnityView(this.context);
     view.addOnAttachStateChangeListener(this);
+    RelaxRoomStartupNativeLog.mark("native_view_create");
 
     if (getPlayer() != null) {
         try {
@@ -176,6 +177,16 @@ public class ReactNativeUnityViewManager extends ReactNativeUnityViewManagerSpec
   }
 
   public static void sendMessageToMobileApp(String message) {
+    if (message != null && message.contains("\"evt\":\"startup_milestone\"")) {
+      String stage = extractJsonStringField(message, "stage");
+      String detail = extractJsonStringField(message, "detail");
+      if (stage != null) {
+        RelaxRoomStartupNativeLog.onUnityStageReceived(stage, detail);
+      }
+    } else if (message != null && message.contains("\"evt\":\"startup_timeline\"")) {
+      RelaxRoomStartupNativeLog.onUnityStageReceived("startup_timeline");
+    }
+
     if (view == null) {
       pendingMessages.add(message);
       return;
@@ -194,6 +205,39 @@ public class ReactNativeUnityViewManager extends ReactNativeUnityViewManagerSpec
     data.putString("message", message);
     ReactContext reactContext = (ReactContext) view.getContext();
     reactContext.getJSModule(RCTEventEmitter.class).receiveEvent(view.getId(), "onUnityMessage", data);
+  }
+
+  private static String extractJsonStringField(String json, String fieldName) {
+    if (json == null || fieldName == null) {
+      return null;
+    }
+
+    String token = "\"" + fieldName + "\":\"";
+    int start = json.indexOf(token);
+    if (start < 0) {
+      return null;
+    }
+
+    start += token.length();
+    int end = start;
+    while (end < json.length()) {
+      if (json.charAt(end) == '\\') {
+        end += 2;
+        continue;
+      }
+      if (json.charAt(end) == '"') {
+        break;
+      }
+      end += 1;
+    }
+
+    if (end >= json.length()) {
+      return null;
+    }
+
+    return json.substring(start, end)
+      .replace("\\\"", "\"")
+      .replace("\\\\", "\\");
   }
 
   private static void flushPendingMessages() {
@@ -258,7 +302,6 @@ public class ReactNativeUnityViewManager extends ReactNativeUnityViewManagerSpec
   @Override
   public void onViewAttachedToWindow(View v) {
     RelaxRoomStartupNativeLog.mark("native_view_window_attached");
-    restoreUnityUserState();
     flushPendingMessages();
   }
 

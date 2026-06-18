@@ -56,6 +56,34 @@ namespace AIgalgame.Motion
 #endif
             }
 
+            public Task<AIGalgameLocalAsrResult> PrepareAndroidAsync()
+            {
+#if UNITY_ANDROID && !UNITY_EDITOR
+                return Task.Run(() =>
+                {
+                    AndroidJNI.AttachCurrentThread();
+                    try
+                    {
+                        lock (sync)
+                        {
+                            EnsureAndroidRecognizer();
+                            return AIGalgameLocalAsrResult.Success("ready");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        return AIGalgameLocalAsrResult.Fail(error.Message);
+                    }
+                    finally
+                    {
+                        AndroidJNI.DetachCurrentThread();
+                    }
+                });
+#else
+                return Task.FromResult(AIGalgameLocalAsrResult.Fail("Android sherpa ASR is only available in an Android player build"));
+#endif
+            }
+
             public Task<AIGalgameLocalAsrResult> RecognizeAndroidAsync(float[] monoSamples, int sampleRate)
             {
 #if UNITY_ANDROID && !UNITY_EDITOR

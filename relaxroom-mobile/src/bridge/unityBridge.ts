@@ -8,6 +8,7 @@ import type {
 import {
   logStartupStage,
   mergeUnityTimeline,
+  maybeLogStartupSummary,
   recordMilestone,
 } from './startupDiagnostics';
 
@@ -70,7 +71,7 @@ export function handleUnityMessage(raw: string) {
     const event = JSON.parse(raw) as UnityBridgeEvent;
     if (event.evt === 'startup_milestone') {
       recordMilestone(
-        'native',
+        event.source === 'unity' ? 'unity' : 'native',
         event.stage ?? 'unknown',
         event.elapsed_ms ?? 0,
         event.detail,
@@ -95,6 +96,10 @@ export function handleUnityMessage(raw: string) {
     }
     if (event.evt === 'environment_ready') {
       logStartupStage('environment_ready', event.state);
+    }
+    if (event.evt === 'stable_frame') {
+      logStartupStage('stable_frame', event.state);
+      maybeLogStartupSummary('stable_frame');
     }
     listeners.forEach(listener => listener(event));
   } catch (error) {
