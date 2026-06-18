@@ -4004,8 +4004,11 @@ PrefabInstance:
       propertyPath: m_WarningMessage
       value: "\nBinding warning: Some generic clip(s) animate transforms that are
         already bound by a Humanoid avatar. These transforms can only be changed
-        by Humanoid clips.\n\tTransform 'chest'\n\tTransform 'chest'\n\tFrom animation
-        clip 'K_Sitting Idle'\n\tFrom animation clip 'K_Sitting Idle'"
+        by Humanoid clips.\n\tTransform 'lower_leg.L'\n\tTransform 'upper_leg.L'\n\tTransform
+        'lower_arm.L'\n\tTransform 'foot.R'\n\tTransform 'Hand.L'\n\tTransform 'hips'\n\tTransform
+        'spine'\n\tTransform 'chest'\n\tTransform 'upper_arm.L'\n\tTransform 'foot.L'\n\tand
+        more ...\n\tFrom animation clip 'K_Sitting Idle'\n\tFrom animation clip 'K_Sitting
+        Idle'"
       objectReference: {fileID: 0}
     - target: {fileID: 4870552773557632513, guid: 69d5ad381c6b2894c96b30e59da2fc2a, type: 3}
       propertyPath: m_ApplyRootMotion
