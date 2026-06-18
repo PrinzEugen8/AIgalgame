@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -25,6 +25,7 @@ from .image_generation import (
     generate_safe_image,
     normalize_image_kind,
 )
+from .idle_actions import relaxroom_idle_action
 from .logging_setup import maybe_start_debugger, setup_logging
 from .models import (
     Character,
@@ -1467,6 +1468,348 @@ def post_event(event: EventIn, session: Session = Depends(get_session)) -> dict[
         )
         write_diagnostic("event_error", event_type=event.event_type, session_id=event.session_id, error_type=type(exc).__name__, message=str(exc))
         return {"event_type": "error", "event_id": uid("evt"), "session_id": event.session_id, "payload": {"message": str(exc)}}
+
+
+@app.post("/api/relaxroom/idle")
+def relaxroom_idle(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(body.get("character_id") or ""))
+    try:
+        return relaxroom_idle_action(
+            session,
+            user_id=user_id,
+            character_id=character_id,
+            session_id=str(body.get("session_id") or "relaxroom_unity"),
+            idle_seconds=int(body.get("idle_seconds") or 0),
+            local_time=str(body.get("local_time") or ""),
+            scene=str(body.get("scene") or "Scene_01"),
+            allow_llm=bool(body.get("allow_llm", True)),
+        )
+    except ProviderError as exc:
+        logger.warning("relaxroom idle action failed user_id=%s character_id=%s message=%s", user_id, character_id, exc)
+        return {"event_type": "error", "event_id": uid("evt"), "session_id": str(body.get("session_id") or "relaxroom_unity"), "payload": {"message": str(exc)}}
+
+
+RELAXROOM_LOCAL_ASSET_PREFIX = "local://RelaxRoomUI/"
+
+RELAXROOM_MOCK_MEDIA_BY_MOMENT: dict[str, dict[str, Any]] = {
+    "seed_moment_atri_morning": {
+        "type": "image",
+        "images": [
+            f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_room_lamp",
+            f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_rain_city",
+        ],
+    },
+    "seed_moment_atri_walk": {
+        "type": "image",
+        "images": [
+            f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_curry_01",
+            f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_curry_02",
+            f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_curry_03",
+        ],
+    },
+    "seed_moment_atri_evening": {
+        "type": "video",
+        "video_thumbnail": f"{RELAXROOM_LOCAL_ASSET_PREFIX}moment_video_thumb",
+        "video_title": "今日片段",
+        "video_duration": "03:24",
+    },
+}
+
+
+def _date_part(value: str) -> str:
+    if not value:
+        return datetime.now(timezone.utc).date().isoformat()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return value[:10] if len(value) >= 10 else datetime.now(timezone.utc).date().isoformat()
+
+
+def _relationship_start_date(user: User | None) -> str:
+    if user is None:
+        return datetime.now(timezone.utc).date().isoformat()
+    profile = load_json(user.profile_json, {})
+    if not isinstance(profile, dict):
+        profile = {}
+    configured = str(profile.get("relationship_start_date") or profile.get("relation_start_date") or "").strip()
+    return _date_part(configured or user.created_at)
+
+
+def _relaxroom_quick_replies(next_slot: ScheduleSlot | None, unread_count: int) -> list[str]:
+    return []
+
+
+def _relaxroom_daily_tip(next_slot: ScheduleSlot | None, unread_count: int) -> str:
+    if unread_count > 0:
+        return "今日提示：朋友圈有人刚刚互动过"
+    if next_slot is not None and next_slot.activity_title:
+        return f"今日提示：她接下来想去{next_slot.activity_title}"
+    return "今日提示：今天也要好好吃饭哦～"
+
+
+@app.get("/api/relaxroom/home")
+def relaxroom_home(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+    session_id: str = "relaxroom_unity",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
+    ensure_schedule(session, user_id=user_id, character_id=character_id, day=datetime.now())
+    user = session.get(User, user_id)
+    character = session.get(Character, character_id)
+    display_name = character.name if character and character.name else character_id
+    next_slot = session.execute(
+        select(ScheduleSlot)
+        .where(ScheduleSlot.user_id == user_id, ScheduleSlot.character_id == character_id, ScheduleSlot.actual_status == "pending")
+        .order_by(ScheduleSlot.start_at)
+        .limit(1)
+    ).scalar_one_or_none()
+    unread = session.execute(
+        select(MomentInteraction).where(MomentInteraction.actor_id == user_id, MomentInteraction.reflected_in_chat == False)  # noqa: E712
+    ).scalars().all()
+    unread_count = len(unread)
+    return {
+        "relationship_start_date": _relationship_start_date(user),
+        "daily_tip": _relaxroom_daily_tip(next_slot, unread_count),
+        "quick_replies": _relaxroom_quick_replies(next_slot, unread_count),
+        "companion_name": display_name,
+        "user_name": user.display_name if user and user.display_name else "你",
+        "chat_state_label": f"夜雨空间 · 和{display_name}聊天中",
+        "session_id": session_id,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "unread_moment_interactions": unread_count,
+    }
+
+
+def _relaxroom_moment_metadata(row: Moment) -> dict[str, Any]:
+    metadata = load_json(row.mood_snapshot, {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _moment_media_for_relaxroom(row: Moment, index: int) -> dict[str, Any]:
+    metadata = _relaxroom_moment_metadata(row)
+    custom_media = metadata.get("relaxroom_media")
+    if isinstance(custom_media, dict):
+        return {
+            "type": str(custom_media.get("type") or "text"),
+            "images": [str(item) for item in custom_media.get("images") or [] if str(item).strip()],
+            "video_thumbnail": str(custom_media.get("video_thumbnail") or ""),
+            "video_title": str(custom_media.get("video_title") or ""),
+            "video_duration": str(custom_media.get("video_duration") or ""),
+        }
+
+    if row.media_asset_id:
+        return {
+            "type": "image",
+            "images": [f"/media/{row.media_asset_id}"],
+        }
+    by_id = RELAXROOM_MOCK_MEDIA_BY_MOMENT.get(row.moment_id)
+    if by_id is not None:
+        return by_id
+    fallbacks = list(RELAXROOM_MOCK_MEDIA_BY_MOMENT.values())
+    return fallbacks[index % len(fallbacks)] if fallbacks else {"type": "text"}
+
+
+def _moment_to_relaxroom_post(row: Moment, interactions: list[MomentInteraction], index: int) -> dict[str, Any]:
+    metadata = _relaxroom_moment_metadata(row)
+    media = _moment_media_for_relaxroom(row, index)
+    likes = [item.actor_name or item.actor_id for item in interactions if item.interaction_type == "like"]
+    comments = [
+        {
+            "user": item.actor_name or item.actor_id,
+            "text": item.content,
+            "created_at": item.created_at,
+        }
+        for item in interactions
+        if item.interaction_type == "comment"
+    ]
+    return {
+        "id": row.moment_id,
+        "username": row.author_name,
+        "created_at": row.created_at,
+        "time": "",
+        "visibility_label": str(metadata.get("visibility_label") or "仅好友可见"),
+        "type": str(media.get("type") or "text"),
+        "text": row.text,
+        "avatar_url": str(metadata.get("avatar_url") or f"{RELAXROOM_LOCAL_ASSET_PREFIX}avatar_xiaobai"),
+        "images": media.get("images") or [],
+        "video_thumbnail": str(media.get("video_thumbnail") or ""),
+        "video_title": str(media.get("video_title") or ""),
+        "video_duration": str(media.get("video_duration") or ""),
+        "likes": likes,
+        "comments": comments,
+    }
+
+
+@app.get("/api/relaxroom/moments")
+def relaxroom_moments(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+    session_id: str = "relaxroom_unity",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
+    character = session.get(Character, character_id)
+    display_name = character.name if character and character.name else character_id
+    candidate_rows = session.execute(
+        select(Moment)
+        .where(or_(Moment.author_id == character_id, Moment.author_id == ""))
+        .order_by(Moment.created_at.desc())
+        .limit(200)
+    ).scalars().all()
+    test_scope = f"relaxroom_test:{user_id}"
+    rows: list[Moment] = []
+    for row in candidate_rows:
+        if row.visibility == "relaxroom_test" and row.source_experience_id != test_scope:
+            continue
+        rows.append(row)
+        if len(rows) >= 50:
+            break
+
+    posts: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        interactions = session.execute(select(MomentInteraction).where(MomentInteraction.moment_id == row.moment_id)).scalars().all()
+        posts.append(_moment_to_relaxroom_post(row, interactions, index))
+    return {
+        "profile": {
+            "name": "夜雨空间",
+            "status_suffix": "今天也是好好地过",
+            "update_note": f"{display_name}更新了 {len(posts)} 条动态",
+            "avatar_url": f"{RELAXROOM_LOCAL_ASSET_PREFIX}avatar_xiaobai",
+        },
+        "posts": posts,
+        "session_id": session_id,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _relaxroom_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _relaxroom_actor_name(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("user") or value.get("actor_name") or value.get("name") or value.get("actor_id") or "").strip()
+    return str(value or "").strip()
+
+
+@app.post("/api/relaxroom/moments/test")
+def relaxroom_create_test_moment(payload: dict[str, Any] | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
+    body = payload or {}
+    user_id = str(body.get("user_id") or DEFAULT_USER_ID)
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=str(body.get("character_id") or ""))
+    character = session.get(Character, character_id)
+    display_name = character.name if character and character.name else character_id
+
+    images = _relaxroom_string_list(body.get("images"))
+    video_thumbnail = str(body.get("video_thumbnail") or "").strip()
+    post_type = str(body.get("type") or ("video" if video_thumbnail else "image" if images else "text")).strip() or "text"
+    text = str(body.get("text") or "").strip()
+    if not text and not images and not video_thumbnail:
+        raise HTTPException(status_code=400, detail="text, images, or video_thumbnail is required")
+
+    moment_id = str(body.get("id") or body.get("moment_id") or uid("moment"))
+    created_at = str(body.get("created_at") or datetime.now(timezone.utc).isoformat())
+    visibility_label = str(body.get("visibility_label") or "仅好友可见").strip() or "仅好友可见"
+    avatar_url = str(body.get("avatar_url") or f"{RELAXROOM_LOCAL_ASSET_PREFIX}avatar_xiaobai").strip()
+    media = {
+        "type": post_type,
+        "images": images,
+        "video_thumbnail": video_thumbnail,
+        "video_title": str(body.get("video_title") or "").strip(),
+        "video_duration": str(body.get("video_duration") or "").strip(),
+    }
+    moment = Moment(
+        moment_id=moment_id,
+        author_type=str(body.get("author_type") or "heroine"),
+        author_id=character_id,
+        author_name=str(body.get("username") or body.get("author_name") or display_name),
+        text=text,
+        visibility=str(body.get("visibility") or "relaxroom_test"),
+        source_experience_id=f"relaxroom_test:{user_id}",
+        mood_snapshot=dump_json(
+            {
+                "relaxroom_media": media,
+                "visibility_label": visibility_label,
+                "avatar_url": avatar_url,
+            }
+        ),
+        created_at=created_at,
+    )
+    session.merge(moment)
+    session.execute(delete(MomentInteraction).where(MomentInteraction.moment_id == moment_id))
+
+    raw_likes = body.get("likes") or []
+    if isinstance(raw_likes, str):
+        raw_likes = _relaxroom_string_list(raw_likes)
+    elif not isinstance(raw_likes, list):
+        raw_likes = [raw_likes]
+
+    raw_comments = body.get("comments") or []
+    if isinstance(raw_comments, str):
+        raw_comments = _relaxroom_string_list(raw_comments)
+    elif not isinstance(raw_comments, list):
+        raw_comments = [raw_comments]
+
+    interactions: list[MomentInteraction] = []
+    for like in raw_likes:
+        actor_name = _relaxroom_actor_name(like)
+        if not actor_name:
+            continue
+        interactions.append(
+            MomentInteraction(
+                interaction_id=uid("mi"),
+                moment_id=moment_id,
+                actor_id=actor_name,
+                actor_name=actor_name,
+                interaction_type="like",
+                created_at=created_at,
+            )
+        )
+
+    for comment in raw_comments:
+        if isinstance(comment, dict):
+            actor_name = _relaxroom_actor_name(comment)
+            content = str(comment.get("text") or comment.get("content") or "").strip()
+            comment_created_at = str(comment.get("created_at") or created_at)
+        else:
+            actor_name = "测试用户"
+            content = str(comment or "").strip()
+            comment_created_at = created_at
+        if not content:
+            continue
+        interactions.append(
+            MomentInteraction(
+                interaction_id=uid("mi"),
+                moment_id=moment_id,
+                actor_id=actor_name or "test_user",
+                actor_name=actor_name or "测试用户",
+                interaction_type="comment",
+                content=content,
+                created_at=comment_created_at,
+            )
+        )
+
+    for item in interactions:
+        session.add(item)
+    session.commit()
+
+    saved = session.get(Moment, moment_id)
+    saved_interactions = session.execute(select(MomentInteraction).where(MomentInteraction.moment_id == moment_id)).scalars().all()
+    return {
+        "ok": True,
+        "moment_id": moment_id,
+        "post": _moment_to_relaxroom_post(saved, saved_interactions, 0) if saved is not None else {},
+    }
 
 
 def _parse_client_time(value: str = "") -> datetime | None:

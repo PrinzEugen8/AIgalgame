@@ -1,0 +1,28 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 8c4c8ef7e2dd4d54893d9b3a74b92811, type: 3}
+  m_Name: RelaxRoomAudioConfig
+  m_EditorClassIdentifier: 
+  bgmClip: {fileID: 8300000, guid: e1d3e26a08e2fa8408830848356e3131, type: 3}
+  phoneNotificationClip: {fileID: 8300000, guid: 707a7cfca5091c9409f02351fe8fa230, type: 3}
+  phoneTypingClips:
+  - {fileID: 8300000, guid: c9dc76b53512b5d4e8594f3d927ab7ed, type: 3}
+  - {fileID: 8300000, guid: 77e1759a433697840830d88a9b72af14, type: 3}
+  - {fileID: 8300000, guid: 5a6ff6066e749da41b4dbeeeec7747ea, type: 3}
+  - {fileID: 8300000, guid: e0e8bc7e11ec12f479866dc4caf00604, type: 3}
+  - {fileID: 8300000, guid: 2b718e5d8ab7c91488f326bb2f0039c2, type: 3}
+  keyboardTypingClips:
+  - {fileID: 8300000, guid: cebff063e1e010b4c96394816b44e806, type: 3}
+  - {fileID: 8300000, guid: 2ceb36cdbc673f846b9c5429c4493f82, type: 3}
+  - {fileID: 8300000, guid: a4f44074397330846bf4fba6dd7c7e6e, type: 3}
+  - {fileID: 8300000, guid: 07474d3eafc96a649a1c7895dfd93457, type: 3}
+  - {fileID: 8300000, guid: fd26b9bea641e664dab60098229fa222, type: 3}

@@ -126,16 +126,96 @@ def _build_recent_dialogue(session: Session, event: EventIn) -> str:
     return "\n".join(lines) or "暂无近期对话。"
 
 
-_EXPRESSION_TAG_RE = re.compile(r"\[(happy|shy|thinking|calm|sad|angry)\]", re.IGNORECASE)
+_EXPRESSION_TAG_RE = re.compile(r"\[(happy|shy|thinking|calm|sad|angry|neutral|relaxed|surprised)\]", re.IGNORECASE)
+_CONTROLLER_TAG_RE = re.compile(r"\[(face|anim|pause)\s*:\s*([^\]]+)\]", re.IGNORECASE)
 
 
 def _split_expression_tag(text: str) -> tuple[str, str]:
-    match = _EXPRESSION_TAG_RE.search(text or "")
-    if not match:
-        return text, ""
-    expression = match.group(1).lower()
-    cleaned = _EXPRESSION_TAG_RE.sub("", text).strip()
+    cleaned, expression, _motion, _pause = _split_controller_tags(text)
     return cleaned, expression
+
+
+def _split_controller_tags(text: str) -> tuple[str, str, str, float]:
+    source = text or ""
+    expression = ""
+    motion = ""
+    pause = 0.0
+
+    def replace_controller_tag(match: re.Match[str]) -> str:
+        nonlocal expression, motion, pause
+        tag = match.group(1).lower()
+        value = match.group(2).strip()
+        if tag == "face" and value:
+            expression = value
+        elif tag == "anim" and value:
+            motion = value
+        elif tag == "pause":
+            try:
+                pause = max(0.0, min(10.0, float(value)))
+            except (TypeError, ValueError):
+                pause = 0.0
+        return ""
+
+    cleaned = _CONTROLLER_TAG_RE.sub(replace_controller_tag, source)
+    match = _EXPRESSION_TAG_RE.search(cleaned)
+    if not match:
+        return " ".join(cleaned.split()).strip(), expression.lower(), motion, pause
+    expression = expression or match.group(1).lower()
+    cleaned = _EXPRESSION_TAG_RE.sub("", cleaned)
+    return " ".join(cleaned.split()).strip(), expression.lower(), motion, pause
+
+
+def _boolish(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"0", "false", "no", "off", "none"}:
+        return False
+    if text in {"1", "true", "yes", "on", "auto"}:
+        return True
+    return default
+
+
+def _floatish(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dialogue_controller(
+    *,
+    emotion: str,
+    pose: str,
+    expression: str = "",
+    motion: str = "",
+    state: str = "speaking",
+    focus: str = "",
+    mouth: str = "auto",
+    lipsync: bool = True,
+    pause: float = 0.0,
+) -> dict[str, Any]:
+    normalized_state = str(state or "speaking").strip().lower()
+    if normalized_state not in {"idle", "typing", "speaking"}:
+        normalized_state = "speaking"
+    face = str(expression or emotion or "calm").strip()
+    animation = str(motion or pose or "idle").strip()
+    normalized_pause = max(0.0, min(10.0, float(pause or 0.0)))
+    tags = [f"[face:{face}]", f"[anim:{animation}]"]
+    if normalized_pause > 0:
+        tags.append(f"[pause:{normalized_pause:g}]")
+    return {
+        "state": normalized_state,
+        "face": face,
+        "animation": animation,
+        "focus": str(focus or "").strip(),
+        "mouth": str(mouth or "auto").strip().lower(),
+        "lipsync": bool(lipsync),
+        "pause": normalized_pause,
+        "tags": tags,
+    }
 
 
 def _summary_text(value: str, limit: int = 120) -> str:
@@ -1277,17 +1357,41 @@ def _wants_continuation(result: dict[str, Any], reply_mode: str, reply_depth: st
     return bool(str(result.get("continuation_intent") or "").strip() and reply_depth in {"deep", "multi_bubble"})
 
 
-def _dialogue_line_candidates(lines: Any, *, max_chars: int = 34) -> list[dict[str, str]]:
-    candidates: list[dict[str, str]] = []
+def _dialogue_line_candidates(lines: Any, *, max_chars: int = 34) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     for item in lines or []:
         if not isinstance(item, dict):
             continue
+        controller = item.get("controller") if isinstance(item.get("controller"), dict) else {}
         line_emotion = str(item.get("emotion") or "calm")
-        line_expression = str(item.get("expression") or "").strip()
+        line_pose = str(item.get("pose") or "idle")
+        line_expression = str(controller.get("face") or item.get("expression") or "").strip()
+        line_motion = str(controller.get("animation") or item.get("motion") or "").strip()
+        line_state = str(controller.get("state") or item.get("state") or "speaking").strip()
+        line_focus = str(controller.get("focus") or item.get("focus") or "").strip()
+        line_mouth = str(controller.get("mouth") or item.get("mouth") or "auto").strip()
+        line_lipsync = _boolish(controller.get("lipsync", item.get("lipsync")), default=True)
+        line_pause = max(0.0, min(10.0, _floatish(controller.get("pause", item.get("pause")), default=0.0)))
+        visual_cues = _normalize_visual_cues(item.get("visual_cues") or item.get("expression_cues") or [], line_expression or line_emotion)
         line_text = " ".join(str(item.get("text") or "").split()).strip()
-        line_text, inline_expression = _split_expression_tag(line_text)
+        line_text, inline_expression, inline_motion, _inline_pause = _split_controller_tags(line_text)
         if not line_expression:
             line_expression = inline_expression
+        if not line_motion:
+            line_motion = inline_motion
+        if not line_pause:
+            line_pause = _inline_pause
+        line_controller = _dialogue_controller(
+            emotion=line_emotion,
+            pose=line_pose,
+            expression=line_expression,
+            motion=line_motion,
+            state=line_state,
+            focus=line_focus,
+            mouth=line_mouth,
+            lipsync=line_lipsync,
+            pause=line_pause,
+        )
         ja_candidate = str(item.get("tts_text_ja") or item.get("tts_text") or item.get("ja") or "").strip()
         for chunk_index, chunk_text in enumerate(_normalize_line_text(line_text, max_chars=max_chars)):
             if not _has_tts_readable_text(chunk_text):
@@ -1296,12 +1400,39 @@ def _dialogue_line_candidates(lines: Any, *, max_chars: int = 34) -> list[dict[s
                 {
                     "text": chunk_text,
                     "emotion": line_emotion,
-                    "pose": str(item.get("pose") or "idle"),
+                    "pose": line_pose,
                     "expression": line_expression,
+                    "motion": line_motion,
+                    "controller": line_controller,
+                    "visual_cues": visual_cues if chunk_index == 0 else [],
                     "tts_text_ja": ja_candidate if chunk_index == 0 else "",
                 }
             )
     return candidates
+
+
+def _normalize_visual_cues(raw_cues: Any, fallback_face: str) -> list[dict[str, Any]]:
+    if not isinstance(raw_cues, list):
+        return []
+    cues: list[dict[str, Any]] = []
+    for item in raw_cues[:6]:
+        if not isinstance(item, dict):
+            continue
+        face = str(item.get("face") or item.get("expression") or item.get("emotion") or fallback_face or "calm").strip()
+        focus = str(item.get("focus") or "").strip()
+        text = " ".join(str(item.get("text") or item.get("span") or "").split()).strip()
+        if not face and not focus:
+            continue
+        cues.append(
+            {
+                "text": text,
+                "face": face,
+                "expression": str(item.get("expression") or face).strip(),
+                "focus": focus,
+                "weight": max(0.1, min(1.0, _floatish(item.get("weight"), default=1.0))),
+            }
+        )
+    return cues
 
 
 def _continuation_candidates(
@@ -1317,7 +1448,7 @@ def _continuation_candidates(
     references: dict[str, Any],
     requires_japanese_tts: bool,
     stats_collector: list[dict[str, Any]],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if not first_lines or reply_depth not in {"deep", "multi_bubble"}:
         return []
     prompt = {
@@ -1339,6 +1470,9 @@ def _continuation_candidates(
                     "emotion": "happy|shy|thinking|calm|sad",
                     "pose": "idle|happy|shy|thinking",
                     "expression": "happy|shy|thinking|calm|sad|angry|",
+                    "motion": "idle|typing|speaking|happy|shy|thinking|angry|",
+                    "controller": {"state": "speaking", "face": "happy", "animation": "speaking", "mouth": "auto", "lipsync": True, "pause": 0},
+                    "visual_cues": [{"text": "对应该情绪的短片段", "face": "happy|shy|thinking|calm|sad|angry", "focus": "user|computer|phone|down|away", "weight": 0.8}],
                     "tts_text_ja": "日文 TTS 可选；requires_japanese_tts=true 时必填",
                 }
             ]
@@ -1651,6 +1785,14 @@ def _llm_dialogue(
 {gate}
 建议回复深度：{reply_depth_hint}
 
+【前端角色控制协议】
+普通用户消息回复只需要生成文字和语音用的情绪，不要主动选择动作，也不要要求口型。
+- motion 留空，controller.animation 留空。
+- controller.mouth 用 none，controller.lipsync 用 false。
+- expression 可用于轻微表情，但不要在 text 里写 [face:...]、[anim:...] 这类控制标签。
+- visual_cues 可选，用于一句话内部的细小表情/视线变化；每个 cue 的 text 写对应短片段，face 写 happy|shy|thinking|calm|sad|angry，focus 写 user|computer|phone|down|away。
+- 闲时自言自语和触摸反馈有单独接口负责动作、口型和正视，不在本普通回复接口里处理。
+
 输出格式：
 {{
   "reply_mode": "silent|light|opening|normal|key_moment",
@@ -1658,8 +1800,8 @@ def _llm_dialogue(
   "reply_depth": "brief|normal|deep|multi_bubble",
   "should_continue": false,
   "continuation_intent": "如果 should_continue=true，说明下一轮续写要补什么",
-  "lines": [{{"text": "短中文台词", "emotion": "happy|shy|thinking|calm|sad", "pose": "idle|happy|shy|thinking", "expression": "happy|shy|thinking|calm|sad|angry|"}}],
-expression 可留空；需要更强面部表现时填写，与 emotion 可不同。也可在 text 内写 [shy] 这类标签。
+  "lines": [{{"text": "短中文台词", "emotion": "happy|shy|thinking|calm|sad", "pose": "idle", "expression": "happy|shy|thinking|calm|sad|angry|", "motion": "", "controller": {{"state":"speaking","face":"happy","animation":"","mouth":"none","lipsync":false,"pause":0}}, "visual_cues":[{{"text":"短片段","face":"thinking","focus":"user","weight":0.8}}]}}],
+expression 可留空；需要更强面部表现时填写，与 emotion 可不同。不要在 text 内写动作或表情控制标签。visual_cues 只写 0 到 3 个，不要过密。
   "normal_replies": [{{"text": "用户可选回复"}}],
   "key_reply_score": 0,
   "key_reply_reason": "为什么这次需要或不需要特殊回复",
@@ -1869,6 +2011,23 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
             break
         line_text = str(item.get("text") or "").strip()
         line_emotion = str(item.get("emotion") or "calm")
+        line_expression = str(item.get("expression") or "")
+        line_pose = str(item.get("pose") or "idle")
+        line_motion = str(item.get("motion") or "")
+        line_controller = item.get("controller") if isinstance(item.get("controller"), dict) else {}
+        if event.event_type == "user_message":
+            controller_face = str(line_controller.get("face") or line_expression or line_emotion or "calm").strip()
+            line_pose = ""
+            line_motion = ""
+            line_controller = {
+                "state": "speaking",
+                "face": controller_face,
+                "animation": "",
+                "focus": str(line_controller.get("focus") or "").strip(),
+                "mouth": "none",
+                "lipsync": False,
+                "pause": max(0.0, min(10.0, _floatish(line_controller.get("pause"), default=0.0))),
+            }
         line_started = time.monotonic()
         tts_url, tts_error = _tts_for_line(
             session,
@@ -1894,8 +2053,11 @@ interest_topics 只允许包含用户明确说“我关注/我喜欢/我想了�
                 line_id=uid("line"),
                 text=line_text,
                 emotion=line_emotion,
-                pose=str(item.get("pose") or "idle"),
-                expression=str(item.get("expression") or ""),
+                pose=line_pose,
+                expression=line_expression,
+                motion=line_motion,
+                controller=line_controller,
+                visual_cues=item.get("visual_cues") if isinstance(item.get("visual_cues"), list) else [],
                 tts_audio_url=tts_url,
                 tts_error=tts_error,
             )

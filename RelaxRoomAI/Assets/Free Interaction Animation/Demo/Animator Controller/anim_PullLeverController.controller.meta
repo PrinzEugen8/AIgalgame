@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: fb3236cd08181014dabfaa046dbde516
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 9100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 352196
+  packageName: Free Interaction Animation
+  packageVersion: 1.0
+  assetPath: Assets/Free Interaction Animation/Demo/Animator Controller/anim_PullLeverController.controller
+  uploadId: 839476

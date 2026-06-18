@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: aba073c7196f8634c82265d05845de08
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 9000000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 281422
+  packageName: This package contains idle motion data for 3D characters
+  packageVersion: 1.0
+  assetPath: Assets/Viewport/Model/avatar.asset
+  uploadId: 663321

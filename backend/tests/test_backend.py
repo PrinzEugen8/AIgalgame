@@ -26,7 +26,7 @@ from app.models import CalendarEvent, Character, DeviceRegistration, Experience,
 from app.news import dispatch_trend_radar_workflow, sync_trend_radar_snapshot, trend_radar_payload_for_news  # noqa: E402
 from app.online import clear_online_state, is_online, mark_offline, mark_online  # noqa: E402
 from app.opening import consume_ready_opening, prepare_due_openings, prepare_opening  # noqa: E402
-from app.pipeline import _normalize_line_text, _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
+from app.pipeline import _dialogue_line_candidates, _normalize_line_text, _split_expression_tag, _tts_for_line, handle_event  # noqa: E402
 from app.opening import _instant_greeting_payload  # noqa: E402
 from app.touch_reactions import (  # noqa: E402
     _touch_prompt,
@@ -5834,6 +5834,27 @@ def test_split_expression_tag_strips_inline_marker() -> None:
     assert expression == "shy"
 
 
+def test_chatdoll_controller_tags_feed_dialogue_controller() -> None:
+    text, expression = _split_expression_tag("[face:shy][anim:typing][pause:0.5] hello")
+    assert text == "hello"
+    assert expression == "shy"
+
+    candidates = _dialogue_line_candidates(
+        [{"text": "[face:shy][anim:typing][pause:0.5] hello", "emotion": "calm", "pose": "idle"}],
+        max_chars=40,
+    )
+
+    assert candidates[0]["text"] == "hello"
+    assert candidates[0]["expression"] == "shy"
+    assert candidates[0]["motion"] == "typing"
+    assert candidates[0]["controller"]["state"] == "speaking"
+    assert candidates[0]["controller"]["face"] == "shy"
+    assert candidates[0]["controller"]["animation"] == "typing"
+    assert candidates[0]["controller"]["mouth"] == "auto"
+    assert candidates[0]["controller"]["lipsync"] is True
+    assert candidates[0]["controller"]["pause"] == 0.5
+
+
 def test_normalize_line_text_splits_long_sentence() -> None:
     chunks = _normalize_line_text("这是一句非常非常非常非常非常非常非常非常长的台词，需要被拆开。")
     assert len(chunks) >= 2
@@ -6395,8 +6416,158 @@ def test_dialogue_line_supports_expression_field() -> None:
     )
     payload = line.model_dump()
     assert payload["expression"] == "shy"
+    assert payload["controller"]["face"] == "shy"
+    assert payload["controller"]["animation"] == "idle"
+    assert payload["controller"]["mouth"] == "auto"
+    assert payload["controller"]["lipsync"] is True
     restored = DialogueLine.model_validate(payload)
     assert restored.expression == "shy"
+    assert restored.controller.face == "shy"
+
+
+def test_dialogue_line_supports_motion_and_controller_fields() -> None:
+    line = DialogueLine(
+        line_id="line_controller_test",
+        text="hello",
+        emotion="calm",
+        pose="idle",
+        motion="typing",
+        controller={"state": "typing", "face": "thinking", "animation": "typing", "mouth": "none", "lipsync": False, "pause": 0.25},
+    )
+    payload = line.model_dump()
+    assert payload["motion"] == "typing"
+    assert payload["controller"]["state"] == "typing"
+    assert payload["controller"]["face"] == "thinking"
+    assert payload["controller"]["animation"] == "typing"
+    assert payload["controller"]["mouth"] == "none"
+    assert payload["controller"]["lipsync"] is False
+    assert payload["controller"]["pause"] == 0.25
+    restored = DialogueLine.model_validate(payload)
+    assert restored.motion == "typing"
+    assert restored.controller.animation == "typing"
+
+
+def test_relaxroom_idle_endpoint_returns_motion_payload_without_llm() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"relaxroom_idle_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        user = session.get(User, user_id)
+        assert user is not None
+        user.tts_enabled = False
+        session.commit()
+
+    payload = client.post(
+        "/api/relaxroom/idle",
+        json={
+            "user_id": user_id,
+            "character_id": "atri",
+            "session_id": "relaxroom_test",
+            "idle_seconds": 180,
+            "scene": "Scene_01",
+            "allow_llm": False,
+        },
+    ).json()
+    assert payload["event_type"] == "idle_action"
+    assert payload["session_id"] == "relaxroom_test"
+    assert payload["payload"]["ok"] is True
+    assert payload["payload"]["motion"] in {"idle_tablet", "idle_texting", "idle_typing", "idle_yawn", "idle_waking", "idle"}
+    assert payload["payload"]["lines"][0]["controller"]["lipsync"] is True
+
+
+def test_relaxroom_home_endpoint_matches_unity_contract() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"relaxroom_home_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        user = session.get(User, user_id)
+        assert user is not None
+        user.display_name = "测试用户"
+        user.profile_json = dump_json({"relationship_start_date": "2026-01-11"})
+        session.commit()
+
+    payload = client.get(
+        "/api/relaxroom/home",
+        params={"user_id": user_id, "character_id": "atri", "session_id": "relaxroom_test"},
+    ).json()
+
+    assert payload["relationship_start_date"] == "2026-01-11"
+    assert payload["daily_tip"]
+    assert payload["quick_replies"] == []
+    assert payload["companion_name"]
+    assert payload["user_name"] == "测试用户"
+    assert payload["chat_state_label"].startswith("夜雨空间 · 和")
+    assert payload["server_time"]
+
+
+def test_relaxroom_moments_endpoint_matches_unity_contract() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"relaxroom_moments_{suffix}"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+
+    payload = client.get(
+        "/api/relaxroom/moments",
+        params={"user_id": user_id, "character_id": "atri", "session_id": "relaxroom_test"},
+    ).json()
+
+    assert payload["profile"]["avatar_url"].startswith("local://RelaxRoomUI/")
+    assert payload["posts"]
+    post = payload["posts"][0]
+    assert post["id"]
+    assert post["username"]
+    assert post["created_at"]
+    assert post["time"] == ""
+    assert post["visibility_label"] == "仅好友可见"
+    assert isinstance(post["likes"], list)
+    assert isinstance(post["comments"], list)
+    assert any(
+        str(image).startswith("local://RelaxRoomUI/") for item in payload["posts"] for image in item.get("images", [])
+    ) or any(str(item.get("video_thumbnail", "")).startswith("local://RelaxRoomUI/") for item in payload["posts"])
+
+
+def test_relaxroom_test_moment_can_be_sent_to_unity_contract() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"relaxroom_test_moment_{suffix}"
+    moment_id = f"test_moment_{suffix}"
+    created_at = "2026-06-18T09:30:00+00:00"
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+
+    created = client.post(
+        "/api/relaxroom/moments/test",
+        json={
+            "user_id": user_id,
+            "character_id": "atri",
+            "moment_id": moment_id,
+            "username": "小白",
+            "text": "测试一下前端朋友圈排版。",
+            "created_at": created_at,
+            "visibility_label": "测试可见",
+            "type": "image",
+            "images": ["https://example.com/one.png", "local://RelaxRoomUI/moment_room_lamp"],
+            "likes": ["你", "亚托莉"],
+            "comments": [
+                {"user": "你", "text": "这个 mock 可以看到。", "created_at": "2026-06-18T09:31:00+00:00"},
+                {"user": "小白", "text": "收到。", "created_at": "2026-06-18T09:32:00+00:00"},
+            ],
+        },
+    ).json()
+
+    assert created["ok"] is True
+    assert created["post"]["id"] == moment_id
+    assert created["post"]["created_at"] == created_at
+    assert created["post"]["visibility_label"] == "测试可见"
+    assert created["post"]["images"][0] == "https://example.com/one.png"
+    assert created["post"]["likes"] == ["你", "亚托莉"]
+    assert [item["text"] for item in created["post"]["comments"]] == ["这个 mock 可以看到。", "收到。"]
+
+    payload = client.get(
+        "/api/relaxroom/moments",
+        params={"user_id": user_id, "character_id": "atri", "session_id": "relaxroom_test"},
+    ).json()
+    assert payload["posts"][0]["id"] == moment_id
+    assert payload["posts"][0]["time"] == ""
 
 
 def _map_screen_to_model_space(screen_x: float, screen_y: float, placement: dict[str, float]) -> tuple[float, float]:

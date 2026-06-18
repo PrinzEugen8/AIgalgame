@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 4543e863fb36b144da38006a3e4d7b96
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 2100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 337118
+  packageName: BTR-80 Military Vehicle
+  packageVersion: 1.0
+  assetPath: Assets/Volklight/BTR/BIRP/Materials/Wheels.mat
+  uploadId: 803578

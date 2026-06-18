@@ -1,0 +1,12 @@
+{
+    "asset": "b11a8d4ea86f1ca4f8d4b931b769fcd4",
+    "fileName": "019ed40e-c97a-786c-9724-ebbd295bf2e0.pose.json",
+    "prompt": "A seated young woman leans slightly forward at a desk. Her left elbow rests on the desk and her left hand supports her cheek. Her right hand holds a smartphone on the desk. She looks at the phone quietly in a relaxed waiting pose. Calm, casual, gentle motion.",
+    "negativePrompt": "",
+    "model": "unity-text-to-motion",
+    "modelName": "Text to Motion",
+    "customSeed": 110551532,
+    "w3CTraceId": "",
+    "feedback": 0,
+    "isTrimmed": false
+}

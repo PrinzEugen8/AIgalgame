@@ -24,3 +24,17 @@ android/local.properties
 android/**/build/
 android/.gradle/
 android/.kotlin/
+
+# Unity generated/local files
+RelaxRoomAI/Library/
+RelaxRoomAI/Temp/
+RelaxRoomAI/Logs/
+RelaxRoomAI/obj/
+RelaxRoomAI/.vs/
+RelaxRoomAI/.plastic/
+RelaxRoomAI/UserSettings/
+RelaxRoomAI/MaterialBackups/
+RelaxRoomAI/*.csproj
+RelaxRoomAI/*.sln
+RelaxRoomAI/.vsconfig
+RelaxRoomAI/ignore.conf

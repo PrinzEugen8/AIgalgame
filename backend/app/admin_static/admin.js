@@ -1965,6 +1965,52 @@ async function runDebug(path) {
   }
 }
 
+function splitRelaxroomList(value) {
+  return String(value || "")
+    .split(/[\n,，]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseRelaxroomComments(value) {
+  return splitRelaxroomList(value).map((line) => {
+    const separator = line.includes("：") ? "：" : ":";
+    if (!line.includes(separator)) {
+      return { user: "测试用户", text: line };
+    }
+    const [user, ...rest] = line.split(separator);
+    return { user: user.trim() || "测试用户", text: rest.join(separator).trim() };
+  }).filter((item) => item.text);
+}
+
+async function submitRelaxroomMomentTest(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const resultNode = $("#relaxroomMomentTestResult");
+  resultNode.textContent = "提交中...";
+  const payload = {
+    user_id: form.elements.user_id.value.trim() || "demo_user",
+    character_id: form.elements.character_id.value.trim() || "atri",
+    moment_id: form.elements.moment_id.value.trim(),
+    username: form.elements.username.value.trim(),
+    created_at: form.elements.created_at.value.trim(),
+    visibility_label: form.elements.visibility_label.value.trim(),
+    type: form.elements.type.value,
+    images: splitRelaxroomList(form.elements.images.value),
+    video_thumbnail: form.elements.video_thumbnail.value.trim(),
+    video_title: form.elements.video_title.value.trim(),
+    video_duration: form.elements.video_duration.value.trim(),
+    text: form.elements.text.value.trim(),
+    likes: splitRelaxroomList(form.elements.likes.value),
+    comments: parseRelaxroomComments(form.elements.comments.value),
+  };
+  try {
+    resultNode.textContent = pretty(await api("/api/relaxroom/moments/test", { method: "POST", body: JSON.stringify(payload) }));
+  } catch (error) {
+    resultNode.textContent = pretty({ ok: false, message: error.message });
+  }
+}
+
 function bindAdminNavigation() {
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.addEventListener("click", () => switchPage(button.dataset.pageTarget));
@@ -2788,6 +2834,7 @@ async function boot() {
   }
   $("#voiceForm").addEventListener("submit", saveVoice);
   $("#voiceNew").addEventListener("click", () => setVoiceForm(null));
+  $("#relaxroomMomentTestForm")?.addEventListener("submit", submitRelaxroomMomentTest);
   document.querySelectorAll("[data-debug]").forEach((button) => {
     button.addEventListener("click", () => runDebug(button.dataset.debug));
   });

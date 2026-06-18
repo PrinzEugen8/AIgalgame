@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 324e0ba9e046fd8418cde658e19e851b
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 9100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 281422
+  packageName: This package contains idle motion data for 3D characters
+  packageVersion: 1.0
+  assetPath: Assets/Viewport/Animation/SampleAnimation.controller
+  uploadId: 663321

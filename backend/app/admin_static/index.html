@@ -246,6 +246,35 @@
         </div>
         <pre id="debugResult">等待操作...</pre>
       </article>
+      <article class="manager">
+        <header>
+          <div>
+            <p class="eyebrow">RelaxRoom</p>
+            <h2>朋友圈测试</h2>
+          </div>
+          <span class="badge">Unity Contract</span>
+        </header>
+        <form class="voice-form" id="relaxroomMomentTestForm">
+          <label><span>user_id</span><input name="user_id" value="demo_user"></label>
+          <label><span>character_id</span><input name="character_id" value="atri"></label>
+          <label><span>moment_id（可留空）</span><input name="moment_id" placeholder="manual_test_001"></label>
+          <label><span>发布人</span><input name="username" value="亚托莉"></label>
+          <label><span>发布时间 ISO（可留空）</span><input name="created_at" placeholder="2026-06-18T09:30:00+00:00"></label>
+          <label><span>可见范围</span><input name="visibility_label" value="仅好友可见"></label>
+          <label><span>类型</span><select name="type"><option value="text">text</option><option value="image" selected>image</option><option value="video">video</option></select></label>
+          <label><span>图片 URL（逗号/换行）</span><textarea name="images" rows="2" placeholder="local://RelaxRoomUI/moment_room_lamp"></textarea></label>
+          <label><span>视频封面 URL</span><input name="video_thumbnail" placeholder="local://RelaxRoomUI/moment_video_thumb"></label>
+          <label><span>视频标题</span><input name="video_title" placeholder="今日片段"></label>
+          <label><span>视频时长</span><input name="video_duration" placeholder="03:24"></label>
+          <label><span>正文</span><textarea name="text" rows="3" placeholder="写一条朋友圈测试内容"></textarea></label>
+          <label><span>点赞（逗号/换行）</span><textarea name="likes" rows="2" placeholder="你&#10;同桌同学"></textarea></label>
+          <label><span>评论（每行 用户：内容）</span><textarea name="comments" rows="3" placeholder="你：可以看到评论&#10;同桌同学：收到"></textarea></label>
+          <div class="actions">
+            <button type="submit">发送到前端朋友圈</button>
+          </div>
+        </form>
+        <pre id="relaxroomMomentTestResult">等待提交...</pre>
+      </article>
       <article class="manager" id="proactiveDebugManager">
         <header>
           <div>
