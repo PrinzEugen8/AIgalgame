@@ -94,6 +94,8 @@ namespace AIgalgame.Motion
         [SerializeField] private bool fetchBackendDataOnStart = true;
         [SerializeField] private string homeBootstrapPath = "/api/relaxroom/home";
         [SerializeField] private string momentsPath = "/api/relaxroom/moments";
+        [SerializeField] private string momentLikePathTemplate = "/api/moments/{moment_id}/like";
+        [SerializeField] private string momentCommentPathTemplate = "/api/moments/{moment_id}/comments";
 
         [Header("Quick Replies (backend-driven)")]
         [SerializeField] private ScrollRect quickRepliesScroll;
@@ -107,6 +109,7 @@ namespace AIgalgame.Motion
         [SerializeField] private Text momentsProfileStatus;
         [SerializeField] private Text momentsUpdateNote;
         [SerializeField] private Image momentsProfileAvatar;
+        [SerializeField] private float momentsRefreshIntervalSeconds = 5f;
         [SerializeField] private string momentsStatusSuffixFallback = "今天也是好好地过";
 
         private const float CollapsedChatHeight = 316f;
@@ -115,12 +118,18 @@ namespace AIgalgame.Motion
 
         private BackendReplyOption[] pendingQuickReplies = Array.Empty<BackendReplyOption>();
         private MomentsResponse momentsData;
+        private bool momentsFetchInFlight;
+        private bool momentInteractionInFlight;
+        private string pendingMomentCommentId = "";
+        private string pendingMomentCommentAuthor = "";
+        private float nextMomentsRefreshAt;
         private readonly Dictionary<string, Sprite> spriteCache = new();
         private readonly List<GameObject> spawnedHistorySlots = new();
         private readonly List<GameObject> spawnedQuickReplyChips = new();
         private readonly List<GameObject> spawnedMomentCards = new();
 
         private RectTransform historyContent;
+        private ScrollRect momentsScrollRect;
         private Font font;
         private bool chatExpanded;
         private bool requestInFlight;
@@ -160,7 +169,7 @@ namespace AIgalgame.Motion
             if (fetchBackendDataOnStart)
             {
                 StartCoroutine(FetchHomeBootstrap());
-                StartCoroutine(FetchMoments());
+                RequestMomentsRefresh(true);
             }
         }
 
@@ -179,6 +188,7 @@ namespace AIgalgame.Motion
             }
 
             TryStartIdleAction();
+            TryRefreshMomentsWhileVisible();
         }
 
         private void OnDestroy()
@@ -273,6 +283,11 @@ namespace AIgalgame.Motion
             if (historyScrollRect != null)
             {
                 historyContent = historyScrollRect.content;
+            }
+
+            if (momentsScrollRect == null && momentsContent != null)
+            {
+                momentsScrollRect = momentsContent.GetComponentInParent<ScrollRect>(true);
             }
 
             RegisterButton(socialButton, ShowSocialCircle);
@@ -393,6 +408,12 @@ namespace AIgalgame.Motion
             SetHomeVisible(false);
             SetSettingsVisible(false);
             SetSocialVisible(true);
+            if (momentsData != null)
+            {
+                RefreshMomentsProfile();
+                PopulateMoments();
+            }
+            RequestMomentsRefresh(true);
             RecordInteraction();
         }
 
@@ -400,6 +421,7 @@ namespace AIgalgame.Motion
         {
             SetSocialVisible(false);
             SetHomeVisible(true);
+            ClearPendingMomentComment();
             RecordInteraction();
         }
 
@@ -651,8 +673,40 @@ namespace AIgalgame.Motion
             SendReplyOption(option);
         }
 
+        private void TryRefreshMomentsWhileVisible()
+        {
+            if (!fetchBackendDataOnStart || socialPanel == null || !socialPanel.activeInHierarchy)
+            {
+                return;
+            }
+
+            if (Time.unscaledTime < nextMomentsRefreshAt)
+            {
+                return;
+            }
+
+            RequestMomentsRefresh(false);
+        }
+
+        private void RequestMomentsRefresh(bool force)
+        {
+            if (!fetchBackendDataOnStart || momentsFetchInFlight)
+            {
+                return;
+            }
+
+            if (!force && Time.unscaledTime < nextMomentsRefreshAt)
+            {
+                return;
+            }
+
+            nextMomentsRefreshAt = Time.unscaledTime + Mathf.Max(1f, momentsRefreshIntervalSeconds);
+            StartCoroutine(FetchMoments());
+        }
+
         private IEnumerator FetchMoments()
         {
+            momentsFetchInFlight = true;
             var url = AppendQuery(CombineUrl(backendBaseUrl, momentsPath));
             using var request = UnityWebRequest.Get(url);
             request.SetRequestHeader("Accept", "application/json");
@@ -660,6 +714,7 @@ namespace AIgalgame.Motion
 
             if (request.result != UnityWebRequest.Result.Success)
             {
+                momentsFetchInFlight = false;
                 ApplyMockMoments("朋友圈数据获取失败，显示本地 mock");
                 yield break;
             }
@@ -676,12 +731,14 @@ namespace AIgalgame.Motion
 
             if (data == null)
             {
+                momentsFetchInFlight = false;
                 ApplyMockMoments("朋友圈数据解析失败，显示本地 mock");
                 yield break;
             }
 
             if (data.posts == null || data.posts.Length == 0)
             {
+                momentsFetchInFlight = false;
                 ApplyMockMoments("朋友圈暂时无后端数据，显示本地 mock");
                 yield break;
             }
@@ -689,6 +746,7 @@ namespace AIgalgame.Motion
             momentsData = data;
             RefreshMomentsProfile();
             PopulateMoments();
+            momentsFetchInFlight = false;
         }
 
         private void ApplyMockMoments(string status = null)
@@ -856,13 +914,12 @@ namespace AIgalgame.Motion
                 var cardObj = Instantiate(momentCardTemplate, momentsContent);
                 cardObj.SetActive(true);
                 BindMomentCard(cardObj.transform, post);
+                ConfigureMomentCardLayout(cardObj, post);
                 spawnedMomentCards.Add(cardObj);
             }
 
-            if (momentsContent != null)
-            {
-                LayoutRebuilder.ForceRebuildLayoutImmediate(momentsContent);
-            }
+            RebuildMomentsLayout(resetScroll: true);
+            StartCoroutine(RebuildMomentsLayoutNextFrame());
         }
 
         private void BindMomentCard(Transform card, MomentPost post)
@@ -876,6 +933,7 @@ namespace AIgalgame.Motion
                 : "";
             SetChildText(card, "Likes/Text", likesText);
             SetChildActive(card, "Likes", !string.IsNullOrWhiteSpace(likesText));
+            BindMomentActionButtons(card, post);
 
             var comments = post.comments ?? Array.Empty<MomentComment>();
             var commentsBuilder = new StringBuilder();
@@ -892,8 +950,8 @@ namespace AIgalgame.Motion
                 }
                 commentsBuilder.Append(string.IsNullOrWhiteSpace(comment.user) ? "" : comment.user + "：").Append(comment.text);
             }
-            SetChildText(card, "Comments/Text", commentsBuilder.ToString());
-            SetChildActive(card, "Comments", commentsBuilder.Length > 0);
+            SetChildText(card, "Comments/Text", commentsBuilder.Length > 0 ? commentsBuilder.ToString() : "还没有评论");
+            SetChildActive(card, "Comments", true);
 
             var avatar = FindChildImage(card, "Avatar");
             if (avatar != null && !string.IsNullOrWhiteSpace(post.avatar_url))
@@ -943,6 +1001,223 @@ namespace AIgalgame.Motion
                     }
                 }
             }
+        }
+
+        private void BindMomentActionButtons(Transform card, MomentPost post)
+        {
+            if (card == null || post == null)
+            {
+                return;
+            }
+
+            var hasMomentId = !string.IsNullOrWhiteSpace(post.id);
+            var likeButton = FindChild(card, "LikeButton")?.GetComponent<Button>();
+            if (likeButton != null)
+            {
+                likeButton.onClick.RemoveAllListeners();
+                likeButton.interactable = hasMomentId;
+                SetChildText(likeButton.transform, "Text", HasUserLikedMoment(post) ? "♥ 已赞" : "♥ 点赞");
+                var capturedId = post.id;
+                likeButton.onClick.AddListener(() => OnMomentLikeClicked(capturedId));
+            }
+
+            var commentButton = FindChild(card, "CommentButton")?.GetComponent<Button>();
+            if (commentButton != null)
+            {
+                commentButton.onClick.RemoveAllListeners();
+                commentButton.interactable = hasMomentId;
+                SetChildText(commentButton.transform, "Text", "评论");
+                var capturedId = post.id;
+                var capturedAuthor = post.username;
+                commentButton.onClick.AddListener(() => OnMomentCommentClicked(capturedId, capturedAuthor));
+            }
+        }
+
+        private bool HasUserLikedMoment(MomentPost post)
+        {
+            if (post?.likes == null)
+            {
+                return false;
+            }
+
+            foreach (var actor in post.likes)
+            {
+                if (string.Equals(actor, "你", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(actor, userDisplayName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void OnMomentLikeClicked(string momentId)
+        {
+            if (string.IsNullOrWhiteSpace(momentId) || momentInteractionInFlight)
+            {
+                return;
+            }
+
+            StartCoroutine(PostMomentLike(momentId));
+        }
+
+        private void OnMomentCommentClicked(string momentId, string authorName)
+        {
+            if (string.IsNullOrWhiteSpace(momentId))
+            {
+                return;
+            }
+
+            pendingMomentCommentId = momentId;
+            pendingMomentCommentAuthor = string.IsNullOrWhiteSpace(authorName) ? "这条动态" : authorName;
+            SetInputText("");
+            SetChatExpanded(true);
+            SetStatus($"评论 {pendingMomentCommentAuthor} 的动态");
+            RecordInteraction();
+        }
+
+        private void ClearPendingMomentComment()
+        {
+            pendingMomentCommentId = "";
+            pendingMomentCommentAuthor = "";
+        }
+
+        private void ConfigureMomentCardLayout(GameObject cardObj, MomentPost post)
+        {
+            if (cardObj == null)
+            {
+                return;
+            }
+
+            var rect = cardObj.GetComponent<RectTransform>();
+            var preferredHeight = PreferredMomentCardHeight(post);
+            if (rect != null)
+            {
+                rect.anchorMin = new Vector2(0f, 1f);
+                rect.anchorMax = new Vector2(1f, 1f);
+                rect.pivot = new Vector2(0.5f, 1f);
+                rect.anchoredPosition = Vector2.zero;
+                rect.sizeDelta = new Vector2(0f, preferredHeight);
+            }
+
+            var layout = cardObj.GetComponent<LayoutElement>() ?? cardObj.AddComponent<LayoutElement>();
+            layout.ignoreLayout = false;
+            layout.minHeight = 240f;
+            layout.preferredHeight = preferredHeight;
+            layout.flexibleWidth = 1f;
+            layout.flexibleHeight = 0f;
+            layout.layoutPriority = 20;
+        }
+
+        private static float PreferredMomentCardHeight(MomentPost post)
+        {
+            var textLength = Mathf.Max(0, post?.text?.Length ?? 0);
+            var textLines = Mathf.Clamp(Mathf.CeilToInt(textLength / 22f), 1, 5);
+            var height = 154f + textLines * 34f;
+
+            var imageCount = post?.images?.Length ?? 0;
+            var isImage = string.Equals(post?.type, "image", StringComparison.OrdinalIgnoreCase) && imageCount > 0;
+            if (isImage)
+            {
+                var rows = Mathf.CeilToInt(Mathf.Min(9, imageCount) / 3f);
+                height += rows * 148f + Mathf.Max(0, rows - 1) * 8f + 16f;
+            }
+
+            if (string.Equals(post?.type, "video", StringComparison.OrdinalIgnoreCase))
+            {
+                height += 170f;
+            }
+
+            if (post?.likes != null && post.likes.Length > 0)
+            {
+                height += 48f;
+            }
+
+            height += 58f;
+
+            var commentCount = post?.comments?.Length ?? 0;
+            if (commentCount > 0)
+            {
+                height += Mathf.Min(150f, 28f + commentCount * 36f);
+            }
+            else
+            {
+                height += 50f;
+            }
+
+            return Mathf.Max(300f, height);
+        }
+
+        private IEnumerator RebuildMomentsLayoutNextFrame()
+        {
+            yield return null;
+            RebuildMomentsLayout(resetScroll: true);
+        }
+
+        private void RebuildMomentsLayout(bool resetScroll)
+        {
+            if (momentsContent == null)
+            {
+                return;
+            }
+
+            Canvas.ForceUpdateCanvases();
+            LayoutRebuilder.ForceRebuildLayoutImmediate(momentsContent);
+
+            var height = PreferredMomentsContentHeight();
+            momentsContent.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, height);
+            LayoutRebuilder.ForceRebuildLayoutImmediate(momentsContent);
+
+            if (momentsScrollRect == null)
+            {
+                momentsScrollRect = momentsContent.GetComponentInParent<ScrollRect>(true);
+            }
+
+            if (momentsScrollRect != null)
+            {
+                momentsScrollRect.content = momentsContent;
+                Canvas.ForceUpdateCanvases();
+                if (resetScroll)
+                {
+                    momentsScrollRect.verticalNormalizedPosition = 1f;
+                }
+            }
+
+        }
+
+        private float PreferredMomentsContentHeight()
+        {
+            if (momentsContent == null)
+            {
+                return 0f;
+            }
+
+            var group = momentsContent.GetComponent<VerticalLayoutGroup>();
+            var height = group != null ? group.padding.top + group.padding.bottom : 0f;
+            var activeChildren = 0;
+
+            for (var i = 0; i < momentsContent.childCount; i++)
+            {
+                var child = momentsContent.GetChild(i) as RectTransform;
+                if (child == null || !child.gameObject.activeSelf)
+                {
+                    continue;
+                }
+
+                if (activeChildren > 0 && group != null)
+                {
+                    height += group.spacing;
+                }
+
+                height += Mathf.Max(1f, LayoutUtility.GetPreferredHeight(child));
+                activeChildren++;
+            }
+
+            var viewportHeight = momentsScrollRect != null && momentsScrollRect.viewport != null
+                ? momentsScrollRect.viewport.rect.height
+                : 0f;
+            return Mathf.Max(height, viewportHeight);
         }
 
         private void BindImageGrid(Transform imageGrid, string[] images)
@@ -1116,7 +1391,48 @@ namespace AIgalgame.Motion
 
         private static Transform FindChild(Transform parent, string path)
         {
-            return parent == null ? null : parent.Find(path);
+            if (parent == null || string.IsNullOrWhiteSpace(path))
+            {
+                return null;
+            }
+
+            var child = parent.Find(path);
+            if (child != null)
+            {
+                return child;
+            }
+
+            var segments = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            return segments.Length == 0 ? null : FindDescendantPath(parent, segments, 0);
+        }
+
+        private static Transform FindDescendantPath(Transform parent, string[] segments, int segmentIndex)
+        {
+            for (var i = 0; i < parent.childCount; i++)
+            {
+                var child = parent.GetChild(i);
+                if (string.Equals(child.name, segments[segmentIndex], StringComparison.Ordinal))
+                {
+                    if (segmentIndex == segments.Length - 1)
+                    {
+                        return child;
+                    }
+
+                    var nested = FindDescendantPath(child, segments, segmentIndex + 1);
+                    if (nested != null)
+                    {
+                        return nested;
+                    }
+                }
+
+                var descendant = FindDescendantPath(child, segments, segmentIndex);
+                if (descendant != null)
+                {
+                    return descendant;
+                }
+            }
+
+            return null;
         }
 
         private static Image FindChildImage(Transform parent, string path)
@@ -1251,6 +1567,15 @@ namespace AIgalgame.Motion
                 return;
             }
 
+            if (!string.IsNullOrWhiteSpace(pendingMomentCommentId))
+            {
+                var momentId = pendingMomentCommentId;
+                SetInputText("");
+                RecordInteraction();
+                StartCoroutine(PostMomentComment(momentId, text));
+                return;
+            }
+
             SetInputText("");
             RecordInteraction();
             SetQuickReplyOptions(Array.Empty<BackendReplyOption>());
@@ -1285,6 +1610,68 @@ namespace AIgalgame.Motion
         private static bool IsKeyReplyOption(BackendReplyOption option)
         {
             return option != null && string.Equals(option.type, "key", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private IEnumerator PostMomentLike(string momentId)
+        {
+            if (momentInteractionInFlight)
+            {
+                yield break;
+            }
+
+            momentInteractionInFlight = true;
+            SetStatus("点赞中...");
+
+            var url = AppendQuery(CombineUrl(backendBaseUrl, BuildMomentPath(momentLikePathTemplate, momentId, "/api/moments/{moment_id}/like")));
+            using var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST);
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes("{}"));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.SetRequestHeader("Accept", "application/json");
+
+            yield return request.SendWebRequest();
+
+            momentInteractionInFlight = false;
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                SetStatus("点赞失败");
+                yield break;
+            }
+
+            SetStatus("已点赞");
+            RequestMomentsRefresh(true);
+        }
+
+        private IEnumerator PostMomentComment(string momentId, string text)
+        {
+            if (momentInteractionInFlight)
+            {
+                yield break;
+            }
+
+            momentInteractionInFlight = true;
+            SetStatus("评论中...");
+
+            var url = AppendQuery(CombineUrl(backendBaseUrl, BuildMomentPath(momentCommentPathTemplate, momentId, "/api/moments/{moment_id}/comments")));
+            var body = $"{{\"content\":\"{EscapeJson(text)}\"}}";
+            using var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST);
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.SetRequestHeader("Accept", "application/json");
+
+            yield return request.SendWebRequest();
+
+            momentInteractionInFlight = false;
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                SetStatus("评论失败");
+                yield break;
+            }
+
+            ClearPendingMomentComment();
+            SetStatus("评论已发送");
+            RequestMomentsRefresh(true);
         }
 
         private IEnumerator PostUserMessage(string text, string replyId = "", bool keyReply = false)
@@ -1607,7 +1994,7 @@ namespace AIgalgame.Motion
             RecordInteraction();
             SetStatus("正在识别语音...");
 
-            LocalAsrResult result;
+            AIGalgameLocalAsrResult result;
 #if UNITY_ANDROID && !UNITY_EDITOR
             localAsrClient ??= new AIGalgameLocalAsrClient();
             localAsrClient.Configure(androidAsrLanguage, androidAsrThreads);
@@ -1618,7 +2005,7 @@ namespace AIgalgame.Motion
             }
 
             result = recognizeTask.IsFaulted
-                ? LocalAsrResult.Fail(recognizeTask.Exception?.GetBaseException().Message ?? "Android ASR failed")
+                ? AIGalgameLocalAsrResult.Fail(recognizeTask.Exception?.GetBaseException().Message ?? "Android ASR failed")
                 : recognizeTask.Result;
 #elif UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
             localAsrClient ??= new AIGalgameLocalAsrClient();
@@ -1630,11 +2017,11 @@ namespace AIgalgame.Motion
             }
 
             result = recognizeTask.IsFaulted
-                ? LocalAsrResult.Fail(recognizeTask.Exception?.GetBaseException().Message ?? "Windows ASR failed")
+                ? AIGalgameLocalAsrResult.Fail(recognizeTask.Exception?.GetBaseException().Message ?? "Windows ASR failed")
                 : recognizeTask.Result;
 #else
             yield return null;
-            result = LocalAsrResult.Fail("Bundled local ASR is not available on this platform yet");
+            result = AIGalgameLocalAsrResult.Fail("Bundled local ASR is not available on this platform yet");
 #endif
 
             asrInFlight = false;
@@ -2310,6 +2697,12 @@ namespace AIgalgame.Motion
             return trimmedBase + trimmedPath;
         }
 
+        private static string BuildMomentPath(string template, string momentId, string fallback)
+        {
+            var path = string.IsNullOrWhiteSpace(template) ? fallback : template;
+            return path.Replace("{moment_id}", UnityWebRequest.EscapeURL(momentId ?? ""));
+        }
+
         private static string EscapeJson(string value)
         {
             if (string.IsNullOrEmpty(value))
@@ -2647,554 +3040,5 @@ namespace AIgalgame.Motion
             public float action_duration_seconds = 75f;
         }
 
-        private readonly struct LocalAsrResult
-        {
-            public LocalAsrResult(bool ok, string text, string error)
-            {
-                Ok = ok;
-                Text = text ?? "";
-                Error = error ?? "";
-            }
-
-            public bool Ok { get; }
-            public string Text { get; }
-            public string Error { get; }
-
-            public static LocalAsrResult Success(string text)
-            {
-                return new LocalAsrResult(true, text, "");
-            }
-
-            public static LocalAsrResult Fail(string error)
-            {
-                return new LocalAsrResult(false, "", error);
-            }
-        }
-
-        private sealed class AIGalgameLocalAsrClient : IDisposable
-        {
-            private const int AndroidAsrSampleRate = 16000;
-            private const int AndroidAsrFeatureDim = 80;
-            private const int StandaloneAsrSampleRate = 16000;
-            private const int StandaloneAsrFeatureDim = 80;
-            private const string SenseVoiceModelDirectory = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
-            private const string SenseVoiceModelFileName = "model.int8.onnx";
-            private const string SenseVoiceTokensFileName = "tokens.txt";
-            private const string AndroidAsrAssetsAar = "aigalgame-sherpa-asr-assets.aar";
-            private readonly object sync = new();
-            private string language = "zh";
-            private int numThreads = 2;
-
-#if UNITY_ANDROID && !UNITY_EDITOR
-            private AndroidJavaObject offlineRecognizer;
-#endif
-
-#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
-            private object standaloneRecognizer;
-
-            [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
-            private static extern bool SetDllDirectory(string lpPathName);
-#endif
-
-            public void Configure(string targetLanguage, int targetThreads)
-            {
-                language = string.IsNullOrWhiteSpace(targetLanguage) ? "zh" : targetLanguage.Trim();
-                numThreads = Math.Max(1, Math.Min(4, targetThreads));
-            }
-
-            public static bool IsStandaloneRuntimeAvailable()
-            {
-#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
-                return TryGetStandaloneManagedDllPath(out _) &&
-                    TryGetStandaloneNativePluginDir(out _) &&
-                    (HasSenseVoiceFiles(GetStandaloneStreamingModelDir()) ||
-#if UNITY_EDITOR
-                        File.Exists(GetAndroidAsrAssetsAarPath())
-#else
-                        false
-#endif
-                    );
-#else
-                return false;
-#endif
-            }
-
-            public Task<LocalAsrResult> RecognizeAndroidAsync(float[] monoSamples, int sampleRate)
-            {
-#if UNITY_ANDROID && !UNITY_EDITOR
-                var samples = monoSamples ?? Array.Empty<float>();
-                return Task.Run(() =>
-                {
-                    AndroidJNI.AttachCurrentThread();
-                    try
-                    {
-                        lock (sync)
-                        {
-                            EnsureAndroidRecognizer();
-                            return RecognizeAndroidLocked(samples, sampleRate);
-                        }
-                    }
-                    catch (Exception error)
-                    {
-                        return LocalAsrResult.Fail(error.Message);
-                    }
-                    finally
-                    {
-                        AndroidJNI.DetachCurrentThread();
-                    }
-                });
-#else
-                return Task.FromResult(LocalAsrResult.Fail("Android sherpa ASR is only available in an Android player build"));
-#endif
-            }
-
-            public Task<LocalAsrResult> RecognizeStandaloneAsync(float[] monoSamples, int sampleRate)
-            {
-#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
-                var samples = monoSamples ?? Array.Empty<float>();
-                string managedDllPath;
-                string nativePluginDir;
-                string modelDir;
-                try
-                {
-                    managedDllPath = GetStandaloneManagedDllPath();
-                    nativePluginDir = GetStandaloneNativePluginDir();
-                    modelDir = PrepareStandaloneSenseVoiceModelDir();
-                }
-                catch (Exception error)
-                {
-                    return Task.FromResult(LocalAsrResult.Fail(error.Message));
-                }
-
-                return Task.Run(() =>
-                {
-                    try
-                    {
-                        lock (sync)
-                        {
-                            EnsureStandaloneRecognizer(managedDllPath, nativePluginDir, modelDir);
-                            return RecognizeStandaloneLocked(samples, sampleRate);
-                        }
-                    }
-                    catch (Exception error)
-                    {
-                        return LocalAsrResult.Fail(error.Message);
-                    }
-                });
-#else
-                return Task.FromResult(LocalAsrResult.Fail("Windows sherpa ASR runtime is not available on this platform"));
-#endif
-            }
-
-            public void Dispose()
-            {
-#if UNITY_ANDROID && !UNITY_EDITOR
-                lock (sync)
-                {
-                    if (offlineRecognizer == null)
-                    {
-                        return;
-                    }
-
-                    try
-                    {
-                        offlineRecognizer.Call("release");
-                    }
-                    catch (Exception)
-                    {
-                    }
-                    offlineRecognizer.Dispose();
-                    offlineRecognizer = null;
-                }
-#endif
-#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
-                lock (sync)
-                {
-                    if (standaloneRecognizer is IDisposable disposable)
-                    {
-                        disposable.Dispose();
-                    }
-
-                    standaloneRecognizer = null;
-                }
-#endif
-            }
-
-#if UNITY_ANDROID && !UNITY_EDITOR
-            private void EnsureAndroidRecognizer()
-            {
-                if (offlineRecognizer != null)
-                {
-                    return;
-                }
-
-                using var featureConfigKt = new AndroidJavaClass("com.k2fsa.sherpa.onnx.FeatureConfigKt");
-                using var offlineRecognizerKt = new AndroidJavaClass("com.k2fsa.sherpa.onnx.OfflineRecognizerKt");
-                using var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
-                using var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
-                using var assetManager = activity.Call<AndroidJavaObject>("getAssets");
-
-                using var featureConfig = featureConfigKt.CallStatic<AndroidJavaObject>(
-                    "getFeatureConfig",
-                    AndroidAsrSampleRate,
-                    AndroidAsrFeatureDim);
-                using var modelConfig = offlineRecognizerKt.CallStatic<AndroidJavaObject>("getOfflineModelConfig", 15);
-                if (modelConfig == null)
-                {
-                    throw new InvalidOperationException("Sherpa SenseVoice model config is missing");
-                }
-
-                using var senseVoice = modelConfig.Call<AndroidJavaObject>("getSenseVoice");
-                senseVoice.Call("setLanguage", language);
-                senseVoice.Call("setUseInverseTextNormalization", true);
-                modelConfig.Call("setNumThreads", numThreads);
-                modelConfig.Call("setDebug", false);
-
-                using var recognizerConfig = new AndroidJavaObject("com.k2fsa.sherpa.onnx.OfflineRecognizerConfig");
-                recognizerConfig.Call("setFeatConfig", featureConfig);
-                recognizerConfig.Call("setModelConfig", modelConfig);
-                offlineRecognizer = new AndroidJavaObject(
-                    "com.k2fsa.sherpa.onnx.OfflineRecognizer",
-                    assetManager,
-                    recognizerConfig);
-            }
-
-            private LocalAsrResult RecognizeAndroidLocked(float[] monoSamples, int sampleRate)
-            {
-                if (monoSamples == null || monoSamples.Length == 0)
-                {
-                    return LocalAsrResult.Fail("No audio samples");
-                }
-
-                var samples = ResampleLinear(monoSamples, sampleRate, AndroidAsrSampleRate);
-                using var stream = offlineRecognizer.Call<AndroidJavaObject>("createStream");
-                try
-                {
-                    stream.Call("acceptWaveform", samples, AndroidAsrSampleRate);
-                    offlineRecognizer.Call("decode", stream);
-                    using var result = offlineRecognizer.Call<AndroidJavaObject>("getResult", stream);
-                    var text = StripSherpaTags(result.Call<string>("getText"));
-                    return string.IsNullOrWhiteSpace(text)
-                        ? LocalAsrResult.Fail("Empty ASR result")
-                        : LocalAsrResult.Success(text);
-                }
-                finally
-                {
-                    stream.Call("release");
-                }
-            }
-#endif
-
-#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
-            private void EnsureStandaloneRecognizer(string managedDllPath, string nativePluginDir, string modelDir)
-            {
-                if (standaloneRecognizer != null)
-                {
-                    return;
-                }
-
-                SetDllDirectory(nativePluginDir);
-                var assembly = LoadStandaloneAssembly(managedDllPath);
-                var modelPath = Path.Combine(modelDir, SenseVoiceModelFileName);
-                var tokensPath = Path.Combine(modelDir, SenseVoiceTokensFileName);
-                if (!File.Exists(modelPath) || !File.Exists(tokensPath))
-                {
-                    throw new FileNotFoundException("SenseVoice model files are missing");
-                }
-
-                var featureConfig = CreateSherpaObject(assembly, "SherpaOnnx.FeatureConfig");
-                SetSherpaField(featureConfig, "SampleRate", StandaloneAsrSampleRate);
-                SetSherpaField(featureConfig, "FeatureDim", StandaloneAsrFeatureDim);
-
-                var senseVoiceConfig = CreateSherpaObject(assembly, "SherpaOnnx.OfflineSenseVoiceModelConfig");
-                SetSherpaField(senseVoiceConfig, "Model", modelPath);
-                SetSherpaField(senseVoiceConfig, "Language", language);
-                SetSherpaField(senseVoiceConfig, "UseInverseTextNormalization", 1);
-
-                var modelConfig = CreateSherpaObject(assembly, "SherpaOnnx.OfflineModelConfig");
-                SetSherpaField(modelConfig, "Tokens", tokensPath);
-                SetSherpaField(modelConfig, "NumThreads", numThreads);
-                SetSherpaField(modelConfig, "Debug", 0);
-                SetSherpaField(modelConfig, "Provider", "cpu");
-                SetSherpaField(modelConfig, "SenseVoice", senseVoiceConfig);
-
-                var recognizerConfig = CreateSherpaObject(assembly, "SherpaOnnx.OfflineRecognizerConfig");
-                SetSherpaField(recognizerConfig, "FeatConfig", featureConfig);
-                SetSherpaField(recognizerConfig, "ModelConfig", modelConfig);
-
-                var recognizerType = assembly.GetType("SherpaOnnx.OfflineRecognizer", true);
-                standaloneRecognizer = Activator.CreateInstance(recognizerType, recognizerConfig);
-            }
-
-            private LocalAsrResult RecognizeStandaloneLocked(float[] monoSamples, int sampleRate)
-            {
-                if (monoSamples == null || monoSamples.Length == 0)
-                {
-                    return LocalAsrResult.Fail("No audio samples");
-                }
-
-                var samples = ResampleLinear(monoSamples, sampleRate, StandaloneAsrSampleRate);
-                var recognizerType = standaloneRecognizer.GetType();
-                var createStream = recognizerType.GetMethod("CreateStream", Type.EmptyTypes) ??
-                    throw new MissingMethodException(recognizerType.FullName, "CreateStream");
-                var stream = createStream.Invoke(standaloneRecognizer, Array.Empty<object>());
-                try
-                {
-                    var streamType = stream.GetType();
-                    var acceptWaveform = streamType.GetMethod("AcceptWaveform", new[] { typeof(int), typeof(float[]) }) ??
-                        throw new MissingMethodException(streamType.FullName, "AcceptWaveform");
-                    acceptWaveform.Invoke(stream, new object[] { StandaloneAsrSampleRate, samples });
-
-                    var decode = recognizerType.GetMethod("Decode", new[] { streamType }) ??
-                        throw new MissingMethodException(recognizerType.FullName, "Decode");
-                    decode.Invoke(standaloneRecognizer, new[] { stream });
-
-                    var result = streamType.GetProperty("Result")?.GetValue(stream);
-                    var text = result?.GetType().GetProperty("Text")?.GetValue(result) as string;
-                    text = StripSherpaTags(text);
-                    return string.IsNullOrWhiteSpace(text)
-                        ? LocalAsrResult.Fail("Empty ASR result")
-                        : LocalAsrResult.Success(text);
-                }
-                finally
-                {
-                    if (stream is IDisposable disposable)
-                    {
-                        disposable.Dispose();
-                    }
-                }
-            }
-
-            private static Assembly LoadStandaloneAssembly(string managedDllPath)
-            {
-                foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    if (string.Equals(assembly.GetName().Name, "sherpa-onnx", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return assembly;
-                    }
-                }
-
-                if (!File.Exists(managedDllPath))
-                {
-                    throw new FileNotFoundException("sherpa-onnx.dll is missing", managedDllPath);
-                }
-
-                return Assembly.LoadFrom(managedDllPath);
-            }
-
-            private static object CreateSherpaObject(Assembly assembly, string typeName)
-            {
-                var type = assembly.GetType(typeName, true);
-                return Activator.CreateInstance(type);
-            }
-
-            private static void SetSherpaField(object target, string fieldName, object value)
-            {
-                var field = target.GetType().GetField(fieldName) ??
-                    throw new MissingFieldException(target.GetType().FullName, fieldName);
-                field.SetValue(target, value);
-            }
-
-            private static string PrepareStandaloneSenseVoiceModelDir()
-            {
-                var streamingDir = GetStandaloneStreamingModelDir();
-                if (HasSenseVoiceFiles(streamingDir))
-                {
-                    return streamingDir;
-                }
-
-#if UNITY_EDITOR
-                var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? Application.dataPath;
-                var cacheDir = Path.Combine(projectRoot, "Library", "SherpaOnnx", SenseVoiceModelDirectory);
-                if (!HasSenseVoiceFiles(cacheDir))
-                {
-                    ExtractSenseVoiceFromAar(cacheDir);
-                }
-
-                if (HasSenseVoiceFiles(cacheDir))
-                {
-                    return cacheDir;
-                }
-#endif
-
-                throw new FileNotFoundException("SenseVoice model files are missing for Windows local ASR");
-            }
-
-            private static void ExtractSenseVoiceFromAar(string outputDir)
-            {
-                var aarPath = GetAndroidAsrAssetsAarPath();
-                if (!File.Exists(aarPath))
-                {
-                    throw new FileNotFoundException("Bundled SenseVoice AAR is missing", aarPath);
-                }
-
-                Directory.CreateDirectory(outputDir);
-                using var archive = ZipFile.OpenRead(aarPath);
-                ExtractAarEntry(
-                    archive,
-                    $"assets/{SenseVoiceModelDirectory}/{SenseVoiceModelFileName}",
-                    Path.Combine(outputDir, SenseVoiceModelFileName));
-                ExtractAarEntry(
-                    archive,
-                    $"assets/{SenseVoiceModelDirectory}/{SenseVoiceTokensFileName}",
-                    Path.Combine(outputDir, SenseVoiceTokensFileName));
-            }
-
-            private static void ExtractAarEntry(ZipArchive archive, string entryName, string destination)
-            {
-                var entry = archive.GetEntry(entryName) ??
-                    throw new FileNotFoundException($"AAR entry is missing: {entryName}");
-                Directory.CreateDirectory(Path.GetDirectoryName(destination));
-                entry.ExtractToFile(destination, true);
-            }
-
-            private static string GetStandaloneManagedDllPath()
-            {
-                return TryGetStandaloneManagedDllPath(out var path)
-                    ? path
-                    : throw new FileNotFoundException("sherpa-onnx.dll is missing from Assets/Plugins");
-            }
-
-            private static bool TryGetStandaloneManagedDllPath(out string path)
-            {
-                return TryFindExistingFile(
-                    out path,
-                    Path.Combine(Application.dataPath, "Plugins", "sherpa-onnx.dll"),
-                    Path.Combine(Application.dataPath, "Managed", "sherpa-onnx.dll"),
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sherpa-onnx.dll"),
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Managed", "sherpa-onnx.dll"));
-            }
-
-            private static string GetStandaloneNativePluginDir()
-            {
-                return TryGetStandaloneNativePluginDir(out var path)
-                    ? path
-                    : throw new FileNotFoundException("sherpa-onnx Windows native DLLs are missing from Assets/Plugins/x86_64");
-            }
-
-            private static bool TryGetStandaloneNativePluginDir(out string path)
-            {
-                var candidates = new[]
-                {
-                    Path.Combine(Application.dataPath, "Plugins", "x86_64"),
-                    Path.Combine(Application.dataPath, "Plugins"),
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Plugins", "x86_64"),
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Plugins"),
-                };
-
-                foreach (var candidate in candidates)
-                {
-                    if (File.Exists(Path.Combine(candidate, "sherpa-onnx-c-api.dll")) &&
-                        File.Exists(Path.Combine(candidate, "onnxruntime.dll")))
-                    {
-                        path = candidate;
-                        return true;
-                    }
-                }
-
-                path = "";
-                return false;
-            }
-
-            private static string GetStandaloneStreamingModelDir()
-            {
-                return Path.Combine(Application.streamingAssetsPath, "SherpaOnnx", SenseVoiceModelDirectory);
-            }
-
-            private static string GetAndroidAsrAssetsAarPath()
-            {
-                return Path.Combine(Application.dataPath, "Plugins", "Android", AndroidAsrAssetsAar);
-            }
-
-            private static bool HasSenseVoiceFiles(string directory)
-            {
-                return !string.IsNullOrWhiteSpace(directory) &&
-                    File.Exists(Path.Combine(directory, SenseVoiceModelFileName)) &&
-                    File.Exists(Path.Combine(directory, SenseVoiceTokensFileName));
-            }
-
-            private static bool TryFindExistingFile(out string path, params string[] candidates)
-            {
-                foreach (var candidate in candidates)
-                {
-                    if (File.Exists(candidate))
-                    {
-                        path = candidate;
-                        return true;
-                    }
-                }
-
-                path = "";
-                return false;
-            }
-#endif
-
-            private static float[] ResampleLinear(float[] source, int sourceRate, int targetRate)
-            {
-                if (source == null || source.Length == 0)
-                {
-                    return Array.Empty<float>();
-                }
-
-                if (sourceRate <= 0 || sourceRate == targetRate)
-                {
-                    return source;
-                }
-
-                var targetLength = Math.Max(1, (int)Math.Round(source.Length * (double)targetRate / sourceRate));
-                if (targetLength == source.Length)
-                {
-                    return source;
-                }
-
-                var target = new float[targetLength];
-                if (targetLength == 1)
-                {
-                    target[0] = source[0];
-                    return target;
-                }
-
-                var scale = (source.Length - 1d) / (targetLength - 1d);
-                for (var i = 0; i < target.Length; i++)
-                {
-                    var position = i * scale;
-                    var left = (int)Math.Floor(position);
-                    var right = Math.Min(left + 1, source.Length - 1);
-                    var t = (float)(position - left);
-                    target[i] = source[left] + ((source[right] - source[left]) * t);
-                }
-
-                return target;
-            }
-
-            private static string StripSherpaTags(string text)
-            {
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    return "";
-                }
-
-                var value = text.Trim();
-                while (true)
-                {
-                    var start = value.IndexOf("<|", StringComparison.Ordinal);
-                    if (start < 0)
-                    {
-                        break;
-                    }
-
-                    var end = value.IndexOf("|>", start, StringComparison.Ordinal);
-                    if (end < 0)
-                    {
-                        break;
-                    }
-
-                    value = value.Remove(start, end - start + 2).Trim();
-                }
-
-                return value;
-            }
-        }
     }
 }

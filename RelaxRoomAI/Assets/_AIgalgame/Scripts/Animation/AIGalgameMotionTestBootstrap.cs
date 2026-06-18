@@ -20,17 +20,10 @@ namespace AIgalgame.Motion
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void InstallAfterSceneLoad()
         {
-            SceneManager.sceneLoaded -= OnSceneLoaded;
-            SceneManager.sceneLoaded += OnSceneLoaded;
             TryInstall(SceneManager.GetActiveScene());
         }
 
         public static void Install(Scene scene)
-        {
-            TryInstall(scene);
-        }
-
-        private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             TryInstall(scene);
         }
@@ -40,6 +33,13 @@ namespace AIgalgame.Motion
             if (!scene.IsValid())
             {
                 return;
+            }
+
+            AIGalgameStartupDiagnostics.Log($"bootstrap_begin scene={scene.name}");
+
+            if (AIGalgameRelaxRoomMobileRenderOptimizer.ShouldApply())
+            {
+                AIGalgameRelaxRoomMobileRenderOptimizer.Apply();
             }
 
             var animator = FindCharacterAnimator();
@@ -53,6 +53,8 @@ namespace AIgalgame.Motion
                 Debug.LogWarning($"AIgalgame RelaxRoom UI did not find a humanoid Animator in scene '{scene.name}'.");
                 return;
             }
+
+            AIGalgameStartupDiagnostics.Log("character_found", animator.gameObject.name);
 
             var player = animator.GetComponent<AIGalgamePlayableMotionPlayer>();
             if (player == null)
@@ -106,7 +108,47 @@ namespace AIgalgame.Motion
             }
 
             var mainUi = Object.FindFirstObjectByType<AIGalgameRelaxRoomUI>();
-            mainUi?.SetTargets(controller, motionUi, demo, audioSource, director, touch);
+            if (mainUi != null)
+            {
+                mainUi.SetTargets(controller, motionUi, demo, audioSource, director, touch);
+                if (mainUi.gameObject.activeSelf)
+                {
+                    mainUi.gameObject.SetActive(false);
+                }
+            }
+
+            var expressionDirector = animator.GetComponent<AIGalgameRelaxRoomExpressionDirector>();
+            if (expressionDirector == null)
+            {
+                expressionDirector = animator.gameObject.AddComponent<AIGalgameRelaxRoomExpressionDirector>();
+            }
+            expressionDirector.SetTargets(vrm);
+
+            var gazeDirector = animator.GetComponent<AIGalgameRelaxRoomGazeDirector>();
+            if (gazeDirector == null)
+            {
+                gazeDirector = animator.gameObject.AddComponent<AIGalgameRelaxRoomGazeDirector>();
+            }
+            gazeDirector.SetTargets(vrm, animator, director);
+
+            controller.SetVisualDirectors(expressionDirector, gazeDirector);
+            director.SetVisualDirectors(gazeDirector, expressionDirector);
+
+            var bridgeRoot = GameObject.Find("RelaxRoomBridge");
+            if (bridgeRoot == null)
+            {
+                bridgeRoot = new GameObject("RelaxRoomBridge");
+            }
+
+            var bridge = bridgeRoot.GetComponent<RelaxRoomPresentationBridge>();
+            if (bridge == null)
+            {
+                bridge = bridgeRoot.AddComponent<RelaxRoomPresentationBridge>();
+            }
+
+            AIGalgameStartupDiagnostics.Log("components_wired");
+            bridge.SetTargets(controller, director, expressionDirector, gazeDirector, touch, audioSource);
+            AIGalgameStartupDiagnostics.Log("bootstrap_done");
         }
 
         private static Animator FindCharacterAnimator()

@@ -119,6 +119,7 @@ namespace AIgalgame.Motion
         private readonly float[] audioSamples = new float[256];
         private Coroutine activeRoutine;
         private Coroutine expressionTimelineRoutine;
+        private AIGalgameDialogueLine currentPlayingLine;
         private AIGalgameAvatarState state = AIGalgameAvatarState.Idle;
         private ExpressionKey? activeFaceKey;
         private string activeFaceName = "neutral";
@@ -136,6 +137,8 @@ namespace AIgalgame.Motion
         public string ActiveFaceName => activeFaceName;
         public string ActiveMotionName => activeMotionName;
         public bool LipSyncActive => lipSyncActive;
+
+        public event Action<AIGalgameDialogueLine> LineCompleted;
 
         private void Reset()
         {
@@ -371,6 +374,7 @@ namespace AIgalgame.Motion
                 return;
             }
 
+            currentPlayingLine = line;
             PlayCommand(BuildCommand(line), returnIdleWhenDone);
         }
 
@@ -424,10 +428,12 @@ namespace AIgalgame.Motion
         {
             foreach (var line in payload.lines)
             {
+                currentPlayingLine = line;
                 var command = BuildCommand(line);
                 yield return PlayCommandRoutine(command, returnIdleWhenDone: false);
             }
 
+            currentPlayingLine = null;
             SetIdle();
         }
 
@@ -461,6 +467,12 @@ namespace AIgalgame.Motion
             while (Time.time < endAt || (audioSource != null && audioSource.isPlaying))
             {
                 yield return null;
+            }
+
+            if (currentPlayingLine != null)
+            {
+                LineCompleted?.Invoke(currentPlayingLine);
+                currentPlayingLine = null;
             }
 
             if (returnIdleWhenDone)

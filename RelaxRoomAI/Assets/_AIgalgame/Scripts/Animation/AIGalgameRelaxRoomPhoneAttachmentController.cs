@@ -65,7 +65,7 @@ namespace AIgalgame.Motion
         [SerializeField] private PhoneAttachmentPreset defaultPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset replyTextingPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset replyWaitingPhoneAttachment = new(HumanBodyBones.RightHand);
-        [SerializeField] private PhoneAttachmentPreset replyDoubleTypingPhoneAttachment = new(HumanBodyBones.LeftHand);
+        [SerializeField] private PhoneAttachmentPreset replyDoubleTypingPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset idleTabletPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset idleTextingPhoneAttachment = new(HumanBodyBones.RightHand);
 

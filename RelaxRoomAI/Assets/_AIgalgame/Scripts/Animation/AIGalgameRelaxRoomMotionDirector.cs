@@ -183,8 +183,12 @@ namespace AIgalgame.Motion
                 motionPlayer.RefreshClipCatalog();
             }
 
+#if RELAXROOM_RN
+            SetIdle(0f);
+#else
             PlayBgmIfNeeded();
             SetIdle(0f);
+#endif
         }
 
         private void Update()
@@ -1880,6 +1884,11 @@ namespace AIgalgame.Motion
             }
 
             gazeDirector?.SetTargets(null, animator, this);
+        }
+
+        public void StartAmbientAudio()
+        {
+            PlayBgmIfNeeded();
         }
 
         private void PlayBgmIfNeeded()

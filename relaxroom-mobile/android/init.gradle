@@ -1,0 +1,24 @@
+def addMirrorRepositories(RepositoryHandler handler) {
+    handler.maven { url 'https://maven.aliyun.com/repository/google' }
+    handler.maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+    handler.maven { url 'https://maven.aliyun.com/repository/public' }
+    handler.google()
+    handler.mavenCentral()
+    handler.gradlePluginPortal()
+}
+
+gradle.beforeSettings { settings ->
+    settings.pluginManagement.repositories { repos ->
+        repos.clear()
+        addMirrorRepositories(repos)
+    }
+}
+
+gradle.allprojects { project ->
+    project.buildscript.repositories { repos ->
+        addMirrorRepositories(repos)
+    }
+    project.repositories { repos ->
+        addMirrorRepositories(repos)
+    }
+}

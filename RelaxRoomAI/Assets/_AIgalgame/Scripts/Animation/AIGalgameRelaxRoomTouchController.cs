@@ -38,6 +38,7 @@ namespace AIgalgame.Motion
         private bool hasLastTouchWorldPoint;
 
         public event Action<string> TouchStarted;
+        public event Action<string, string, string, bool> TouchFinished;
 
         private void Reset()
         {
@@ -113,6 +114,16 @@ namespace AIgalgame.Motion
             {
                 appearanceId = appearance.Trim();
             }
+        }
+
+        public void SimulateTouch(string hitArea)
+        {
+            if (requestInFlight || !CanAcceptTouch())
+            {
+                return;
+            }
+
+            HandleTouchArea(hitArea, Vector3.zero);
         }
 
         private bool CanAcceptTouch()
@@ -277,6 +288,11 @@ namespace AIgalgame.Motion
             SetCooldown(hitArea, cooldownSeconds);
             yield return PlayResponse(response);
             requestInFlight = false;
+            TouchFinished?.Invoke(
+                hitArea,
+                response?.text ?? "",
+                response?.line_id ?? "",
+                response != null && response.ok);
         }
 
         private IEnumerator QueueTouchPoolRefresh(string hitArea)
