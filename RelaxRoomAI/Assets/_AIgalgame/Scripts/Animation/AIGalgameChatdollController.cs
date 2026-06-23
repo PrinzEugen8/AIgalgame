@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using UniVRM10;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace AIgalgame.Motion
 {
@@ -70,6 +71,7 @@ namespace AIgalgame.Motion
         public bool LipSync = true;
         public float DurationSeconds;
         public float PreGapSeconds;
+        public string AudioUrl = "";
         public AIGalgameDialogueVisualCue[] VisualCues = Array.Empty<AIGalgameDialogueVisualCue>();
     }
 
@@ -102,6 +104,11 @@ namespace AIgalgame.Motion
         [SerializeField] private float faceCameraWeight = 0.28f;
         [SerializeField] private float faceCameraSmoothSpeed = 5f;
 
+        [Header("Backend Audio")]
+        [SerializeField] private string defaultBackendBaseUrl = "http://10.0.2.2:8899";
+        [SerializeField] private bool playLineTtsAudio = true;
+        [SerializeField] private float audioDownloadTimeoutSeconds = 12f;
+
         private const string AutoMouth = "auto";
         private static readonly Regex ControlTagRegex = new(@"\[(face|anim|pause)\s*:\s*([^\]]+)\]", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex LegacyFaceTagRegex = new(@"\[(happy|shy|thinking|calm|sad|angry|neutral|relaxed|surprised)\]", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -126,12 +133,14 @@ namespace AIgalgame.Motion
         private string activeMotionName = "idle";
         private string currentText = "";
         private bool lipSyncActive;
+        private bool loggedMissingDialogueAudioSource;
         private float lipSyncEndTime;
         private float speechElapsed;
         private float faceWeight;
         private float lookAtCameraWeight;
         private float mouthOpen;
-        private int lastMotionIndex = -1;
+        private string backendBaseUrl = "";
+        private readonly HashSet<string> loggedControllerOnlyMotionBlocks = new();
 
         public AIGalgameAvatarState State => state;
         public string ActiveFaceName => activeFaceName;
@@ -206,6 +215,14 @@ namespace AIgalgame.Motion
             expressionDirector?.SetTargets(vrmInstance);
             gazeDirector?.SetTargets(vrmInstance, animator, relaxRoomMotion);
             relaxRoomMotion?.SetVisualDirectors(gazeDirector, expressionDirector);
+        }
+
+        public void ConfigureBackendBaseUrl(string baseUrl)
+        {
+            if (!string.IsNullOrWhiteSpace(baseUrl))
+            {
+                backendBaseUrl = baseUrl.Trim();
+            }
         }
 
         public void SetTouchFocus(Vector3 worldPosition, float seconds = 1.8f)
@@ -454,31 +471,58 @@ namespace AIgalgame.Motion
                 command.DurationSeconds = EstimateSpeechSeconds(command.Text);
             }
 
+            AudioClip lineClip = null;
+            if (ShouldPlayLineAudio(command))
+            {
+                yield return DownloadLineAudio(command.AudioUrl, value => lineClip = value);
+                if (lineClip != null && lineClip.length > 0.01f)
+                {
+                    command.DurationSeconds = lineClip.length;
+                }
+            }
+
             ApplyCommand(command);
+            var playingLineAudio = false;
+            if (lineClip != null && audioSource != null)
+            {
+                audioSource.Stop();
+                audioSource.loop = false;
+                audioSource.clip = lineClip;
+                audioSource.Play();
+                playingLineAudio = true;
+            }
 
             if (command.State != AIGalgameAvatarState.Speaking)
             {
+                CompleteCurrentLine();
                 yield break;
             }
 
             var duration = command.DurationSeconds > 0f ? command.DurationSeconds : EstimateSpeechSeconds(command.Text);
             StartExpressionTimeline(command, duration);
             var endAt = Time.time + duration;
-            while (Time.time < endAt || (audioSource != null && audioSource.isPlaying))
+            while (Time.time < endAt || (playingLineAudio && audioSource != null && audioSource.clip == lineClip && audioSource.isPlaying))
             {
                 yield return null;
             }
 
-            if (currentPlayingLine != null)
-            {
-                LineCompleted?.Invoke(currentPlayingLine);
-                currentPlayingLine = null;
-            }
+            CompleteCurrentLine();
 
             if (returnIdleWhenDone)
             {
                 SetIdle();
             }
+        }
+
+        private void CompleteCurrentLine()
+        {
+            if (currentPlayingLine == null)
+            {
+                return;
+            }
+
+            LineCompleted?.Invoke(currentPlayingLine);
+            currentPlayingLine = null;
         }
 
         private IEnumerator ReturnIdleAfter(float seconds)
@@ -549,10 +593,137 @@ namespace AIgalgame.Motion
                 Mouth = mouth,
                 LipSync = lipSync,
                 PreGapSeconds = controller != null && controller.pause > 0f ? Mathf.Clamp(controller.pause, 0f, 10f) : parsed.PauseSeconds,
+                AudioUrl = line.tts_audio_url ?? "",
                 VisualCues = line.visual_cues ?? Array.Empty<AIGalgameDialogueVisualCue>()
             };
             command.DurationSeconds = EstimateSpeechSeconds(command.Text);
             return command;
+        }
+
+        private bool ShouldPlayLineAudio(AIGalgameAvatarCommand command)
+        {
+            if (!playLineTtsAudio ||
+                command.State != AIGalgameAvatarState.Speaking ||
+                string.IsNullOrWhiteSpace(command.AudioUrl))
+            {
+                return false;
+            }
+
+            ResolveReferences();
+            if (audioSource != null)
+            {
+                return true;
+            }
+
+            if (!loggedMissingDialogueAudioSource)
+            {
+                Debug.LogWarning("AIGalgameChatdollController received a TTS audio URL, but no AudioSource is assigned near the character.", this);
+                loggedMissingDialogueAudioSource = true;
+            }
+            return false;
+        }
+
+        private IEnumerator DownloadLineAudio(string url, Action<AudioClip> onComplete)
+        {
+            var fullUrl = CombineUrl(FirstNonEmpty(backendBaseUrl, defaultBackendBaseUrl), url);
+            var lastError = "";
+            foreach (var audioType in AudioTypesForUrl(fullUrl))
+            {
+                using var request = UnityWebRequestMultimedia.GetAudioClip(fullUrl, audioType);
+                request.timeout = Mathf.Max(1, Mathf.CeilToInt(audioDownloadTimeoutSeconds));
+                UnityWebRequestAsyncOperation operation = null;
+                try
+                {
+                    operation = request.SendWebRequest();
+                }
+                catch (Exception exception)
+                {
+                    lastError = exception.Message;
+                    continue;
+                }
+
+                yield return operation;
+                if (request.result != UnityWebRequest.Result.Success)
+                {
+                    lastError = request.error;
+                    continue;
+                }
+
+                AudioClip clip = null;
+                try
+                {
+                    clip = DownloadHandlerAudioClip.GetContent(request);
+                }
+                catch (Exception exception)
+                {
+                    lastError = exception.Message;
+                }
+
+                if (clip != null && clip.length > 0.01f)
+                {
+                    onComplete?.Invoke(clip);
+                    yield break;
+                }
+            }
+
+            Debug.LogWarning($"AIGalgameChatdollController could not download or decode TTS audio '{fullUrl}': {lastError}", this);
+            onComplete?.Invoke(null);
+        }
+
+        private static IEnumerable<AudioType> AudioTypesForUrl(string url)
+        {
+            var preferred = AudioTypeForUrl(url);
+            yield return preferred;
+
+            if (preferred != AudioType.MPEG)
+            {
+                yield return AudioType.MPEG;
+            }
+
+            if (preferred != AudioType.WAV)
+            {
+                yield return AudioType.WAV;
+            }
+
+            if (preferred != AudioType.OGGVORBIS)
+            {
+                yield return AudioType.OGGVORBIS;
+            }
+        }
+
+        private static AudioType AudioTypeForUrl(string url)
+        {
+            var lower = (url ?? "").ToLowerInvariant();
+            var path = lower.Split('?')[0];
+            if (path.EndsWith(".wav") || lower.Contains("format=wav"))
+            {
+                return AudioType.WAV;
+            }
+
+            if (path.EndsWith(".ogg") || path.EndsWith(".ogg_opus") || lower.Contains("format=ogg"))
+            {
+                return AudioType.OGGVORBIS;
+            }
+
+            return AudioType.MPEG;
+        }
+
+        private static string CombineUrl(string baseUrl, string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return baseUrl;
+            }
+
+            if (path.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                return path;
+            }
+
+            var trimmedBase = (baseUrl ?? "").TrimEnd('/');
+            var trimmedPath = path.StartsWith("/") ? path : "/" + path;
+            return trimmedBase + trimmedPath;
         }
 
         private void SetFaceInternal(string face)
@@ -574,33 +745,16 @@ namespace AIgalgame.Motion
         {
             if (relaxRoomMotion != null && relaxRoomMotion.PlaySemanticMotion(animation, state, motionBlendSeconds))
             {
-                lastMotionIndex = -1;
                 return;
             }
 
-            if (motionPlayer == null)
+            var key = $"{state}|{animation}";
+            if (loggedControllerOnlyMotionBlocks.Add(key))
             {
-                return;
+                Debug.LogError(
+                    $"Chatdoll motion is Animator Controller-only. No scripted PlayClip fallback will run for state '{state}' animation '{animation}'.",
+                    this);
             }
-
-            if (motionPlayer.Clips.Count == 0)
-            {
-                motionPlayer.RefreshClipCatalog();
-            }
-
-            var index = FindMotionIndex(animation);
-            if (index < 0)
-            {
-                return;
-            }
-
-            if (index == lastMotionIndex && state != AIGalgameAvatarState.Speaking)
-            {
-                return;
-            }
-
-            lastMotionIndex = index;
-            motionPlayer.PlayClip(index, motionBlendSeconds);
         }
 
         private int FindMotionIndex(string animation)
@@ -1392,6 +1546,11 @@ namespace AIgalgame.Motion
             {
                 StopCoroutine(activeRoutine);
                 activeRoutine = null;
+            }
+
+            if (currentPlayingLine != null && audioSource != null && audioSource.isPlaying)
+            {
+                audioSource.Stop();
             }
 
             StopExpressionTimeline();

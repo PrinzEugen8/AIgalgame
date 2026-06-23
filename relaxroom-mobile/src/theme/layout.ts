@@ -1,7 +1,7 @@
 import {useWindowDimensions} from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
-export const INTERACTION_MAX_RATIO = 1 / 3;
+export const INTERACTION_MAX_RATIO = 1 / 2;
 
 export function useInteractionPanelHeight() {
   const {height} = useWindowDimensions();

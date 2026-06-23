@@ -33,6 +33,7 @@ namespace AIgalgame.Motion
 
         private Vrm10AnimationInstance activeVrma;
         private GameObject activeVrmaRoot;
+        private bool loggedControllerOnlyBlock;
 
         private void Reset()
         {
@@ -45,7 +46,7 @@ namespace AIgalgame.Motion
 
             if (fbxController != null && animator != null)
             {
-                animator.runtimeAnimatorController = fbxController;
+                LogControllerOnlyBlock("runtime Animator Controller assignment");
             }
 
             if (enableVrmControlRig)
@@ -58,13 +59,12 @@ namespace AIgalgame.Motion
         {
             if (playInitialVrmaOnStart && initialVrmaPrefab != null)
             {
-                PlayVrma(initialVrmaPrefab);
-                return;
+                LogControllerOnlyBlock("initial VRMA playback");
             }
 
             if (playInitialAnimatorStateOnStart && !string.IsNullOrWhiteSpace(initialAnimatorState))
             {
-                PlayAnimatorState(initialAnimatorState, 0f);
+                LogControllerOnlyBlock($"initial Animator state '{initialAnimatorState}'");
             }
         }
 
@@ -85,79 +85,12 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            ResolveReferences();
-            ClearVrma();
-
-            if (animator == null)
-            {
-                Debug.LogWarning($"{nameof(AIGalgameMotionPlayer)} cannot play '{stateName}' because no Animator was found.", this);
-                return;
-            }
-
-            if (fbxController != null && animator.runtimeAnimatorController == null)
-            {
-                animator.runtimeAnimatorController = fbxController;
-            }
-
-            animator.enabled = true;
-            if (transitionSeconds <= 0f)
-            {
-                animator.Play(stateName, 0, 0f);
-            }
-            else
-            {
-                animator.CrossFadeInFixedTime(stateName, transitionSeconds, 0, 0f);
-            }
+            LogControllerOnlyBlock($"Animator state '{stateName}'");
         }
 
         public void PlayVrma(GameObject vrmaPrefab)
         {
-            ResolveReferences();
-
-            if (vrmInstance == null)
-            {
-                Debug.LogWarning($"{nameof(AIGalgameMotionPlayer)} cannot play VRMA because no Vrm10Instance was found.", this);
-                return;
-            }
-
-            if (vrmaPrefab == null)
-            {
-                Debug.LogWarning($"{nameof(AIGalgameMotionPlayer)} cannot play VRMA because the prefab is empty.", this);
-                return;
-            }
-
-            if (!TryEnableVrmControlRigBeforeRuntimeStarts())
-            {
-                return;
-            }
-
-            ClearVrma();
-
-            activeVrmaRoot = Instantiate(vrmaPrefab);
-            activeVrmaRoot.name = $"{vrmaPrefab.name} Driver";
-            activeVrmaRoot.transform.SetPositionAndRotation(transform.position, transform.rotation);
-
-            activeVrma = activeVrmaRoot.GetComponent<Vrm10AnimationInstance>();
-            if (activeVrma == null)
-            {
-                activeVrma = activeVrmaRoot.GetComponentInChildren<Vrm10AnimationInstance>();
-            }
-
-            if (activeVrma == null)
-            {
-                Debug.LogWarning($"{nameof(AIGalgameMotionPlayer)} could not find Vrm10AnimationInstance on '{vrmaPrefab.name}'.", this);
-                Destroy(activeVrmaRoot);
-                activeVrmaRoot = null;
-                return;
-            }
-
-            if (hideVrmaDriverBoxMan && activeVrma.BoxMan != null)
-            {
-                activeVrma.ShowBoxMan(false);
-            }
-
-            PlayLegacyAnimationOnVrmaDriver(activeVrma);
-            vrmInstance.Runtime.VrmAnimation = activeVrma;
+            LogControllerOnlyBlock(vrmaPrefab != null ? $"VRMA '{vrmaPrefab.name}'" : "VRMA playback");
         }
 
         public void ClearVrma()
@@ -247,6 +180,19 @@ namespace AIgalgame.Motion
 
             animation.wrapMode = WrapMode.Loop;
             animation.Play();
+        }
+
+        private void LogControllerOnlyBlock(string context)
+        {
+            if (loggedControllerOnlyBlock)
+            {
+                return;
+            }
+
+            loggedControllerOnlyBlock = true;
+            Debug.LogError(
+                $"{nameof(AIGalgameMotionPlayer)} refused {context}. RelaxRoom motion is Animator Controller-only; drive actions through Animator Controller parameters.",
+                this);
         }
     }
 }

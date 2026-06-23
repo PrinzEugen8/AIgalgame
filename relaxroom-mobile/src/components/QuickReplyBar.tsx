@@ -26,6 +26,7 @@ export function QuickReplyBar({
 
   return (
     <ScrollView
+      style={styles.scroller}
       horizontal
       showsHorizontalScrollIndicator={false}
       contentContainerStyle={styles.row}>
@@ -46,9 +47,16 @@ export function QuickReplyBar({
 }
 
 const styles = StyleSheet.create({
+  scroller: {
+    flexGrow: 0,
+    flexShrink: 0,
+    height: 48,
+    marginBottom: 6,
+  },
   row: {
     gap: 8,
     paddingVertical: 6,
+    alignItems: 'center',
   },
   chip: {
     backgroundColor: colors.chipBg,

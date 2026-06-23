@@ -1,7 +1,21 @@
-import React, {useEffect, useImperativeHandle, useRef, forwardRef} from 'react';
-import {FlatList, StyleSheet, Text, View} from 'react-native';
+import React, {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+} from 'react';
+import {
+  FlatList,
+  GestureResponderEvent,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import {colors} from '../theme/colors';
 import type {ChatMessage} from '../types/dialogue';
+
+const TAP_MOVE_THRESHOLD = 8;
 
 export type ChatMessageListHandle = {
   scrollToEnd: () => void;
@@ -9,24 +23,72 @@ export type ChatMessageListHandle = {
 
 type Props = {
   messages: ChatMessage[];
+  onAdvanceReply?: () => void;
 };
 
 export const ChatMessageList = forwardRef<ChatMessageListHandle, Props>(
-  function ChatMessageList({messages}, ref) {
+  function ChatMessageList({messages, onAdvanceReply}, ref) {
     const listRef = useRef<FlatList<ChatMessage>>(null);
+    const touchStartRef = useRef<{pageX: number; pageY: number} | null>(null);
+    const touchMovedRef = useRef(false);
 
-    const scrollToEnd = () => {
-      listRef.current?.scrollToEnd({animated: true});
-    };
+    const scrollToEnd = useCallback((animated = true) => {
+      listRef.current?.scrollToEnd({animated});
+    }, []);
 
-    useImperativeHandle(ref, () => ({scrollToEnd}), []);
+    const scrollToEndAfterLayout = useCallback(
+      (animated = true) => {
+        requestAnimationFrame(() => scrollToEnd(animated));
+        setTimeout(() => scrollToEnd(animated), 80);
+      },
+      [scrollToEnd],
+    );
+
+    useImperativeHandle(
+      ref,
+      () => ({scrollToEnd: () => scrollToEndAfterLayout(true)}),
+      [scrollToEndAfterLayout],
+    );
 
     useEffect(() => {
       if (messages.length === 0) {
         return;
       }
-      requestAnimationFrame(scrollToEnd);
-    }, [messages]);
+      scrollToEndAfterLayout(true);
+    }, [messages.length, scrollToEndAfterLayout]);
+
+    const handleTouchStart = useCallback((event: GestureResponderEvent) => {
+      const {pageX, pageY} = event.nativeEvent;
+      touchStartRef.current = {pageX, pageY};
+      touchMovedRef.current = false;
+    }, []);
+
+    const handleTouchMove = useCallback((event: GestureResponderEvent) => {
+      const start = touchStartRef.current;
+      if (!start) {
+        return;
+      }
+
+      const {pageX, pageY} = event.nativeEvent;
+      if (
+        Math.abs(pageX - start.pageX) > TAP_MOVE_THRESHOLD ||
+        Math.abs(pageY - start.pageY) > TAP_MOVE_THRESHOLD
+      ) {
+        touchMovedRef.current = true;
+      }
+    }, []);
+
+    const handleTouchEnd = useCallback(() => {
+      if (!touchMovedRef.current) {
+        onAdvanceReply?.();
+      }
+      touchStartRef.current = null;
+      touchMovedRef.current = false;
+    }, [onAdvanceReply]);
+
+    const handleScrollBeginDrag = useCallback(() => {
+      touchMovedRef.current = true;
+    }, []);
 
     return (
       <FlatList
@@ -36,7 +98,11 @@ export const ChatMessageList = forwardRef<ChatMessageListHandle, Props>(
         style={styles.list}
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
-        onContentSizeChange={scrollToEnd}
+        onContentSizeChange={() => scrollToEndAfterLayout(true)}
+        onScrollBeginDrag={handleScrollBeginDrag}
+        onTouchEnd={handleTouchEnd}
+        onTouchMove={handleTouchMove}
+        onTouchStart={handleTouchStart}
         renderItem={({item}) => (
           <View
             style={[
@@ -58,7 +124,8 @@ const styles = StyleSheet.create({
   },
   content: {
     gap: 6,
-    paddingVertical: 4,
+    paddingTop: 4,
+    paddingBottom: 10,
     flexGrow: 1,
     justifyContent: 'flex-end',
   },

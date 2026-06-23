@@ -1,5 +1,12 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {Alert, Keyboard, Platform, StyleSheet, Text, View} from 'react-native';
+import {
+  Alert,
+  Keyboard,
+  Platform,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import {launchImageLibrary} from 'react-native-image-picker';
 import {ChatInputRow} from './ChatInputRow';
 import {ChatMessageList, type ChatMessageListHandle} from './ChatMessageList';
@@ -22,6 +29,7 @@ type Props = {
   onDraftChange: (text: string) => void;
   onSend: (text: string) => void;
   onQuickReplySelect: (text: string) => void;
+  onAdvanceReply: () => void;
   onPhone: () => void;
   onVideoCall: () => void;
 };
@@ -39,6 +47,7 @@ export function InteractionPanel({
   onDraftChange,
   onSend,
   onQuickReplySelect,
+  onAdvanceReply,
   onPhone,
   onVideoCall,
 }: Props) {
@@ -101,7 +110,11 @@ export function InteractionPanel({
         ) : null}
 
         <View style={styles.history}>
-          <ChatMessageList ref={messageListRef} messages={messages} />
+          <ChatMessageList
+            ref={messageListRef}
+            messages={messages}
+            onAdvanceReply={onAdvanceReply}
+          />
         </View>
 
         <QuickReplyBar
@@ -174,6 +187,6 @@ const styles = StyleSheet.create({
   history: {
     flex: 1,
     minHeight: 48,
-    marginBottom: 4,
+    marginBottom: 8,
   },
 });

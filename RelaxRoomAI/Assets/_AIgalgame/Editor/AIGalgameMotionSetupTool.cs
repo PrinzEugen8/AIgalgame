@@ -56,6 +56,7 @@ public static class AIGalgameMotionSetupTool
 
         var character = animator.gameObject;
         var player = EnsureComponent<AIGalgamePlayableMotionPlayer>(character, "Add RelaxRoom Motion Player");
+        var ikAdjuster = EnsureComponent<AIGalgameHumanoidIKAdjuster>(character, "Add RelaxRoom IK Adjuster");
         var phone = EnsureComponent<AIGalgameRelaxRoomPhoneAttachmentController>(character, "Add RelaxRoom Phone Attachment");
         var phonePickup = EnsureComponent<AIGalgameRelaxRoomPhonePickupController>(character, "Add RelaxRoom Phone Pickup");
         var director = EnsureComponent<AIGalgameRelaxRoomMotionDirector>(character, "Add RelaxRoom Motion Director");
@@ -67,8 +68,12 @@ public static class AIGalgameMotionSetupTool
         var vrm = character.GetComponent<Vrm10Instance>() ?? character.GetComponentInChildren<Vrm10Instance>();
 
         SetObjectReference(player, "animator", animator);
+        SetObjectReference(player, "ikAdjuster", ikAdjuster);
         player.SetAnimator(animator);
         player.RefreshClipCatalog();
+
+        SetObjectReference(ikAdjuster, "animator", animator);
+        ikAdjuster.SetAnimator(animator);
 
         SetObjectReference(phone, "animator", animator);
         phone.SetAnimator(animator);
@@ -115,6 +120,7 @@ public static class AIGalgameMotionSetupTool
         ConfigureSceneAudio(character, director, phone);
 
         EditorUtility.SetDirty(player);
+        EditorUtility.SetDirty(ikAdjuster);
         EditorUtility.SetDirty(phone);
         EditorUtility.SetDirty(phonePickup);
         EditorUtility.SetDirty(director);

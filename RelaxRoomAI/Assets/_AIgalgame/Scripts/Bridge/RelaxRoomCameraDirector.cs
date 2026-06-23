@@ -14,6 +14,8 @@ namespace AIgalgame.Motion
         [SerializeField] private bool autoFindCameras = true;
         [SerializeField] private bool retagActiveCameraAsMain = true;
 
+        private const bool IncludeVideoCallCameraInManualSwitching = false;
+
         private int activeIndex = -1;
         private Camera cameraBeforeVideoCall;
         private int cameraIndexBeforeVideoCall = -1;
@@ -108,7 +110,7 @@ namespace AIgalgame.Motion
             cameraBeforeVideoCall = null;
             cameraIndexBeforeVideoCall = -1;
 
-            if (restoreIndex >= 0 && cameras != null && restoreIndex < cameras.Length)
+            if (restoreIndex >= 0 && cameras != null && restoreIndex < cameras.Length && IsManualCameraIndex(restoreIndex))
             {
                 ActivateCamera(restoreIndex);
                 return;
@@ -120,7 +122,7 @@ namespace AIgalgame.Motion
         private void Step(int direction)
         {
             ResolveCameras();
-            if (cameras.Length == 0)
+            if (cameras.Length == 0 || videoCallCameraActive)
             {
                 return;
             }
@@ -131,7 +133,12 @@ namespace AIgalgame.Motion
                 current = activeIndex >= 0 ? activeIndex : 0;
             }
 
-            var next = Mod(current + direction, cameras.Length);
+            var next = FindNextManualCameraIndex(current, direction);
+            if (next < 0)
+            {
+                return;
+            }
+
             ActivateCamera(next);
         }
 
@@ -184,7 +191,14 @@ namespace AIgalgame.Motion
             }
 
             var current = FindActiveCameraIndex();
-            ActivateCamera(current >= 0 ? current : 0);
+            if (current >= 0 && IsManualCameraIndex(current))
+            {
+                ActivateCamera(current);
+                return;
+            }
+
+            var firstManual = FindNextManualCameraIndex(current >= 0 ? current - 1 : -1, 1);
+            ActivateCamera(firstManual >= 0 ? firstManual : current >= 0 ? current : 0);
         }
 
         private int FindVideoCallCameraIndex()
@@ -253,6 +267,91 @@ namespace AIgalgame.Motion
             }
 
             return -1;
+        }
+
+        private int FindNextManualCameraIndex(int current, int direction)
+        {
+            if (cameras == null || cameras.Length == 0)
+            {
+                return -1;
+            }
+
+            var step = direction >= 0 ? 1 : -1;
+            for (var offset = 1; offset <= cameras.Length; offset++)
+            {
+                var index = Mod(current + (step * offset), cameras.Length);
+                if (IsManualCameraIndex(index))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private bool IsManualCameraIndex(int index)
+        {
+            return cameras != null &&
+                index >= 0 &&
+                index < cameras.Length &&
+                cameras[index] != null &&
+                (IncludeVideoCallCameraInManualSwitching || !IsVideoCallCamera(cameras[index]));
+        }
+
+        private bool IsVideoCallCamera(Camera camera)
+        {
+            if (camera == null)
+            {
+                return false;
+            }
+
+            if (IsNamedCamera(camera, videoCallCameraName))
+            {
+                return true;
+            }
+
+            var cameraName = camera.name ?? "";
+            var knownNames = new[]
+            {
+                "PhoneFrontCamera",
+                "Phone Front Camera",
+                "phone_front_camera",
+                "PhoneSelfieCamera",
+                "Phone Selfie Camera",
+                "SelfieCamera",
+                "Selfie Camera",
+                "VideoCallCamera",
+                "Video Call Camera",
+                "video_call_camera",
+                "FrontCamera",
+                "Front Camera",
+                "\u524D\u7F6E\u6444\u50CF\u5934"
+            };
+
+            for (var i = 0; i < knownNames.Length; i++)
+            {
+                if (IsNamedCamera(camera, knownNames[i]))
+                {
+                    return true;
+                }
+            }
+
+            var parentPhoneRelated = ParentChainContains(camera.transform, "phone") ||
+                                     ParentChainContains(camera.transform, "\u624B\u673A");
+            return parentPhoneRelated &&
+                (ContainsIgnoreCase(cameraName, "front") ||
+                 ContainsIgnoreCase(cameraName, "selfie") ||
+                 ContainsIgnoreCase(cameraName, "video") ||
+                 ContainsIgnoreCase(cameraName, "call") ||
+                 ContainsIgnoreCase(cameraName, "camera") ||
+                 ContainsIgnoreCase(cameraName, "\u6444\u50CF\u5934"));
+        }
+
+        private static bool IsNamedCamera(Camera camera, string cameraName)
+        {
+            return camera != null &&
+                !string.IsNullOrWhiteSpace(cameraName) &&
+                string.Equals(camera.name, cameraName.Trim(), StringComparison.OrdinalIgnoreCase);
         }
 
         private int FindCameraIndexByName(string cameraName)

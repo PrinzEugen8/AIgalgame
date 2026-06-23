@@ -58,14 +58,16 @@ namespace AIgalgame.Motion
 
             AIGalgameStartupDiagnostics.Log("character_found", animator.gameObject.name);
 
-            var player = RequireExistingNear<AIGalgamePlayableMotionPlayer>(animator);
-            if (player == null)
+            var player = FindExistingNear<AIGalgamePlayableMotionPlayer>(animator);
+            if (player != null)
             {
-                return;
+                player.SetAnimator(animator);
+                AIGalgameStartupDiagnostics.Log("motion_player_ready");
             }
-
-            player.SetAnimator(animator);
-            AIGalgameStartupDiagnostics.Log("motion_player_ready");
+            else
+            {
+                AIGalgameStartupDiagnostics.Log("motion_player_optional_missing", animator.gameObject.name);
+            }
 
             var phoneAttachment = RequireExistingNear<AIGalgameRelaxRoomPhoneAttachmentController>(animator);
             if (phoneAttachment == null)

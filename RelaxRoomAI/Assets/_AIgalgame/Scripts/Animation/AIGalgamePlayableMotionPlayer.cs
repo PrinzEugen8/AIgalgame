@@ -941,7 +941,9 @@ namespace AIgalgame.Motion
         [SerializeField] private float playbackSpeed = 1f;
         [SerializeField] private AIGalgameHumanoidIKAdjuster ikAdjuster;
 
+        private Animator missingIkAdjusterWarningAnimator;
         private bool preferAnimatorController;
+        private bool loggedAnimatorControllerClipBlock;
         private readonly AnimationClip[] inputClips = new AnimationClip[2];
         private PlayableGraph graph;
         private AnimationMixerPlayable mixer;
@@ -1067,7 +1069,14 @@ namespace AIgalgame.Motion
 
         public void SetAnimator(Animator targetAnimator)
         {
+            if (animator == targetAnimator)
+            {
+                EnsureIkAdjuster();
+                return;
+            }
+
             animator = targetAnimator;
+            missingIkAdjusterWarningAnimator = null;
             DestroyGraph();
 
             hasBaseTransform = false;
@@ -1168,14 +1177,8 @@ namespace AIgalgame.Motion
 
         public bool PlayClip(string motionHint, float transitionSeconds, params string[] pathHints)
         {
-            var index = FindClipIndex(motionHint, pathHints);
-            if (index < 0)
-            {
-                return false;
-            }
-
-            PlayClip(index, transitionSeconds);
-            return true;
+            LogAnimatorControllerClipBlock(motionHint);
+            return false;
         }
 
         public MotionAdjustmentData GetAdjustmentSnapshot()
@@ -1235,83 +1238,29 @@ namespace AIgalgame.Motion
 
         public void PlayClip(int index)
         {
-            PlayClip(index, blendSeconds);
+            LogAnimatorControllerClipBlock(index >= 0 && index < clips.Count && clips[index].clip != null
+                ? clips[index].clip.name
+                : index.ToString());
         }
 
         public void PlayClip(int index, float transitionSeconds)
         {
-#if UNITY_EDITOR
-            if (IsEditorAnimationPreviewActive())
-            {
-                DestroyGraph();
-                return;
-            }
-#endif
+            LogAnimatorControllerClipBlock(index >= 0 && index < clips.Count && clips[index].clip != null
+                ? clips[index].clip.name
+                : index.ToString());
+        }
 
-            if (index < 0 || index >= clips.Count)
-            {
-                return;
-            }
-
-            var clip = clips[index].clip;
-            if (clip == null)
+        private void LogAnimatorControllerClipBlock(string clipName)
+        {
+            if (loggedAnimatorControllerClipBlock)
             {
                 return;
             }
 
-            ResolveReferences();
-            if (animator == null)
-            {
-                Debug.LogWarning($"{nameof(AIGalgamePlayableMotionPlayer)} needs an Animator target.", this);
-                return;
-            }
-
-            if (preferAnimatorController && animator.runtimeAnimatorController != null)
-            {
-                Debug.LogWarning(
-                    $"{nameof(AIGalgamePlayableMotionPlayer)} is in Animator Controller driver mode. Use the state machine instead of PlayClip.",
-                    this);
-                return;
-            }
-
-            if (clearAnimatorControllerOnStart && animator.runtimeAnimatorController != null)
-            {
-                animator.runtimeAnimatorController = null;
-            }
-
-            EnsureGraph();
-            if (!graph.IsValid() || !mixer.IsValid())
-            {
-                return;
-            }
-
-            CompleteActiveFade();
-
-            var nextInput = currentInput == 0 ? 1 : 0;
-            DestroyInput(nextInput);
-
-            var playable = AnimationClipPlayable.Create(graph, clip);
-            playable.SetApplyFootIK(applyFootIk);
-            playable.SetSpeed(playbackSpeed);
-            playable.SetTime(0d);
-            graph.Connect(playable, 0, mixer, nextInput);
-            mixer.SetInputWeight(nextInput, currentInput < 0 || transitionSeconds <= 0f ? 1f : 0f);
-            inputClips[nextInput] = clip;
-
-            currentClipIndex = index;
-            MotionChanged?.Invoke(currentClipIndex, clips[currentClipIndex]);
-
-            if (currentInput < 0 || transitionSeconds <= 0f)
-            {
-                DestroyInput(currentInput);
-                currentInput = nextInput;
-                return;
-            }
-
-            fadingFromInput = currentInput;
-            fadingToInput = nextInput;
-            fadeElapsed = 0f;
-            fadeDuration = transitionSeconds;
+            loggedAnimatorControllerClipBlock = true;
+            Debug.LogError(
+                $"{nameof(AIGalgamePlayableMotionPlayer)} refused scripted PlayClip '{clipName}'. RelaxRoom motion is Animator Controller-only; drive actions through Animator Controller parameters.",
+                this);
         }
 
         public void ReplayCurrent()
@@ -1397,12 +1346,18 @@ namespace AIgalgame.Motion
 
             if (ikAdjuster == null)
             {
-                Debug.LogWarning(
-                    "AIGalgamePlayableMotionPlayer is missing AIGalgameHumanoidIKAdjuster. Add it to the character in the scene if IK handles are needed; runtime AddComponent is disabled.",
-                    this);
+                if (missingIkAdjusterWarningAnimator != animator)
+                {
+                    Debug.LogWarning(
+                        "AIGalgamePlayableMotionPlayer is missing AIGalgameHumanoidIKAdjuster. Add it to the character in the scene if IK handles are needed; runtime AddComponent is disabled.",
+                        this);
+                    missingIkAdjusterWarningAnimator = animator;
+                }
+
                 return null;
             }
 
+            missingIkAdjusterWarningAnimator = null;
             ikAdjuster.SetAnimator(animator);
             return ikAdjuster;
         }
@@ -1470,30 +1425,7 @@ namespace AIgalgame.Motion
 
         private void EnsureGraph()
         {
-#if UNITY_EDITOR
-            if (IsEditorAnimationPreviewActive())
-            {
-                return;
-            }
-#endif
-
-            if (graph.IsValid())
-            {
-                return;
-            }
-
-            graph = PlayableGraph.Create("AIgalgame Motion Test");
-            graph.SetTimeUpdateMode(DirectorUpdateMode.GameTime);
-            mixer = AnimationMixerPlayable.Create(graph, 2);
-            var output = AnimationPlayableOutput.Create(graph, "Motion Output", animator);
-            if (!output.IsOutputValid())
-            {
-                DestroyGraph();
-                return;
-            }
-
-            output.SetSourcePlayable(mixer);
-            graph.Play();
+            DestroyGraph();
         }
 
 #if UNITY_EDITOR

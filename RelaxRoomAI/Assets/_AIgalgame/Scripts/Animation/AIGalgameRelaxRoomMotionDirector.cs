@@ -2,8 +2,6 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Animations;
-using UnityEngine.Playables;
 using UnityEngine.Serialization;
 
 #if UNITY_EDITOR
@@ -146,17 +144,10 @@ namespace AIgalgame.Motion
             TriggerVideoCallEnd,
         };
 
-        private readonly List<LayerRuntime> layers = new();
-        private PlayableGraph graph;
-        private AnimationLayerMixerPlayable layerMixer;
         private Coroutine managedRoutine;
         private Coroutine delayedPutDownRoutine;
-        private Coroutine graphBlendRoutine;
         private RelaxRoomMotionMode mode = RelaxRoomMotionMode.Idle;
         private float busyUntil;
-        private PlayableGraph previousGraph;
-        private AnimationPlayableOutput currentOutput;
-        private AnimationPlayableOutput previousOutput;
         private bool replyPhoneHeld;
         private bool replyWaitingPoseScheduled;
         private bool replyWaitingPoseActive;
@@ -166,6 +157,9 @@ namespace AIgalgame.Motion
         private bool videoCallAiSpeaking;
         private bool videoCallUserSpeaking;
         private bool loggedMissingVideoCallAnimatorContract;
+        private bool loggedMissingPhoneNotificationAudioSource;
+        private bool loggedMissingPhoneNotificationClip;
+        private readonly HashSet<string> loggedControllerOnlyFallbackBlocks = new();
         private Vector3 preSleepPosition;
         private Quaternion preSleepRotation = Quaternion.identity;
         private bool hasPreSleepPose;
@@ -240,16 +234,6 @@ namespace AIgalgame.Motion
             {
                 phoneAttachment.RefreshAttachment();
             }
-
-            if (!graph.IsValid())
-            {
-                return;
-            }
-
-            for (var i = 0; i < layers.Count; i++)
-            {
-                UpdateLayer(layers[i]);
-            }
         }
 
         private void OnDestroy()
@@ -316,6 +300,7 @@ namespace AIgalgame.Motion
             busyUntil = Time.time + 2f;
             gazeDirector?.SetMotionMode(mode, "phone_texting");
             phoneScreen?.ShowMessage(0f, true);
+            PlayPhoneNotificationAudioOnly();
             expressionDirector?.SetAvatarState(AIGalgameAvatarState.Typing);
             expressionDirector?.SetEmotion("thinking", 0.48f);
             replyPhoneHeld = true;
@@ -323,19 +308,14 @@ namespace AIgalgame.Motion
             replyWaitingPoseActive = false;
             replyVoiceEnded = false;
 
-            if ((!ShouldUsePhonePickupFlow() || continueWithPhone) &&
-                TryTriggerController(continueWithPhone ? TriggerReplyDoubleTyping : TriggerReplyRequest))
+            var replyTrigger = continueWithPhone ? TriggerReplyDoubleTyping : TriggerReplyRequest;
+            if (TryTriggerController(replyTrigger))
             {
                 return;
             }
 
-            if (continueWithPhone)
-            {
-                PlayReplyDoubleTyping();
-                return;
-            }
-
-            StartManagedRoutine(ReplyRequestRoutine());
+            replyPhoneHeld = continueWithPhone;
+            LogControllerOnlyFallbackBlocked("BeginReplyRequest", replyTrigger);
         }
 
         public void BeginReplyReceived(bool hasDialogue)
@@ -642,8 +622,23 @@ namespace AIgalgame.Motion
         private void PlayPhoneNotificationAudioOnly()
         {
             var source = EnsurePhoneAudioSource();
-            if (source == null || phoneNotificationClip == null)
+            if (source == null)
             {
+                if (!loggedMissingPhoneNotificationAudioSource)
+                {
+                    Debug.LogWarning("RelaxRoom phone notification sound has no AudioSource. Assign phoneAudioSource in AIGalgameRelaxRoomMotionDirector.", this);
+                    loggedMissingPhoneNotificationAudioSource = true;
+                }
+                return;
+            }
+
+            if (phoneNotificationClip == null)
+            {
+                if (!loggedMissingPhoneNotificationClip)
+                {
+                    Debug.LogWarning("RelaxRoom phone notification sound has no AudioClip. Assign phoneNotificationClip in AIGalgameRelaxRoomMotionDirector.", this);
+                    loggedMissingPhoneNotificationClip = true;
+                }
                 return;
             }
 
@@ -702,25 +697,28 @@ namespace AIgalgame.Motion
             StopDelayedPutDownRoutine();
             ClearReplyState();
             ClearVideoCallState();
-            SetPhoneVisible(false);
+            var deferPhoneReleaseToAnimator = ShouldDeferPhoneReleaseToAnimator();
+            if (!deferPhoneReleaseToAnimator)
+            {
+                SetPhoneVisible(false);
+            }
+
             mode = RelaxRoomMotionMode.Idle;
             busyUntil = 0f;
             gazeDirector?.SetMotionMode(mode, "idle");
             expressionDirector?.SetAvatarState(AIGalgameAvatarState.Idle);
 
-            var baseClip = GetSittingClip();
             if (TryTriggerController(TriggerToIdle))
             {
                 return;
             }
 
-            if (baseClip != null)
+            if (deferPhoneReleaseToAnimator)
             {
-                PlayLayered(new[] { new LayerSpec(baseClip, null, 1f, 0d, baseClip.length, true, 1d) }, transitionSeconds);
-                return;
+                SetPhoneVisible(false);
             }
 
-            PlaySingle("Sitting Idle", IdleFolderHint, loop: true, RelaxRoomMotionMode.Idle);
+            LogControllerOnlyFallbackBlocked("SetIdle", TriggerToIdle);
         }
 
         public void PlayTouch(string hitArea, string motionHint = "")
@@ -746,7 +744,7 @@ namespace AIgalgame.Motion
                     return;
                 }
 
-                PlayFullBodyClip("Bashful", TouchFolderHint, RelaxRoomMotionMode.Touch, loop: false);
+                LogControllerOnlyFallbackBlocked("PlayTouch(head)", TriggerTouchHead);
                 ScheduleIdleReturn(ResolveOneShotDurationSeconds(key, -1f, "Bashful"));
                 return;
             }
@@ -760,7 +758,7 @@ namespace AIgalgame.Motion
                     return;
                 }
 
-                PlayFullBodyClip("Sitting Rubbing Arm", TouchFolderHint, RelaxRoomMotionMode.Touch, loop: false);
+                LogControllerOnlyFallbackBlocked("PlayTouch(hand)", TriggerTouchHand);
                 ScheduleIdleReturn(ResolveOneShotDurationSeconds(key, -1f, "Sitting Rubbing Arm", "Rubbing Arm"));
                 return;
             }
@@ -773,7 +771,7 @@ namespace AIgalgame.Motion
             }
 
             expressionDirector?.AddTransient("angry", 0.36f, fallbackOneShotSeconds);
-            PlaySingle("Sitting Disapproval", TouchFolderHint, loop: false, RelaxRoomMotionMode.Touch);
+            LogControllerOnlyFallbackBlocked("PlayTouch(chest)", TriggerTouchChest);
             ScheduleIdleReturn(ResolveOneShotDurationSeconds(key, -1f, "Sitting Disapproval", "Disapproval"));
         }
 
@@ -816,46 +814,8 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            switch (key)
-            {
-                case "phone":
-                case "phonetablet":
-                case "idletablet":
-                case "standingusingtouchscreentablet":
-                    StartManagedRoutine(LongPhoneLoopRoutine("K_play", RelaxRoomPhoneGrip.IdleTablet, holdSeconds));
-                    break;
-                case "phonetexting":
-                case "idletexting":
-                case "texting":
-                    StartManagedRoutine(IdleTextingRoutine(holdSeconds));
-                    break;
-                case "typing":
-                case "idletyping":
-                    StartManagedRoutine(IdleTypingRoutine(holdSeconds));
-                    break;
-                case "yawn":
-                case "idleyawn":
-                    PlayFullBodyClip("Yawn", IdleActionFolderHint, RelaxRoomMotionMode.IdleAction, loop: false);
-                    ScheduleIdleReturn(ResolveOneShotDurationSeconds(key, requestedDurationSeconds, "Yawn", "haqie"));
-                    break;
-                case "waking":
-                case "wakeup":
-                case "idlewaking":
-                case "sleeping":
-                case "sleepy":
-                case "dozing":
-                case "doze":
-                case "idlesleeping":
-                case "idledozing":
-                    StartManagedRoutine(DozingRoutine(holdSeconds));
-                    break;
-                case "sitting":
-                    StartManagedRoutine(LongSingleLoopRoutine("Sitting", holdSeconds));
-                    break;
-                default:
-                    SetIdle();
-                    break;
-            }
+            LogControllerOnlyFallbackBlocked($"PlayIdleAction({motion})", ControllerTriggerForIdleActionKey(key));
+            SetIdle();
         }
 
         private float ResolveLoopIdleActionDuration(float requestedDurationSeconds)
@@ -946,29 +906,47 @@ namespace AIgalgame.Motion
             return "neutral";
         }
 
+        private static string ControllerTriggerForIdleActionKey(string key)
+        {
+            switch (key)
+            {
+                case "phone":
+                case "phonetablet":
+                case "idletablet":
+                case "standingusingtouchscreentablet":
+                    return TriggerIdleTablet;
+                case "phonetexting":
+                case "idletexting":
+                case "texting":
+                    return TriggerIdleTexting;
+                case "typing":
+                case "idletyping":
+                    return TriggerIdleTyping;
+                case "yawn":
+                case "idleyawn":
+                    return TriggerIdleYawn;
+                case "waking":
+                case "wakeup":
+                case "idlewaking":
+                    return TriggerIdleWaking;
+                case "sleeping":
+                case "sleepy":
+                case "dozing":
+                case "doze":
+                case "idlesleeping":
+                case "idledozing":
+                    return TriggerIdleSleeping;
+                case "sitting":
+                    return TriggerIdleSitting;
+                default:
+                    return "idle action trigger";
+            }
+        }
+
         private IEnumerator ReplyRequestRoutine()
         {
-            mode = RelaxRoomMotionMode.Reply;
-            busyUntil = Time.time + 2f;
-            PreparePhoneOnTable();
-            phoneScreen?.ShowMessage(0f, true);
-            replyPhoneHeld = true;
-            replyWaitingPoseScheduled = false;
-            replyWaitingPoseActive = false;
-            replyVoiceEnded = false;
-            var grip = RelaxRoomPhoneGrip.ReplyTexting;
-            var pickupDuration = PlayPhonePickupMotion(ReplyFolderHint, RelaxRoomMotionMode.Reply);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PickupDuring(grip, pickupDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(pickupDuration);
-                EnsurePhoneInHand(grip);
-            }
-
-            PlayPhoneTextingLoop(ReplyFolderHint, RelaxRoomMotionMode.Reply, grip);
+            LogControllerOnlyFallbackBlocked(nameof(ReplyRequestRoutine), TriggerReplyRequest);
+            yield break;
         }
 
         private IEnumerator ReplyReceivedRoutine()
@@ -990,11 +968,6 @@ namespace AIgalgame.Motion
         private bool TryPlayIdleActionOnController(string key, float holdSeconds)
         {
             if (!CanUseAnimatorController())
-            {
-                return false;
-            }
-
-            if (ShouldUsePhonePickupFlow() && IsPhoneIdleActionKey(key))
             {
                 return false;
             }
@@ -1087,13 +1060,7 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            var stopClip = GetPhoneTextingStopClip(ReplyFolderHint);
-            if (stopClip != null && PlayPhoneFullBodyClip(stopClip, RelaxRoomMotionMode.Reply, loop: true))
-            {
-                return;
-            }
-
-            PlayPhoneTextingLoop(ReplyFolderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyTexting);
+            LogControllerOnlyFallbackBlocked("PlayReplyBaseOnly", $"{TriggerReplyTextingStop}/{TriggerToIdle}");
         }
 
         private void PlayReplyWaitingPoseState()
@@ -1103,7 +1070,7 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            PlayReplyWaitingPose();
+            LogControllerOnlyFallbackBlocked("PlayReplyWaitingPoseState", TriggerReplyWaitingPose);
         }
 
         private void StartReplyPutDownNow()
@@ -1122,7 +1089,7 @@ namespace AIgalgame.Motion
 
         private IEnumerator DelayedReplyPutDownRoutine()
         {
-            yield return new WaitForSeconds(Mathf.Clamp(replyHoldAfterVoiceSeconds, 5f, 8f));
+            yield return new WaitForSeconds(Mathf.Clamp(replyHoldAfterVoiceSeconds, 0.5f, 15f));
             replyWaitingPoseActive = false;
             replyWaitingPoseScheduled = false;
             mode = RelaxRoomMotionMode.Reply;
@@ -1130,21 +1097,13 @@ namespace AIgalgame.Motion
             gazeDirector?.SetMotionMode(RelaxRoomMotionMode.Reply, "phone_texting");
             var putDownDuration = PhonePutDownDuration(ReplyFolderHint);
 
-            if (!ShouldUsePhonePickupFlow() && TryTriggerController(TriggerReplyPutDown))
+            if (TryTriggerController(TriggerReplyPutDown))
             {
                 yield return new WaitForSeconds(putDownDuration);
             }
             else
             {
-                putDownDuration = PlayPhonePutDownMotion(ReplyFolderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyTexting);
-                if (ShouldUsePhonePickupFlow())
-                {
-                    yield return phonePickup.PutDownDuring(RelaxRoomPhoneGrip.ReplyTexting, putDownDuration);
-                }
-                else
-                {
-                    yield return new WaitForSeconds(putDownDuration);
-                }
+                LogControllerOnlyFallbackBlocked("DelayedReplyPutDownRoutine", TriggerReplyPutDown);
             }
 
             delayedPutDownRoutine = null;
@@ -1161,7 +1120,7 @@ namespace AIgalgame.Motion
             gazeDirector?.SetMotionMode(RelaxRoomMotionMode.Reply, "phone_texting");
             var putDownDuration = PhonePutDownDuration(folderHint);
 
-            if (!ShouldUsePhonePickupFlow() && TryTriggerController(TriggerReplyPutDown))
+            if (TryTriggerController(TriggerReplyPutDown))
             {
                 yield return new WaitForSeconds(putDownDuration);
                 ClearReplyState();
@@ -1169,137 +1128,43 @@ namespace AIgalgame.Motion
                 yield break;
             }
 
-            putDownDuration = PlayPhonePutDownMotion(folderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyTexting);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PutDownDuring(RelaxRoomPhoneGrip.ReplyTexting, putDownDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(putDownDuration);
-            }
+            LogControllerOnlyFallbackBlocked("PutPhoneDownRoutine", TriggerReplyPutDown);
             ClearReplyState();
             SetIdle();
         }
 
         private IEnumerator IdleTextingRoutine(float holdSeconds)
         {
-            PreparePhoneOnTable();
-            phoneScreen?.ShowMessage(holdSeconds, false);
-
-            var grip = RelaxRoomPhoneGrip.IdleTexting;
-            var pickupDuration = PlayPhonePickupMotion(IdleActionFolderHint, RelaxRoomMotionMode.IdleAction);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PickupDuring(grip, pickupDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(pickupDuration);
-                EnsurePhoneInHand(grip);
-            }
-
-            PlayPhoneTextingLoop(IdleActionFolderHint, RelaxRoomMotionMode.IdleAction, grip);
-            yield return new WaitForSeconds(Mathf.Max(0.5f, holdSeconds));
-            var putDownDuration = PlayPhonePutDownMotion(IdleActionFolderHint, RelaxRoomMotionMode.IdleAction, grip);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PutDownDuring(grip, putDownDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(putDownDuration);
-            }
+            LogControllerOnlyFallbackBlocked(nameof(IdleTextingRoutine), TriggerIdleTexting);
+            yield return null;
             SetIdle();
         }
 
         private IEnumerator IdleTypingRoutine(float holdSeconds)
         {
-            PlaySingle("K_Typing", IdleActionFolderHint, loop: true, RelaxRoomMotionMode.IdleAction);
-            if (GetClip("K_Typing", IdleActionFolderHint) == null)
-            {
-                PlaySingle("Typing", IdleActionFolderHint, loop: true, RelaxRoomMotionMode.IdleAction);
-            }
-
-            yield return new WaitForSeconds(Mathf.Max(0.5f, holdSeconds));
+            LogControllerOnlyFallbackBlocked(nameof(IdleTypingRoutine), TriggerIdleTyping);
+            yield return null;
             SetIdle();
         }
 
         private IEnumerator LongPhoneLoopRoutine(string clipHint, RelaxRoomPhoneGrip grip, float holdSeconds)
         {
-            PreparePhoneOnTable();
-            phoneScreen?.ShowMessage(holdSeconds, false);
-            var pickupDuration = PlayPhonePickupMotion(IdleActionFolderHint, RelaxRoomMotionMode.IdleAction);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PickupDuring(grip, pickupDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(pickupDuration);
-                EnsurePhoneInHand(grip);
-            }
-
-            PlayFullBodyClip(clipHint, IdleActionFolderHint, RelaxRoomMotionMode.IdleAction, loop: true);
-            yield return new WaitForSeconds(Mathf.Max(0.5f, holdSeconds));
-
-            var putDownDuration = PlayPhonePutDownMotion(IdleActionFolderHint, RelaxRoomMotionMode.IdleAction, grip);
-            if (ShouldUsePhonePickupFlow())
-            {
-                yield return phonePickup.PutDownDuring(grip, putDownDuration);
-            }
-            else
-            {
-                yield return new WaitForSeconds(putDownDuration);
-            }
-
+            LogControllerOnlyFallbackBlocked($"{nameof(LongPhoneLoopRoutine)}({clipHint})", TriggerIdleTablet);
+            yield return null;
             SetIdle();
         }
 
         private IEnumerator DozingRoutine(float holdSeconds)
         {
-            var endAt = Time.time + Mathf.Max(0.5f, holdSeconds);
-            var sleepClip = GetClip("K_wake_Reverse", IdleActionFolderHint) ?? GetClip("Idle_sleeping", IdleActionFolderHint);
-            var wakeClip = GetClip("K_wake", IdleActionFolderHint) ?? GetClip("Waking", IdleActionFolderHint);
-            var sleepDuration = ClipDuration(sleepClip, 1.8f);
-            var wakeDuration = ClipDuration(wakeClip, 1.2f);
-
-            while (Time.time < endAt)
-            {
-                gazeDirector?.SetMotionMode(RelaxRoomMotionMode.IdleAction, "sleeping");
-                expressionDirector?.SetEmotion("relaxed", 0.5f, sleepDuration + 2.5f);
-                PlaySingle("K_wake_Reverse", IdleActionFolderHint, loop: false, RelaxRoomMotionMode.IdleAction);
-                if (sleepClip == null)
-                {
-                    PlaySingle("Waking", IdleActionFolderHint, loop: false, RelaxRoomMotionMode.IdleAction);
-                }
-
-                yield return new WaitForSeconds(sleepDuration);
-                yield return new WaitForSeconds(Mathf.Min(UnityEngine.Random.Range(2.5f, 6f), Mathf.Max(0f, endAt - Time.time)));
-                if (Time.time >= endAt)
-                {
-                    break;
-                }
-
-                gazeDirector?.SetMotionMode(RelaxRoomMotionMode.IdleAction, "waking");
-                expressionDirector?.AddTransient("surprised", 0.34f, 0.9f);
-                PlaySingle("K_wake", IdleActionFolderHint, loop: false, RelaxRoomMotionMode.IdleAction);
-                if (wakeClip == null)
-                {
-                    PlaySingle("Waking", IdleActionFolderHint, loop: false, RelaxRoomMotionMode.IdleAction);
-                }
-
-                yield return new WaitForSeconds(wakeDuration);
-                yield return new WaitForSeconds(Mathf.Min(UnityEngine.Random.Range(2f, 5f), Mathf.Max(0f, endAt - Time.time)));
-            }
-
+            LogControllerOnlyFallbackBlocked(nameof(DozingRoutine), TriggerIdleSleeping);
+            yield return null;
             SetIdle();
         }
 
         private IEnumerator LongSingleLoopRoutine(string clipHint, float holdSeconds)
         {
-            PlaySingle(clipHint, IdleActionFolderHint, loop: true, RelaxRoomMotionMode.IdleAction);
-            yield return new WaitForSeconds(Mathf.Max(0.5f, holdSeconds));
+            LogControllerOnlyFallbackBlocked($"{nameof(LongSingleLoopRoutine)}({clipHint})", TriggerIdleSitting);
+            yield return null;
             SetIdle();
         }
 
@@ -1315,7 +1180,7 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            PlayPhoneTextingLoop(ReplyFolderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyTexting);
+            LogControllerOnlyFallbackBlocked("PlayTypingLoopForDialogue", TriggerReplyRequest);
         }
 
         private void PlaySittingSpeaking()
@@ -1323,17 +1188,7 @@ namespace AIgalgame.Motion
             StopManagedRoutine();
             mode = RelaxRoomMotionMode.Speaking;
             expressionDirector?.SetAvatarState(AIGalgameAvatarState.Speaking);
-            if (motionPlayer != null)
-            {
-                StopGraph();
-                if (motionPlayer.PlayClip("Sitting Talking", 0.2f) ||
-                    motionPlayer.PlayClip("Sitting Talking", 0.2f, "FBX"))
-                {
-                    return;
-                }
-            }
-
-            PlaySingle("Sitting Talking", "", loop: true, RelaxRoomMotionMode.Speaking);
+            LogControllerOnlyFallbackBlocked("PlaySittingSpeaking", "Animator Controller speaking state");
         }
 
         private IEnumerator VideoCallStateReleaseRoutine()
@@ -1362,12 +1217,12 @@ namespace AIgalgame.Motion
         {
             var fallbackDuration = SegmentDuration(GetClip("Texting", folderHint), textingPickupRange);
             var pickupClip = GetPhonePickupClip(folderHint);
-            if (pickupClip != null && PlayPhoneFullBodyClip(pickupClip, nextMode, loop: false))
+            if (pickupClip != null)
             {
-                return ClipDuration(pickupClip, fallbackDuration);
+                fallbackDuration = ClipDuration(pickupClip, fallbackDuration);
             }
 
-            PlayTextingSegment(folderHint, textingPickupRange, loop: false, freezeAtStart: false, ensurePhoneInHand: false);
+            LogControllerOnlyFallbackBlocked(nameof(PlayPhonePickupMotion), TriggerReplyRequest);
             return fallbackDuration;
         }
 
@@ -1377,14 +1232,10 @@ namespace AIgalgame.Motion
             var putDownClip = GetPhonePutDownClip(folderHint);
             if (putDownClip != null)
             {
-                EnsurePhoneInHand(grip);
-                if (PlayPhoneFullBodyClip(putDownClip, nextMode, loop: false))
-                {
-                    return ClipDuration(putDownClip, fallbackDuration);
-                }
+                fallbackDuration = ClipDuration(putDownClip, fallbackDuration);
             }
 
-            PlayTextingSegment(folderHint, textingPutDownRange, loop: false, freezeAtStart: false, phoneGrip: grip);
+            LogControllerOnlyFallbackBlocked(nameof(PlayPhonePutDownMotion), TriggerReplyPutDown);
             return fallbackDuration;
         }
 
@@ -1395,36 +1246,13 @@ namespace AIgalgame.Motion
 
         private void PlayPhoneTextingLoop(string folderHint, RelaxRoomMotionMode nextMode, RelaxRoomPhoneGrip grip)
         {
-            EnsurePhoneInHand(grip);
-            if (nextMode == RelaxRoomMotionMode.Reply)
-            {
-                phoneScreen?.ShowMessage(0f, true);
-            }
-
-            var loopClip = GetPhoneTextingLoopClip(folderHint);
-            if (loopClip != null && PlayPhoneFullBodyClip(loopClip, nextMode, loop: true))
-            {
-                return;
-            }
-
-            PlayTextingSegment(folderHint, textingLoopRange, loop: true, freezeAtStart: false, phoneGrip: grip);
+            LogControllerOnlyFallbackBlocked(nameof(PlayPhoneTextingLoop), "phone texting controller state");
         }
 
         private bool PlayPhoneFullBodyClip(AnimationClip clip, RelaxRoomMotionMode nextMode, bool loop)
         {
-            if (clip == null || clip.length <= 0.01f)
-            {
-                return false;
-            }
-
-            if (CanUseAnimatorController())
-            {
-                return false;
-            }
-
-            mode = nextMode;
-            PlayLayered(new LayerSpec(clip, null, 1f, 0d, clip.length, loop, 1d));
-            return true;
+            LogControllerOnlyFallbackBlocked(nameof(PlayPhoneFullBodyClip), clip != null ? clip.name : "missing clip");
+            return false;
         }
 
         private AnimationClip GetPhonePickupClip(string folderHint)
@@ -1478,63 +1306,27 @@ namespace AIgalgame.Motion
 
         private void PlayTextingSegment(string folderHint, Vector2 normalizedRange, bool loop, bool freezeAtStart, bool ensurePhoneInHand = true, RelaxRoomPhoneGrip? phoneGrip = null)
         {
-            if (ensurePhoneInHand)
-            {
-                EnsurePhoneInHand(phoneGrip ?? GetTextingSegmentPhoneGrip(folderHint));
-            }
-            var texting = GetClip("Texting", folderHint);
-            if (texting == null)
-            {
-                SetIdle();
-                return;
-            }
-
-            var start = NormalizedToSeconds(texting, normalizedRange.x);
-            var end = NormalizedToSeconds(texting, normalizedRange.y);
-            PlayLayered(new LayerSpec(texting, null, 1f, start, end, loop, freezeAtStart ? 0d : 1d));
+            LogControllerOnlyFallbackBlocked(nameof(PlayTextingSegment), "Texting clip segment");
         }
 
         private void PlayReplyWaitingPose()
         {
-            EnsurePhoneInHand(RelaxRoomPhoneGrip.ReplyWaiting);
-            var waitingClip = GetDedicatedPhoneClip(ReplyFolderHint, "K_sitting_waiting", "wait_for_reply", "Waiting");
-            if (waitingClip != null && PlayPhoneFullBodyClip(waitingClip, RelaxRoomMotionMode.Reply, loop: true))
-            {
-                return;
-            }
-
-            PlayPhoneTextingLoop(ReplyFolderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyWaiting);
+            LogControllerOnlyFallbackBlocked(nameof(PlayReplyWaitingPose), TriggerReplyWaitingPose);
         }
 
         private void PlayReplyDoubleTyping()
         {
-            EnsurePhoneInHand(RelaxRoomPhoneGrip.ReplyDoubleTyping);
-            PlayPhoneTextingLoop(ReplyFolderHint, RelaxRoomMotionMode.Reply, RelaxRoomPhoneGrip.ReplyDoubleTyping);
+            LogControllerOnlyFallbackBlocked(nameof(PlayReplyDoubleTyping), TriggerReplyDoubleTyping);
         }
 
         private void PlayFullBodyClip(string clipHint, string folderHint, RelaxRoomMotionMode nextMode, bool loop)
         {
-            var clip = GetClip(clipHint, folderHint) ?? GetClip(clipHint, "");
-            if (clip == null)
-            {
-                SetIdle();
-                return;
-            }
-
-            mode = nextMode;
-            PlayLayered(new LayerSpec(clip, null, 1f, 0d, clip.length, loop, 1d));
+            LogControllerOnlyFallbackBlocked($"{nameof(PlayFullBodyClip)}({clipHint})", folderHint);
         }
 
         private void PlaySingle(string clipHint, string folderHint, bool loop, RelaxRoomMotionMode nextMode)
         {
-            var clip = GetClip(clipHint, folderHint) ?? GetClip(clipHint, "");
-            if (clip == null)
-            {
-                return;
-            }
-
-            mode = nextMode;
-            PlayLayered(new LayerSpec(clip, null, 1f, 0d, clip.length, loop, 1d));
+            LogControllerOnlyFallbackBlocked($"{nameof(PlaySingle)}({clipHint})", folderHint);
         }
 
         private void PlayLayered(params LayerSpec[] specs)
@@ -1544,125 +1336,7 @@ namespace AIgalgame.Motion
 
         private void PlayLayered(LayerSpec[] specs, float transitionSeconds)
         {
-#if UNITY_EDITOR
-            if (IsEditorAnimationPreviewActive())
-            {
-                StopGraph();
-                return;
-            }
-#endif
-
-            if (CanUseAnimatorController())
-            {
-                return;
-            }
-
-            ResolveReferences();
-            if (animator == null)
-            {
-                return;
-            }
-
-            motionPlayer?.Stop();
-            PrepareGraphTransition();
-
-            var validSpecs = new List<LayerSpec>();
-            foreach (var spec in specs)
-            {
-                if (spec.Clip != null)
-                {
-                    validSpecs.Add(spec);
-                }
-            }
-
-            if (validSpecs.Count == 0)
-            {
-                return;
-            }
-
-            graph = PlayableGraph.Create("AIgalgame RelaxRoom Motion");
-            graph.SetTimeUpdateMode(DirectorUpdateMode.GameTime);
-            layerMixer = AnimationLayerMixerPlayable.Create(graph, validSpecs.Count);
-            currentOutput = AnimationPlayableOutput.Create(graph, "RelaxRoom Motion Output", animator);
-            if (!IsOutputValid(currentOutput))
-            {
-                StopGraph();
-                return;
-            }
-
-            currentOutput.SetSourcePlayable(layerMixer);
-            layers.Clear();
-
-            for (var i = 0; i < validSpecs.Count; i++)
-            {
-                var spec = validSpecs[i];
-                var playable = AnimationClipPlayable.Create(graph, spec.Clip);
-                playable.SetApplyFootIK(applyFootIk);
-                playable.SetTime(spec.StartSeconds);
-                playable.SetSpeed(spec.Speed);
-                graph.Connect(playable, 0, layerMixer, i);
-                layerMixer.SetInputWeight(i, spec.Weight);
-                if (i > 0 && spec.Mask != null)
-                {
-                    layerMixer.SetLayerMaskFromAvatarMask((uint)i, spec.Mask);
-                }
-
-                layers.Add(new LayerRuntime
-                {
-                    Input = i,
-                    Clip = spec.Clip,
-                    StartSeconds = spec.StartSeconds,
-                    EndSeconds = Math.Max(spec.StartSeconds, spec.EndSeconds),
-                    Loop = spec.Loop,
-                    Speed = spec.Speed,
-                });
-            }
-
-            graph.Play();
-            StartGraphBlend(transitionSeconds);
-        }
-
-        private void UpdateLayer(LayerRuntime layer)
-        {
-            if (!layerMixer.IsValid() || layer.Input < 0 || layer.Input >= layers.Count || layer.Clip == null || layer.EndSeconds <= layer.StartSeconds)
-            {
-                return;
-            }
-
-            var playable = layerMixer.GetInput(layer.Input);
-            if (!playable.IsValid())
-            {
-                return;
-            }
-
-            var time = playable.GetTime();
-            if (layer.Speed == 0d)
-            {
-                playable.SetTime(layer.StartSeconds);
-                return;
-            }
-
-            if (time < layer.StartSeconds)
-            {
-                playable.SetTime(layer.StartSeconds);
-                return;
-            }
-
-            if (time < layer.EndSeconds)
-            {
-                return;
-            }
-
-            if (layer.Loop)
-            {
-                var span = Math.Max(0.05d, layer.EndSeconds - layer.StartSeconds);
-                playable.SetTime(layer.StartSeconds + ((time - layer.StartSeconds) % span));
-            }
-            else
-            {
-                playable.SetTime(layer.EndSeconds);
-                playable.SetSpeed(0d);
-            }
+            LogControllerOnlyFallbackBlocked(nameof(PlayLayered), "scripted clip playback");
         }
 
         private void ScheduleIdleReturn(float seconds)
@@ -1877,6 +1551,19 @@ namespace AIgalgame.Motion
             return true;
         }
 
+        private void LogControllerOnlyFallbackBlocked(string context, string controllerEntry)
+        {
+            var key = $"{context}|{controllerEntry}";
+            if (!loggedControllerOnlyFallbackBlocks.Add(key))
+            {
+                return;
+            }
+
+            Debug.LogError(
+                $"RelaxRoom motion is Animator Controller-only. Scripted clip/playable fallback was blocked for '{context}'. Check Animator Controller entry '{controllerEntry}'.",
+                this);
+        }
+
         private void ResetControllerTriggers()
         {
             if (animator == null)
@@ -2063,6 +1750,15 @@ namespace AIgalgame.Motion
             return phonePickup != null && phonePickup.enabled && phonePickup.UsePickupFlow;
         }
 
+        private bool ShouldDeferPhoneReleaseToAnimator()
+        {
+            ResolveReferences();
+            return phoneAttachment != null &&
+                phoneAttachment.IsAttachedToHand &&
+                CanUseAnimatorController() &&
+                HasControllerTrigger(TriggerToIdle);
+        }
+
         private void PreparePhoneOnTable()
         {
             ResolveReferences();
@@ -2213,109 +1909,6 @@ namespace AIgalgame.Motion
             managedRoutine = null;
         }
 
-        private void PrepareGraphTransition()
-        {
-            if (graphBlendRoutine != null)
-            {
-                StopCoroutine(graphBlendRoutine);
-                graphBlendRoutine = null;
-            }
-
-            if (previousGraph.IsValid())
-            {
-                previousGraph.Destroy();
-                previousGraph = default;
-                previousOutput = default;
-            }
-
-            if (!graph.IsValid())
-            {
-                return;
-            }
-
-            previousGraph = graph;
-            previousOutput = currentOutput;
-            if (IsOutputValid(previousOutput))
-            {
-                previousOutput.SetWeight(1f);
-            }
-            graph = default;
-            currentOutput = default;
-        }
-
-        private void StartGraphBlend(float transitionSeconds)
-        {
-            var duration = transitionSeconds < 0f
-                ? Mathf.Clamp(motionTransitionSeconds, 0f, 2f)
-                : Mathf.Clamp(transitionSeconds, 0f, 2f);
-            if (!graph.IsValid() || !IsOutputValid(currentOutput))
-            {
-                if (previousGraph.IsValid())
-                {
-                    previousGraph.Destroy();
-                }
-
-                previousGraph = default;
-                previousOutput = default;
-                return;
-            }
-
-            if (!previousGraph.IsValid() || !IsOutputValid(previousOutput) || duration <= 0.001f)
-            {
-                currentOutput.SetWeight(1f);
-                if (previousGraph.IsValid())
-                {
-                    previousGraph.Destroy();
-                    previousGraph = default;
-                    previousOutput = default;
-                }
-                return;
-            }
-
-            currentOutput.SetWeight(0f);
-            if (IsOutputValid(previousOutput))
-            {
-                previousOutput.SetWeight(1f);
-            }
-            graphBlendRoutine = StartCoroutine(GraphBlendRoutine(duration));
-        }
-
-        private IEnumerator GraphBlendRoutine(float duration)
-        {
-            var elapsed = 0f;
-            while (elapsed < duration && graph.IsValid() && IsOutputValid(currentOutput))
-            {
-                elapsed += Time.deltaTime;
-                var weight = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(elapsed / duration));
-                currentOutput.SetWeight(weight);
-                if (previousGraph.IsValid() && IsOutputValid(previousOutput))
-                {
-                    previousOutput.SetWeight(1f - weight);
-                }
-
-                yield return null;
-            }
-
-            if (graph.IsValid() && IsOutputValid(currentOutput))
-            {
-                currentOutput.SetWeight(1f);
-            }
-
-            if (previousGraph.IsValid())
-            {
-                previousGraph.Destroy();
-            }
-
-            previousGraph = default;
-            previousOutput = default;
-            graphBlendRoutine = null;
-        }
-
-        private static bool IsOutputValid(AnimationPlayableOutput output)
-        {
-            return output.IsOutputValid();
-        }
-
 #if UNITY_EDITOR
         private static bool IsEditorAnimationPreviewActive()
         {
@@ -2325,26 +1918,6 @@ namespace AIgalgame.Motion
 
         private void StopGraph()
         {
-            if (graphBlendRoutine != null)
-            {
-                StopCoroutine(graphBlendRoutine);
-                graphBlendRoutine = null;
-            }
-
-            layers.Clear();
-            if (graph.IsValid())
-            {
-                graph.Destroy();
-            }
-            if (previousGraph.IsValid())
-            {
-                previousGraph.Destroy();
-            }
-
-            graph = default;
-            previousGraph = default;
-            currentOutput = default;
-            previousOutput = default;
         }
 
         private void ResolveReferences()
@@ -2468,7 +2041,7 @@ namespace AIgalgame.Motion
 
             if (phoneAudioSource == null && phoneAudioTarget != null)
             {
-                phoneAudioSource = phoneAudioTarget.GetComponent<AudioSource>() ?? phoneAudioTarget.gameObject.AddComponent<AudioSource>();
+                phoneAudioSource = phoneAudioTarget.GetComponent<AudioSource>();
             }
 
             ConfigureSfxSource(phoneAudioSource);
@@ -2760,14 +2333,5 @@ namespace AIgalgame.Motion
             }
         }
 
-        private sealed class LayerRuntime
-        {
-            public int Input;
-            public AnimationClip Clip;
-            public double StartSeconds;
-            public double EndSeconds;
-            public bool Loop;
-            public double Speed;
-        }
     }
 }

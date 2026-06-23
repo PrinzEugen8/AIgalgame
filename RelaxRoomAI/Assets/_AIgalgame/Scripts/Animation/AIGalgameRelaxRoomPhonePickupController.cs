@@ -38,6 +38,7 @@ namespace AIgalgame.Motion
         [SerializeField] private float fallbackPutDownSeconds = 0.9f;
         [SerializeField, Range(0.05f, 0.95f)] private float grabNormalizedTime = 0.58f;
         [SerializeField, Range(0.05f, 0.95f)] private float releaseNormalizedTime = 0.58f;
+        [SerializeField] private bool releasePhoneOnlyFromAnimationEvent = true;
         [SerializeField] private bool driveHandIkDuringPickup;
         [SerializeField, Range(0f, 1f)] private float maxIkWeight = 0.92f;
         [SerializeField] private bool keepPhoneVisibleOnTable = true;
@@ -45,6 +46,7 @@ namespace AIgalgame.Motion
         private RelaxRoomPhoneGrip activeGrip = RelaxRoomPhoneGrip.ReplyTexting;
         private Coroutine activeRoutine;
         private bool referencesResolved;
+        private bool phoneReleaseEventReceived;
 
         public bool UsePickupFlow => usePickupFlow && phoneAttachment != null;
         public bool IsPhoneHeld => phoneAttachment != null && phoneAttachment.IsAttachedToHand;
@@ -133,9 +135,8 @@ namespace AIgalgame.Motion
         public void OnPhoneRelease()
         {
             ResolveReferences();
-            ApplyPlaceTargetAsTableSlot();
-            phoneAttachment?.PlaceOnTable(keepPhoneVisibleOnTable);
-            phoneScreen?.ShowActiveScreen(5f, false);
+            phoneReleaseEventReceived = true;
+            ReleasePhoneToTable();
         }
 
         private IEnumerator PickupRoutine(RelaxRoomPhoneGrip grip, float durationSeconds)
@@ -191,6 +192,7 @@ namespace AIgalgame.Motion
         private IEnumerator PutDownRoutine(RelaxRoomPhoneGrip grip, float durationSeconds)
         {
             activeGrip = grip;
+            phoneReleaseEventReceived = false;
             phoneAttachment.AttachToHand(grip);
 
             var hand = ResolveHand(grip);
@@ -213,11 +215,13 @@ namespace AIgalgame.Motion
                     ApplyHandIk(hand, aim, weight);
                 }
 
-                if (!released && t >= releaseNormalizedTime)
+                if (!released && phoneReleaseEventReceived)
                 {
-                    ApplyPlaceTargetAsTableSlot();
-                    phoneAttachment.PlaceOnTable(keepPhoneVisibleOnTable);
-                    phoneScreen?.ShowActiveScreen(5f, false);
+                    released = true;
+                }
+                else if (!released && !releasePhoneOnlyFromAnimationEvent && t >= releaseNormalizedTime)
+                {
+                    ReleasePhoneToTable();
                     released = true;
                 }
 
@@ -227,9 +231,7 @@ namespace AIgalgame.Motion
 
             if (!released)
             {
-                ApplyPlaceTargetAsTableSlot();
-                phoneAttachment.PlaceOnTable(keepPhoneVisibleOnTable);
-                phoneScreen?.ShowActiveScreen(5f, false);
+                ReleasePhoneToTable();
             }
 
             if (driveHandIkDuringPickup)
@@ -308,6 +310,13 @@ namespace AIgalgame.Motion
             {
                 phoneAttachment?.SetPhoneTableSlot(phonePlaceTarget);
             }
+        }
+
+        private void ReleasePhoneToTable()
+        {
+            ApplyPlaceTargetAsTableSlot();
+            phoneAttachment?.PlaceOnTable(keepPhoneVisibleOnTable);
+            phoneScreen?.ShowActiveScreen(5f, false);
         }
 
         private void ApplyHandIk(PhoneHand hand, Pose pose, float weight)

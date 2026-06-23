@@ -40,8 +40,9 @@ import {
   handleUnityMessage,
   notifyWhileSleeping,
   playIdleAction,
-  playLinesSequentially,
+  playLine,
   playPhoneNotification,
+  receivedReply,
   setVideoCallAiSpeaking,
   setVideoCallExpression,
   setVideoCallUserSpeaking,
@@ -59,6 +60,7 @@ import {colors} from '../theme/colors';
 import {getStartupSummaryText, logStartupStage} from '../bridge/startupDiagnostics';
 import type {
   ChatMessage,
+  DialogueLine,
   HomeBootstrap,
   LazyReply,
   MomentsResponse,
@@ -78,6 +80,30 @@ const INITIAL_CALL_SNAPSHOT: RealtimeCallSnapshot = {
   voice: 'Momo',
   providerId: '',
 };
+
+type ReplyPlaybackQueue = {
+  sequenceId: number;
+  lines: DialogueLine[];
+  nextIndex: number;
+  currentLineId: string;
+  normalReplies: LazyReply[];
+  keyReplies: LazyReply[];
+};
+
+function lineWithClientId(
+  line: DialogueLine,
+  sequenceId: number,
+  index: number,
+): DialogueLine {
+  if (line.line_id?.trim()) {
+    return line;
+  }
+
+  return {
+    ...line,
+    line_id: `rn_reply_${sequenceId}_${index}`,
+  };
+}
 
 async function requestVideoCallPermissions(): Promise<boolean> {
   if (Platform.OS !== 'android') {
@@ -100,6 +126,8 @@ async function requestVideoCallPermissions(): Promise<boolean> {
 export function RelaxRoomScreen() {
   const unityRef = useRef<UnityView>(null);
   const callControllerRef = useRef<RealtimeCallController | null>(null);
+  const replyQueueRef = useRef<ReplyPlaybackQueue | null>(null);
+  const replySequenceIdRef = useRef(0);
   const lastCallImageSentAtRef = useRef(0);
   const lastInteractionRef = useRef(Date.now());
   const idleInFlightRef = useRef(false);
@@ -139,6 +167,96 @@ export function RelaxRoomScreen() {
     ]);
   }, []);
 
+  const finishReplyQueue = useCallback((sequenceId: number) => {
+    const queue = replyQueueRef.current;
+    if (!queue || queue.sequenceId !== sequenceId) {
+      return;
+    }
+
+    replyQueueRef.current = null;
+    endReply();
+    setNormalReplies(queue.normalReplies);
+    setKeyReplies(queue.keyReplies);
+    setStatusText('');
+    setSending(false);
+  }, []);
+
+  const playReplyLine = useCallback(
+    (queue: ReplyPlaybackQueue, line: DialogueLine) => {
+      queue.currentLineId = line.line_id ?? '';
+      if (line.text) {
+        pushMessage('companion', line.text);
+      }
+      playLine(line);
+    },
+    [pushMessage],
+  );
+
+  const advanceReplyQueue = useCallback(
+    (manual = false) => {
+      const queue = replyQueueRef.current;
+      if (!queue) {
+        return false;
+      }
+
+      if (queue.nextIndex >= queue.lines.length) {
+        if (!manual) {
+          finishReplyQueue(queue.sequenceId);
+        }
+        return false;
+      }
+
+      const line = queue.lines[queue.nextIndex];
+      queue.nextIndex += 1;
+      playReplyLine(queue, line);
+      return true;
+    },
+    [finishReplyQueue, playReplyLine],
+  );
+
+  const startReplyQueue = useCallback(
+    (
+      lines: DialogueLine[],
+      normalRepliesForEnd: LazyReply[],
+      keyRepliesForEnd: LazyReply[],
+    ) => {
+      const sequenceId = replySequenceIdRef.current + 1;
+      replySequenceIdRef.current = sequenceId;
+
+      replyQueueRef.current = {
+        sequenceId,
+        lines: lines.map((line, index) =>
+          lineWithClientId(line, sequenceId, index),
+        ),
+        nextIndex: 0,
+        currentLineId: '',
+        normalReplies: normalRepliesForEnd,
+        keyReplies: keyRepliesForEnd,
+      };
+
+      receivedReply(true);
+      setStatusText('');
+      advanceReplyQueue(false);
+    },
+    [advanceReplyQueue],
+  );
+
+  const handleReplyLineFinished = useCallback(
+    (lineId?: string) => {
+      const queue = replyQueueRef.current;
+      if (!queue) {
+        return;
+      }
+
+      if (queue.currentLineId && lineId !== queue.currentLineId) {
+        return;
+      }
+
+      advanceReplyQueue(false);
+    },
+    [advanceReplyQueue],
+  );
+
   const refreshHome = useCallback(async () => {
     try {
       const data = await fetchHomeBootstrap();
@@ -170,6 +288,12 @@ export function RelaxRoomScreen() {
   const markInteraction = useCallback(() => {
     lastInteractionRef.current = Date.now();
   }, []);
+
+  const handleAdvanceReplyPress = useCallback(() => {
+    if (advanceReplyQueue(true)) {
+      markInteraction();
+    }
+  }, [advanceReplyQueue, markInteraction]);
 
   const resolveCallController = useCallback(() => {
     if (callControllerRef.current != null) {
@@ -269,6 +393,7 @@ export function RelaxRoomScreen() {
         return;
       }
 
+      let replyQueueStarted = false;
       markInteraction();
       setSending(true);
       setStatusText('发送中...');
@@ -307,17 +432,12 @@ export function RelaxRoomScreen() {
           return;
         }
 
-        for (const line of lines) {
-          if (line.text) {
-            pushMessage('companion', line.text);
-          }
-        }
-
-        await playLinesSequentially(lines);
-
-        setNormalReplies(response.payload?.normal_replies ?? []);
-        setKeyReplies(response.payload?.key_replies ?? []);
-        setStatusText('');
+        startReplyQueue(
+          lines,
+          response.payload?.normal_replies ?? [],
+          response.payload?.key_replies ?? [],
+        );
+        replyQueueStarted = true;
       } catch (error) {
         if (!isSleeping) {
           endReply();
@@ -328,10 +448,12 @@ export function RelaxRoomScreen() {
         );
         setStatusText('发送失败');
       } finally {
-        setSending(false);
+        if (!replyQueueStarted) {
+          setSending(false);
+        }
       }
     },
-    [isSleeping, markInteraction, pushMessage, sending],
+    [isSleeping, markInteraction, pushMessage, sending, startReplyQueue],
   );
 
   useEffect(() => {
@@ -407,6 +529,11 @@ export function RelaxRoomScreen() {
         return;
       }
 
+      if (event.evt === 'line.finished') {
+        handleReplyLineFinished(event.line_id);
+        return;
+      }
+
       if (event.evt === 'touch.finished') {
         if (event.text) {
           pushMessage('companion', event.text);
@@ -425,7 +552,14 @@ export function RelaxRoomScreen() {
     });
 
     return unsubscribe;
-  }, [markInteraction, pushMessage, refreshHome, refreshMoments, sessionReady]);
+  }, [
+    handleReplyLineFinished,
+    markInteraction,
+    pushMessage,
+    refreshHome,
+    refreshMoments,
+    sessionReady,
+  ]);
 
   useEffect(() => {
     const timer = setInterval(async () => {
@@ -571,6 +705,7 @@ export function RelaxRoomScreen() {
                 markInteraction();
                 setDraft(text);
               }}
+              onAdvanceReply={handleAdvanceReplyPress}
               onPhone={() => {
                 markInteraction();
                 if (isSleeping) {

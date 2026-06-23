@@ -71,6 +71,7 @@ namespace AIgalgame.Motion
         private bool roomReadySent;
         private bool environmentReadySent;
         private bool pendingAmbientAudio;
+        private bool replySequenceActive;
 
         public void SetTargets(
             AIGalgameChatdollController targetController,
@@ -95,6 +96,7 @@ namespace AIgalgame.Motion
                 "Add RelaxRoomCameraDirector to the RelaxRoomBridge scene object.");
 
             backendBaseUrl = defaultBackendBaseUrl;
+            controller?.ConfigureBackendBaseUrl(backendBaseUrl);
             touchController?.ConfigureBackend(defaultBackendBaseUrl, defaultUserId, defaultCharacterId, defaultAppearanceId);
 
             if (controller != null)
@@ -182,18 +184,21 @@ namespace AIgalgame.Motion
                     controller?.SetTyping();
                     break;
                 case "avatar.reply.begin":
+                    replySequenceActive = true;
                     controller?.BeginReplyRequest();
                     break;
                 case "avatar.reply.received":
+                    replySequenceActive = envelope.has_dialogue;
                     controller?.BeginReplyReceived(envelope.has_dialogue);
                     break;
                 case "avatar.reply.end":
+                    replySequenceActive = false;
                     controller?.EndReplyWithoutMessage();
                     break;
                 case "avatar.play_line":
                     if (envelope.line != null)
                     {
-                        controller?.PlayLine(envelope.line, returnIdleWhenDone: true);
+                        controller?.PlayLine(envelope.line, returnIdleWhenDone: !replySequenceActive);
                     }
                     else if (!string.IsNullOrWhiteSpace(envelope.payload_json))
                     {
@@ -321,6 +326,7 @@ namespace AIgalgame.Motion
             defaultCharacterId = FirstNonEmpty(envelope.character_id, defaultCharacterId);
             defaultSessionId = FirstNonEmpty(envelope.session_id, defaultSessionId);
             defaultAppearanceId = FirstNonEmpty(envelope.appearance_id, defaultAppearanceId);
+            controller?.ConfigureBackendBaseUrl(backendBaseUrl);
             touchController?.ConfigureBackend(backendBaseUrl, defaultUserId, defaultCharacterId, defaultAppearanceId);
 #if RELAXROOM_RN
             pendingAmbientAudio = true;
@@ -339,7 +345,7 @@ namespace AIgalgame.Motion
                 ? url
                 : backendBaseUrl.TrimEnd('/') + (url.StartsWith("/") ? url : "/" + url);
 
-            using var request = UnityWebRequestMultimedia.GetAudioClip(fullUrl, AudioType.UNKNOWN);
+            using var request = UnityWebRequestMultimedia.GetAudioClip(fullUrl, AudioTypeForUrl(fullUrl));
             yield return request.SendWebRequest();
             if (request.result != UnityWebRequest.Result.Success)
             {
@@ -355,6 +361,22 @@ namespace AIgalgame.Motion
 
             audioSource.clip = clip;
             audioSource.Play();
+        }
+
+        private static AudioType AudioTypeForUrl(string url)
+        {
+            var lower = (url ?? "").Split('?')[0].ToLowerInvariant();
+            if (lower.EndsWith(".wav"))
+            {
+                return AudioType.WAV;
+            }
+
+            if (lower.EndsWith(".ogg"))
+            {
+                return AudioType.OGGVORBIS;
+            }
+
+            return AudioType.MPEG;
         }
 
         private void OnLineCompleted(AIGalgameDialogueLine line)

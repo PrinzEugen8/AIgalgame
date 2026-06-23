@@ -327,11 +327,13 @@ namespace AIgalgame.Motion
                 yield return DownloadAudio(response.tts_audio_url, value => clip = value);
             }
 
+            var audioStarted = false;
             if (clip != null && audioSource != null)
             {
                 audioSource.Stop();
                 audioSource.clip = clip;
                 audioSource.Play();
+                audioStarted = true;
             }
 
             if (controller != null && !string.IsNullOrWhiteSpace(response.text))
@@ -344,7 +346,7 @@ namespace AIgalgame.Motion
                     expression = FirstNonEmpty(response.expression, response.emotion, "shy"),
                     motion = motion,
                     pose = motion,
-                    tts_audio_url = response.tts_audio_url,
+                    tts_audio_url = audioStarted ? "" : response.tts_audio_url,
                     controller = new AIGalgameDialogueControllerCommand
                     {
                         state = "speaking",
