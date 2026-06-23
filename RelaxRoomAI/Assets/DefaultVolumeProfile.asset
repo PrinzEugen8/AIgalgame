@@ -334,13 +334,13 @@ MonoBehaviour:
     m_Value: 0
   top:
     m_OverrideState: 1
-    m_Value: {r: 0.747, g: 0, b: 1, a: 1}
+    m_Value: {r: 0.52, g: 0.58, b: 0.68, a: 1}
   middle:
     m_OverrideState: 1
-    m_Value: {r: 1, g: 0.667, b: 0.676, a: 1}
+    m_Value: {r: 0.72, g: 0.74, b: 0.78, a: 1}
   bottom:
     m_OverrideState: 1
-    m_Value: {r: 1, g: 1, b: 1, a: 1}
+    m_Value: {r: 0.92, g: 0.91, b: 0.88, a: 1}
   gradientDiffusion:
     m_OverrideState: 1
     m_Value: 1

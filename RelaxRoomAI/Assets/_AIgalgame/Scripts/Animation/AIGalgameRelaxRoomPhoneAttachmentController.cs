@@ -10,14 +10,16 @@ namespace AIgalgame.Motion
         ReplyWaiting,
         ReplyDoubleTyping,
         IdleTablet,
-        IdleTexting
+        IdleTexting,
+        VideoCallSelfie
     }
 
     public enum RelaxRoomPhonePlacement
     {
         Hidden,
         Table,
-        Hand
+        Hand,
+        Bedroom
     }
 
     [DefaultExecutionOrder(-111)]
@@ -44,6 +46,7 @@ namespace AIgalgame.Motion
 
         private const string EditorPhoneAssetPath = "Assets/Item/\u624b\u673a.fbx";
         private const string AutoPhoneTableSlotName = "RelaxRoom Phone TableSlot";
+        private const string BedroomPhoneSlotName = "BedRoomPhoneSlot";
 
         [Header("Targets")]
         [SerializeField] private Animator animator;
@@ -58,6 +61,11 @@ namespace AIgalgame.Motion
         [SerializeField] private Transform phoneTableSlot;
         [SerializeField] private bool keepVisibleOnTable = true;
 
+        [Header("Bedroom Slot")]
+        [SerializeField] private Transform bedroomPhoneSlot;
+        [SerializeField] private bool keepVisibleOnBedroomSlot = true;
+        [SerializeField] private bool hideDuplicatePhonePropsInSlots = true;
+
         [Header("Preview")]
         [SerializeField] private RelaxRoomPhoneGrip previewPhoneGrip = RelaxRoomPhoneGrip.ReplyTexting;
 
@@ -68,6 +76,7 @@ namespace AIgalgame.Motion
         [SerializeField] private PhoneAttachmentPreset replyDoubleTypingPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset idleTabletPhoneAttachment = new(HumanBodyBones.RightHand);
         [SerializeField] private PhoneAttachmentPreset idleTextingPhoneAttachment = new(HumanBodyBones.RightHand);
+        [SerializeField] private PhoneAttachmentPreset videoCallSelfiePhoneAttachment = new(HumanBodyBones.RightHand);
 
         [HideInInspector] [SerializeField] private HumanBodyBones phoneHandBone = HumanBodyBones.RightHand;
         [HideInInspector] [SerializeField] private Vector3 phoneLocalPosition = Vector3.zero;
@@ -81,6 +90,9 @@ namespace AIgalgame.Motion
         private Vector3 tableLocalPosition;
         private Quaternion tableLocalRotation = Quaternion.identity;
         private bool hasTableLocalPose;
+        private Vector3 bedroomLocalPosition;
+        private Quaternion bedroomLocalRotation = Quaternion.identity;
+        private bool hasBedroomLocalPose;
 
         public bool IsVisible => visible;
         public Transform PhoneInstance => phoneInstance;
@@ -89,6 +101,7 @@ namespace AIgalgame.Motion
         public RelaxRoomPhonePlacement Placement => placement;
         public bool IsAttachedToHand => placement == RelaxRoomPhonePlacement.Hand;
         public bool IsOnTable => placement == RelaxRoomPhonePlacement.Table;
+        public bool IsInBedroomSlot => placement == RelaxRoomPhonePlacement.Bedroom;
         public Animator Animator => animator;
 
 #if UNITY_EDITOR
@@ -116,6 +129,7 @@ namespace AIgalgame.Motion
             TryFindScenePhoneInstance();
             EnsurePhoneTableSlot();
             KeepPhoneVisibleOnTableIfNeeded();
+            HideDuplicatePhonePropsInKnownSlots();
         }
 
 #if UNITY_EDITOR
@@ -126,6 +140,7 @@ namespace AIgalgame.Motion
             TryFindScenePhoneInstance();
             EnsurePhoneTableSlot();
             KeepPhoneVisibleOnTableIfNeeded();
+            HideDuplicatePhonePropsInKnownSlots();
             if (Application.isPlaying && visible)
             {
                 ApplyAttachment();
@@ -141,6 +156,7 @@ namespace AIgalgame.Motion
             TryFindScenePhoneInstance();
             EnsurePhoneTableSlot();
             KeepPhoneVisibleOnTableIfNeeded();
+            HideDuplicatePhonePropsInKnownSlots();
         }
 
         private void LateUpdate()
@@ -161,6 +177,16 @@ namespace AIgalgame.Motion
             if (slot != null)
             {
                 phoneTableSlot = slot;
+                HideDuplicatePhonePropsInKnownSlots();
+            }
+        }
+
+        public void SetBedroomPhoneSlot(Transform slot)
+        {
+            if (slot != null)
+            {
+                bedroomPhoneSlot = slot;
+                HideDuplicatePhonePropsInKnownSlots();
             }
         }
 
@@ -195,6 +221,21 @@ namespace AIgalgame.Motion
         {
             visible = visibleOnTable || keepVisibleOnTable;
             placement = RelaxRoomPhonePlacement.Table;
+
+            var phone = ResolvePhoneInstance();
+            if (phone == null)
+            {
+                return;
+            }
+
+            phone.gameObject.SetActive(visible);
+            ApplyAttachment();
+        }
+
+        public void PlaceOnBedroomSlot(bool visibleOnSlot = true)
+        {
+            visible = visibleOnSlot || keepVisibleOnBedroomSlot;
+            placement = RelaxRoomPhonePlacement.Bedroom;
 
             var phone = ResolvePhoneInstance();
             if (phone == null)
@@ -253,10 +294,19 @@ namespace AIgalgame.Motion
             if (placement == RelaxRoomPhonePlacement.Table)
             {
                 ApplyTableAttachment(phone);
+                HideDuplicatePhonePropsInKnownSlots();
+                return;
+            }
+
+            if (placement == RelaxRoomPhonePlacement.Bedroom)
+            {
+                ApplyBedroomAttachment(phone);
+                HideDuplicatePhonePropsInKnownSlots();
                 return;
             }
 
             ApplyHandAttachment(phone);
+            HideDuplicatePhonePropsInKnownSlots();
         }
 
         private void KeepPhoneVisibleOnTableIfNeeded()
@@ -323,6 +373,39 @@ namespace AIgalgame.Motion
             }
 
             phone.localScale = Vector3.one;
+            HideDuplicatePhonePropsInKnownSlots();
+        }
+
+        private void ApplyBedroomAttachment(Transform phone)
+        {
+            var slot = EnsureBedroomPhoneSlot();
+            if (slot == null)
+            {
+                ApplyTableAttachment(phone);
+                return;
+            }
+
+            if (phone.parent != slot)
+            {
+                phone.SetParent(slot, false);
+                if (hasBedroomLocalPose)
+                {
+                    phone.localPosition = bedroomLocalPosition;
+                    phone.localRotation = bedroomLocalRotation;
+                }
+                else
+                {
+                    phone.localPosition = Vector3.zero;
+                    phone.localRotation = Quaternion.identity;
+                }
+            }
+            else
+            {
+                CacheBedroomPoseIfPhoneOnBedroomSlot(phone);
+            }
+
+            phone.localScale = Vector3.one;
+            HideDuplicatePhonePropsInKnownSlots();
         }
 
         private void CacheTablePoseIfPhoneOnTable(Transform phone)
@@ -336,6 +419,19 @@ namespace AIgalgame.Motion
             tableLocalPosition = phone.localPosition;
             tableLocalRotation = phone.localRotation;
             hasTableLocalPose = true;
+        }
+
+        private void CacheBedroomPoseIfPhoneOnBedroomSlot(Transform phone)
+        {
+            var slot = EnsureBedroomPhoneSlot();
+            if (phone == null || slot == null || phone.parent != slot)
+            {
+                return;
+            }
+
+            bedroomLocalPosition = phone.localPosition;
+            bedroomLocalRotation = phone.localRotation;
+            hasBedroomLocalPose = true;
         }
 
         public Transform GetPhoneParent(PhoneAttachmentPreset preset = null)
@@ -413,6 +509,7 @@ namespace AIgalgame.Motion
                 RelaxRoomPhoneGrip.ReplyDoubleTyping => replyDoubleTypingPhoneAttachment,
                 RelaxRoomPhoneGrip.IdleTablet => idleTabletPhoneAttachment,
                 RelaxRoomPhoneGrip.IdleTexting => idleTextingPhoneAttachment,
+                RelaxRoomPhoneGrip.VideoCallSelfie => videoCallSelfiePhoneAttachment,
                 _ => defaultPhoneAttachment,
             };
         }
@@ -467,6 +564,7 @@ namespace AIgalgame.Motion
             replyDoubleTypingPhoneAttachment ??= new PhoneAttachmentPreset(HumanBodyBones.LeftHand);
             idleTabletPhoneAttachment ??= new PhoneAttachmentPreset(HumanBodyBones.RightHand);
             idleTextingPhoneAttachment ??= new PhoneAttachmentPreset(HumanBodyBones.RightHand);
+            videoCallSelfiePhoneAttachment ??= new PhoneAttachmentPreset(HumanBodyBones.RightHand);
 
             EnsurePhoneScale(defaultPhoneAttachment);
             EnsurePhoneScale(replyTextingPhoneAttachment);
@@ -474,6 +572,7 @@ namespace AIgalgame.Motion
             EnsurePhoneScale(replyDoubleTypingPhoneAttachment);
             EnsurePhoneScale(idleTabletPhoneAttachment);
             EnsurePhoneScale(idleTextingPhoneAttachment);
+            EnsurePhoneScale(videoCallSelfiePhoneAttachment);
         }
 
         private static void EnsurePhoneScale(PhoneAttachmentPreset preset)
@@ -501,11 +600,69 @@ namespace AIgalgame.Motion
                 return;
             }
 
-            phoneInstance = FindSceneTransformByName("RelaxRoom Phone Prop", "\u624b\u673a", phonePrefab != null ? phonePrefab.name : "Phone");
+            phoneInstance = FindPhoneInPreferredSlot();
+            if (phoneInstance == null)
+            {
+                phoneInstance = FindPhoneNearThisController();
+            }
+
+            if (phoneInstance == null)
+            {
+                phoneInstance = FindSceneTransformByName("RelaxRoom Phone Prop", "\u624b\u673a", phonePrefab != null ? phonePrefab.name : "Phone");
+            }
+
             if (phoneInstance != null)
             {
                 loggedMissingPhoneInstance = false;
             }
+        }
+
+        private Transform FindPhoneInPreferredSlot()
+        {
+            var slot = phoneTableSlot != null
+                ? phoneTableSlot
+                : FindSceneTransformByName(AutoPhoneTableSlotName, "Phone_TableSlot", "\u624b\u673a_TableSlot");
+            return FindDirectPhoneChild(slot);
+        }
+
+        private Transform FindPhoneNearThisController()
+        {
+            var direct = FindDirectPhoneChild(transform);
+            if (direct != null)
+            {
+                return direct;
+            }
+
+            var transforms = GetComponentsInChildren<Transform>(true);
+            for (var i = 0; i < transforms.Length; i++)
+            {
+                var candidate = transforms[i];
+                if (candidate != null && candidate != transform && LooksLikePhone(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static Transform FindDirectPhoneChild(Transform parent)
+        {
+            if (parent == null)
+            {
+                return null;
+            }
+
+            for (var i = 0; i < parent.childCount; i++)
+            {
+                var child = parent.GetChild(i);
+                if (LooksLikePhone(child))
+                {
+                    return child;
+                }
+            }
+
+            return null;
         }
 
         private Transform EnsurePhoneTableSlot(bool alignExistingToPhone = false)
@@ -546,6 +703,89 @@ namespace AIgalgame.Motion
             CopyPhonePoseToTableSlot(slot.transform);
             phoneTableSlot = slot.transform;
             return phoneTableSlot;
+        }
+
+        private Transform EnsureBedroomPhoneSlot()
+        {
+            if (bedroomPhoneSlot != null)
+            {
+                return bedroomPhoneSlot;
+            }
+
+            bedroomPhoneSlot = FindSceneTransformByName(
+                BedroomPhoneSlotName,
+                "BedroomPhoneSlot",
+                "Bedroom Phone Slot",
+                "Bedroom_PhoneSlot",
+                "\u5367\u5ba4\u624b\u673a\u70b9");
+            HideDuplicatePhonePropsInKnownSlots();
+            return bedroomPhoneSlot;
+        }
+
+        private void HideDuplicatePhonePropsInKnownSlots()
+        {
+            if (!hideDuplicatePhonePropsInSlots)
+            {
+                return;
+            }
+
+            HideDuplicatePhonePropsUnder(phoneTableSlot);
+            HideDuplicatePhonePropsUnder(bedroomPhoneSlot);
+        }
+
+        private void HideDuplicatePhonePropsUnder(Transform slot)
+        {
+            if (slot == null)
+            {
+                return;
+            }
+
+            for (var i = 0; i < slot.childCount; i++)
+            {
+                var child = slot.GetChild(i);
+                if (child == null ||
+                    child == phoneInstance ||
+                    (phoneInstance != null && child.IsChildOf(phoneInstance)) ||
+                    !LooksLikePhone(child))
+                {
+                    continue;
+                }
+
+                child.gameObject.SetActive(false);
+            }
+        }
+
+        private static bool LooksLikePhone(Transform candidate)
+        {
+            if (candidate == null)
+            {
+                return false;
+            }
+
+            var normalized = NormalizeToken(candidate.name);
+            return normalized.Contains("phone") ||
+                candidate.name.IndexOf("\u624b\u673a", StringComparison.Ordinal) >= 0;
+        }
+
+        private static string NormalizeToken(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "";
+            }
+
+            var buffer = new char[value.Length];
+            var count = 0;
+            for (var i = 0; i < value.Length; i++)
+            {
+                var c = value[i];
+                if (char.IsLetterOrDigit(c))
+                {
+                    buffer[count++] = char.ToLowerInvariant(c);
+                }
+            }
+
+            return new string(buffer, 0, count);
         }
 
         private void AlignAutoTableSlotToPhonePose()

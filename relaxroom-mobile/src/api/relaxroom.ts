@@ -1,5 +1,10 @@
 import {apiRequest, getSession} from './client';
-import type {HomeBootstrap, IdleActionResponse, MomentsResponse} from '../types/dialogue';
+import type {
+  HomeBootstrap,
+  IdleActionResponse,
+  MomentsResponse,
+  RealtimeCallConfig,
+} from '../types/dialogue';
 
 function sessionQuery(extra?: Record<string, string | number | boolean | undefined>) {
   const session = getSession();
@@ -17,6 +22,10 @@ export async function fetchHomeBootstrap(): Promise<HomeBootstrap> {
 
 export async function fetchMoments(): Promise<MomentsResponse> {
   return apiRequest('/api/relaxroom/moments', undefined, sessionQuery());
+}
+
+export async function fetchRealtimeCallConfig(): Promise<RealtimeCallConfig> {
+  return apiRequest('/api/realtime/call/config', undefined, sessionQuery());
 }
 
 export async function postMomentLike(momentId: string): Promise<unknown> {

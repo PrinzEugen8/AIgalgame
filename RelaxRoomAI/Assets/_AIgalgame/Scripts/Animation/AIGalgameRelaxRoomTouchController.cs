@@ -401,7 +401,10 @@ namespace AIgalgame.Motion
             var area = target.GetComponent<AIGalgameRelaxRoomTouchArea>();
             if (area == null)
             {
-                area = target.gameObject.AddComponent<AIGalgameRelaxRoomTouchArea>();
+                Debug.LogError(
+                    $"Missing AIGalgameRelaxRoomTouchArea on '{target.name}'. Add it in the scene so the hit area is editable in the Inspector.",
+                    this);
+                return;
             }
 
             area.HitArea = hitArea;
@@ -427,7 +430,10 @@ namespace AIgalgame.Motion
             var area = target.GetComponent<AIGalgameRelaxRoomTouchArea>();
             if (area == null)
             {
-                area = target.gameObject.AddComponent<AIGalgameRelaxRoomTouchArea>();
+                Debug.LogError(
+                    $"Missing AIGalgameRelaxRoomTouchArea on '{target.name}'. Add it in the scene so the hit area is editable in the Inspector.",
+                    this);
+                return;
             }
 
             area.HitArea = hitArea;

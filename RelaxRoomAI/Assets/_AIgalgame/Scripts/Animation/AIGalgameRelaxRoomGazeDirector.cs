@@ -150,6 +150,7 @@ namespace AIgalgame.Motion
             switch (mode)
             {
                 case RelaxRoomMotionMode.Reply:
+                case RelaxRoomMotionMode.VideoCall:
                     SetFocus(RelaxRoomGazeFocus.Phone, 0f);
                     break;
                 case RelaxRoomMotionMode.Speaking:

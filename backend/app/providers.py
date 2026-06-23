@@ -502,6 +502,31 @@ def provider_presets() -> dict[str, Any]:
                 ],
             }
         ],
+        "realtime": [
+            {
+                "provider": "qwen_dashscope_realtime",
+                "label": "Qwen-Omni Realtime",
+                "base_url": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+                "model": "qwen3.5-omni-flash-realtime-2026-03-15",
+                "docs": "https://help.aliyun.com/zh/model-studio/realtime",
+                "supports_models": False,
+                "description": "DashScope Qwen-Omni-Realtime WebSocket sessions for the video-call demo. The backend keeps the API key private and relays audio/image events.",
+                "fields": [
+                    _field("label", "Display name", "core", default="Qwen-Omni Realtime"),
+                    _field("base_url", "DashScope WebSocket URL", "core", default="wss://dashscope.aliyuncs.com/api-ws/v1/realtime", required=True),
+                    _field("model", "Realtime model", "core", default="qwen3.5-omni-flash-realtime-2026-03-15", required=True),
+                    _field("api_key", "DashScope API Key", "secret", required=True),
+                    _field("voice", "Voice", "metadata", default="Momo"),
+                    _field("turn_detection", "Turn detection", "metadata", type_="select", default="semantic_vad", options=["server_vad", "semantic_vad", "none"]),
+                    _field("image_input", "Enable image input", "metadata", type_="checkbox", default=True),
+                    _field("active_frame_interval_ms", "Active image interval ms", "metadata", type_="number", default=1500),
+                    _field("idle_frame_interval_ms", "Idle image interval ms", "metadata", type_="number", default=7500),
+                    _field("input_audio_transcription_model", "Transcription model", "metadata", default="gummy-realtime-v1"),
+                    _field("repetition_penalty", "Repetition penalty", "metadata", type_="number", default=1.2),
+                    _field("temperature", "Temperature", "metadata", type_="number", default=0.7),
+                ],
+            }
+        ],
         "image": [
             {
                 "provider": "doubao_seedream",
@@ -2719,6 +2744,19 @@ def run_provider_test(session: Session, payload: ProviderConfigIn, test_text: st
             ok = True
             message = "Image provider generated and saved a real image"
             details = {"asset_id": asset.asset_id, "url": asset.url}
+        elif config.kind == "realtime":
+            missing_secrets = _missing_secret_fields(config)
+            missing_required = _missing_required_fields(config)
+            if missing_secrets or missing_required:
+                raise ProviderError(f"Realtime provider is incomplete: missing {', '.join(missing_secrets + missing_required)}")
+            ok = True
+            message = "Qwen Realtime provider configuration is ready"
+            details = {
+                "base_url": config.base_url,
+                "model": config.model,
+                "provider": config.provider,
+                "has_api_key": bool(_secret(config, "api_key")),
+            }
         else:
             raise ProviderError(f"Unsupported provider kind: {config.kind}")
     except Exception as exc:  # noqa: BLE001

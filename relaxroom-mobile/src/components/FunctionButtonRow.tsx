@@ -1,20 +1,24 @@
 import React from 'react';
 import {Pressable, StyleSheet, View} from 'react-native';
 import {colors} from '../theme/colors';
-import {ImageIcon, MicIcon, PhoneIcon} from './icons';
+import {ImageIcon, MicIcon, PhoneIcon, VideoIcon} from './icons';
 
 type Props = {
   voiceMode: boolean;
+  videoCallActive: boolean;
   onToggleVoice: () => void;
   onPickImage: () => void;
   onPhone: () => void;
+  onVideoCall: () => void;
 };
 
 export function FunctionButtonRow({
   voiceMode,
+  videoCallActive,
   onToggleVoice,
   onPickImage,
   onPhone,
+  onVideoCall,
 }: Props) {
   return (
     <View style={styles.row}>
@@ -28,6 +32,11 @@ export function FunctionButtonRow({
       </Pressable>
       <Pressable style={styles.button} onPress={onPhone}>
         <PhoneIcon />
+      </Pressable>
+      <Pressable
+        style={[styles.button, videoCallActive && styles.buttonActive]}
+        onPress={onVideoCall}>
+        <VideoIcon color={videoCallActive ? colors.textPrimary : colors.textSecondary} />
       </Pressable>
     </View>
   );

@@ -1,15 +1,18 @@
 import React, {useCallback, useState} from 'react';
 import {Pressable, StyleSheet, Text, TextInput, View} from 'react-native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {checkHealth} from '../api/events';
 import {ApiError, getSession} from '../api/client';
 import {configureUnity} from '../bridge/unityBridge';
 import {saveBackendUrl} from '../storage/sessionStorage';
 import {colors} from '../theme/colors';
 import {ArrowLeftIcon} from '../components/icons';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
 
 type Props = {
   onClose: () => void;
+  isSleeping: boolean;
+  onEnterSleep: () => void;
+  onExitSleep: () => void;
 };
 
 function formatHealthError(error: unknown, url: string) {
@@ -18,14 +21,19 @@ function formatHealthError(error: unknown, url: string) {
       return error.message;
     }
 
-    const body = error.message ? `：${error.message.slice(0, 180)}` : '';
+    const body = error.message ? `: ${error.message.slice(0, 180)}` : '';
     return `HTTP ${error.status}${body}`;
   }
 
-  return error instanceof Error ? error.message : `无法连接 ${url}`;
+  return error instanceof Error ? error.message : `Cannot connect to ${url}`;
 }
 
-export function SettingsScreen({onClose}: Props) {
+export function SettingsScreen({
+  onClose,
+  isSleeping,
+  onEnterSleep,
+  onExitSleep,
+}: Props) {
   const insets = useSafeAreaInsets();
   const session = getSession();
   const [backendBaseUrl, setBackendBaseUrl] = useState(session.backendBaseUrl);
@@ -34,7 +42,7 @@ export function SettingsScreen({onClose}: Props) {
   const saveCurrentBackendUrl = useCallback(async () => {
     const trimmed = backendBaseUrl.trim();
     if (!trimmed) {
-      setStatus('后端地址不能为空');
+      setStatus('Backend URL cannot be empty');
       return undefined;
     }
 
@@ -48,10 +56,10 @@ export function SettingsScreen({onClose}: Props) {
     try {
       const next = await saveCurrentBackendUrl();
       if (next) {
-        setStatus('已保存并同步到 Unity');
+        setStatus('Saved and synced to Unity');
       }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : '保存失败');
+      setStatus(error instanceof Error ? error.message : 'Save failed');
     }
   }, [saveCurrentBackendUrl]);
 
@@ -65,7 +73,7 @@ export function SettingsScreen({onClose}: Props) {
       url = next.backendBaseUrl;
 
       await checkHealth();
-      setStatus('后端连接正常');
+      setStatus('Backend connection is healthy');
     } catch (error) {
       setStatus(formatHealthError(error, url));
     }
@@ -76,13 +84,13 @@ export function SettingsScreen({onClose}: Props) {
       <View style={styles.header}>
         <Pressable onPress={onClose} style={styles.backButton}>
           <ArrowLeftIcon />
-          <Text style={styles.back}>返回</Text>
+          <Text style={styles.back}>Back</Text>
         </Pressable>
-        <Text style={styles.title}>设置</Text>
+        <Text style={styles.title}>Settings</Text>
         <View style={styles.headerSpacer} />
       </View>
 
-      <Text style={styles.label}>后端地址</Text>
+      <Text style={styles.label}>Backend URL</Text>
       <TextInput
         style={styles.input}
         value={backendBaseUrl}
@@ -98,7 +106,7 @@ export function SettingsScreen({onClose}: Props) {
           onPress={() => {
             void handleSave();
           }}>
-          <Text style={styles.buttonText}>保存</Text>
+          <Text style={styles.buttonText}>Save</Text>
         </Pressable>
 
         <Pressable
@@ -106,8 +114,30 @@ export function SettingsScreen({onClose}: Props) {
           onPress={() => {
             void handleHealthCheck();
           }}>
-          <Text style={styles.buttonText}>健康检查</Text>
+          <Text style={styles.buttonText}>Health</Text>
         </Pressable>
+      </View>
+
+      <View style={styles.devSection}>
+        <Text style={styles.sectionTitle}>Dev test</Text>
+        <View style={styles.row}>
+          <Pressable
+            style={[styles.button, isSleeping ? styles.buttonDisabled : null]}
+            disabled={isSleeping}
+            onPress={onEnterSleep}>
+            <Text style={styles.buttonText}>Enter sleep</Text>
+          </Pressable>
+
+          <Pressable
+            style={[styles.button, !isSleeping ? styles.buttonDisabled : null]}
+            disabled={!isSleeping}
+            onPress={onExitSleep}>
+            <Text style={styles.buttonText}>Exit sleep</Text>
+          </Pressable>
+        </View>
+        <Text style={styles.sleepStatus}>
+          Avatar state: {isSleeping ? 'sleeping' : 'awake'}
+        </Text>
       </View>
 
       {status ? <Text style={styles.status}>{status}</Text> : null}
@@ -163,6 +193,14 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 20,
   },
+  devSection: {
+    marginTop: 28,
+  },
+  sectionTitle: {
+    color: colors.textSecondary,
+    fontSize: 13,
+    fontWeight: '700',
+  },
   button: {
     flex: 1,
     backgroundColor: colors.accent,
@@ -171,9 +209,17 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     minHeight: 48,
   },
+  buttonDisabled: {
+    opacity: 0.42,
+  },
   buttonText: {
     color: colors.textPrimary,
     fontWeight: '700',
+  },
+  sleepStatus: {
+    marginTop: 10,
+    color: colors.textMuted,
+    fontSize: 12,
   },
   status: {
     marginTop: 16,

@@ -150,6 +150,55 @@ export function playPhoneNotification() {
   postCommand('motion.phone_notification');
 }
 
+export function enterSleepMode() {
+  postCommand('sleep.enter');
+}
+
+export function exitSleepMode() {
+  postCommand('sleep.exit');
+}
+
+export function notifyWhileSleeping(durationSeconds?: number) {
+  postCommand('sleep.notify', {
+    duration_seconds: durationSeconds ?? 0,
+  });
+}
+
+export function switchCameraPrevious() {
+  postCommand('camera.prev');
+}
+
+export function switchCameraNext() {
+  postCommand('camera.next');
+}
+
+export function setUnityCamera(name: string) {
+  postCommand('camera.set', {text: name});
+}
+
+export function beginVideoCall() {
+  postCommand('video_call.begin');
+}
+
+export function endVideoCall() {
+  postCommand('video_call.end');
+}
+
+export function setVideoCallAiSpeaking(active: boolean) {
+  postCommand(active ? 'video_call.ai_speaking_start' : 'video_call.ai_speaking_stop');
+}
+
+export function setVideoCallUserSpeaking(active: boolean) {
+  postCommand(active ? 'video_call.user_speaking_start' : 'video_call.user_speaking_stop');
+}
+
+export function setVideoCallExpression(emotion: string, intensity = 0.75) {
+  postCommand('video_call.expression', {
+    emotion,
+    intensity,
+  });
+}
+
 export function startLocalAsr(): string {
   const id = `asr-${Date.now()}`;
   postCommand('asr.start', {id});

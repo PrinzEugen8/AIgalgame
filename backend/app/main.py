@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .calendar_events import calendar_items, create_calendar_event, day_note, ensure_calendar_events, ensure_calendar_proactive_candidates, update_calendar_event
-from .database import get_session, init_db
+from .database import SessionLocal, get_session, init_db
 from .diagnostics import runtime_logs, tail_diagnostics, write_diagnostic
 from .image_generation import (
     MANUAL_IMAGE_COOLDOWN_SECONDS,
@@ -86,6 +86,7 @@ from .providers import (
     run_provider_test,
     upsert_provider,
 )
+from .realtime import realtime_public_config, run_qwen_realtime_relay
 from .schemas import (
     CharacterAdminIn,
     CharacterAdminOut,
@@ -243,7 +244,7 @@ def admin_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     providers = [provider_to_out(item).model_dump() for item in session.execute(select(ProviderConfig)).scalars().all()]
     configured = {
         kind: any(item["kind"] == kind and item["ready"] for item in providers)
-        for kind in ("llm", "llm_task", "embedding", "tts", "search", "weather", "image")
+        for kind in ("llm", "llm_task", "embedding", "tts", "search", "weather", "image", "realtime")
     }
     return {"ok": True, "providers": providers, "configured": configured}
 
@@ -1449,6 +1450,33 @@ def provider_models(provider_id: str, session: Session = Depends(get_session)) -
     except Exception as exc:  # noqa: BLE001
         logger.exception("provider model lookup failed provider_id=%s", provider_id)
         return {"ok": False, "models": [], "message": str(exc)}
+
+
+@app.get("/api/realtime/call/config")
+def realtime_call_config(
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
+    return realtime_public_config(session, user_id=user_id, character_id=character_id)
+
+
+@app.websocket("/api/realtime/call/ws")
+async def realtime_call_ws(
+    websocket: WebSocket,
+    user_id: str = DEFAULT_USER_ID,
+    character_id: str = "",
+) -> None:
+    with SessionLocal() as session:
+        try:
+            character_id = _resolve_active_character(session, user_id=user_id, character_id=character_id)
+        except Exception as exc:  # noqa: BLE001
+            await websocket.accept()
+            await websocket.send_json({"type": "relay.error", "message": str(exc)})
+            await websocket.close(code=1011)
+            return
+        await run_qwen_realtime_relay(websocket, session, user_id=user_id, character_id=character_id)
 
 
 @app.post("/api/events")

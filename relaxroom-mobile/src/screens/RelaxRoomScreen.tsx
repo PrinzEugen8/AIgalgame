@@ -1,13 +1,28 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {ActivityIndicator, Modal, Pressable, StyleSheet, Text, View} from 'react-native';
+import {
+  ActivityIndicator,
+  Modal,
+  PermissionsAndroid,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import UnityView from '@azesmway/react-native-unity';
 import {HomeTopHud} from '../components/HomeTopHud';
 import {InteractionPanel} from '../components/InteractionPanel';
+import {ChevronLeftIcon, ChevronRightIcon} from '../components/icons';
 import {MomentsScreen} from './MomentsScreen';
 import {SettingsScreen} from './SettingsScreen';
+import {
+  VideoCallScreen,
+  type VideoCallPrimaryPane,
+} from './VideoCallScreen';
+import type {PhoneCameraFacing} from '../components/PhoneCameraPreview';
 import {getSession} from '../api/client';
-import {postUserMessage} from '../api/events';
+import {postSleepingUserMessage, postUserMessage} from '../api/events';
 import {
   fetchHomeBootstrap,
   fetchMoments,
@@ -16,14 +31,28 @@ import {
 import {
   beginReply,
   bindUnityRef,
+  beginVideoCall,
   configureUnity,
+  enterSleepMode,
   endReply,
+  endVideoCall,
+  exitSleepMode,
   handleUnityMessage,
+  notifyWhileSleeping,
   playIdleAction,
   playLinesSequentially,
   playPhoneNotification,
+  setVideoCallAiSpeaking,
+  setVideoCallExpression,
+  setVideoCallUserSpeaking,
   subscribeUnityEvents,
+  switchCameraNext,
+  switchCameraPrevious,
 } from '../bridge/unityBridge';
+import {
+  RealtimeCallController,
+  type RealtimeCallSnapshot,
+} from '../realtime/realtimeCallClient';
 import {loadSession} from '../storage/sessionStorage';
 import {useInteractionPanelHeight} from '../theme/layout';
 import {colors} from '../theme/colors';
@@ -38,9 +67,40 @@ import type {
 const IDLE_AFTER_MS = 55_000;
 const IDLE_RETRY_MS = 25_000;
 const UNITY_LOAD_TIMEOUT_MS = 90_000;
+const INITIAL_CALL_SNAPSHOT: RealtimeCallSnapshot = {
+  phase: 'idle',
+  statusText: '',
+  elapsedSeconds: 0,
+  muted: false,
+  cameraEnabled: true,
+  configured: false,
+  model: 'qwen3.5-omni-flash-realtime-2026-03-15',
+  voice: 'Momo',
+  providerId: '',
+};
+
+async function requestVideoCallPermissions(): Promise<boolean> {
+  if (Platform.OS !== 'android') {
+    return true;
+  }
+
+  const result = await PermissionsAndroid.requestMultiple([
+    PermissionsAndroid.PERMISSIONS.CAMERA,
+    PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+  ]);
+
+  return (
+    result[PermissionsAndroid.PERMISSIONS.CAMERA] ===
+      PermissionsAndroid.RESULTS.GRANTED &&
+    result[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] ===
+      PermissionsAndroid.RESULTS.GRANTED
+  );
+}
 
 export function RelaxRoomScreen() {
   const unityRef = useRef<UnityView>(null);
+  const callControllerRef = useRef<RealtimeCallController | null>(null);
+  const lastCallImageSentAtRef = useRef(0);
   const lastInteractionRef = useRef(Date.now());
   const idleInFlightRef = useRef(false);
   const unityReadyRef = useRef(false);
@@ -59,11 +119,18 @@ export function RelaxRoomScreen() {
   const [keyReplies, setKeyReplies] = useState<LazyReply[]>([]);
   const [showMoments, setShowMoments] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [isSleeping, setIsSleeping] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
   const [momentsLoading, setMomentsLoading] = useState(false);
   const [momentsError, setMomentsError] = useState('');
   const [loadTimedOut, setLoadTimedOut] = useState(false);
   const [devStartupSummary, setDevStartupSummary] = useState<string | null>(null);
+  const [callSnapshot, setCallSnapshot] =
+    useState<RealtimeCallSnapshot>(INITIAL_CALL_SNAPSHOT);
+  const [callPrimaryPane, setCallPrimaryPane] =
+    useState<VideoCallPrimaryPane>('remote');
+  const [phoneCameraFacing, setPhoneCameraFacing] =
+    useState<PhoneCameraFacing>('front');
 
   const pushMessage = useCallback((role: ChatMessage['role'], text: string) => {
     setMessages(current => [
@@ -104,6 +171,98 @@ export function RelaxRoomScreen() {
     lastInteractionRef.current = Date.now();
   }, []);
 
+  const resolveCallController = useCallback(() => {
+    if (callControllerRef.current != null) {
+      return callControllerRef.current;
+    }
+
+    callControllerRef.current = new RealtimeCallController({
+      onSnapshot: setCallSnapshot,
+      onUnityEvent: event => {
+        switch (event) {
+          case 'begin':
+            beginVideoCall();
+            setVideoCallExpression('shy', 0.55);
+            break;
+          case 'end':
+            endVideoCall();
+            break;
+          case 'ai_speaking_start':
+            setVideoCallAiSpeaking(true);
+            break;
+          case 'ai_speaking_stop':
+            setVideoCallAiSpeaking(false);
+            break;
+          case 'user_speaking_start':
+            setVideoCallUserSpeaking(true);
+            break;
+          case 'user_speaking_stop':
+            setVideoCallUserSpeaking(false);
+            break;
+        }
+      },
+    });
+    return callControllerRef.current;
+  }, []);
+
+  const handleVideoCallPress = useCallback(async () => {
+    markInteraction();
+    if (isSleeping) {
+      notifyWhileSleeping();
+      return;
+    }
+
+    const controller = resolveCallController();
+    if (callSnapshot.phase === 'idle' || callSnapshot.phase === 'error') {
+      const granted = await requestVideoCallPermissions();
+      if (!granted) {
+        setStatusText('Camera and microphone permission are required');
+        return;
+      }
+
+      setCallPrimaryPane('remote');
+      setPhoneCameraFacing('front');
+      lastCallImageSentAtRef.current = 0;
+      void controller.start();
+      return;
+    }
+    controller.end();
+  }, [callSnapshot.phase, isSleeping, markInteraction, resolveCallController]);
+
+  const setSleepModeForTest = useCallback(
+    (sleeping: boolean) => {
+      markInteraction();
+      setShowSettings(false);
+      setIsSleeping(sleeping);
+      setTimeout(() => {
+        if (sleeping) {
+          enterSleepMode();
+          return;
+        }
+
+        exitSleepMode();
+      }, 80);
+    },
+    [markInteraction],
+  );
+
+  const handlePreviousCamera = useCallback(() => {
+    markInteraction();
+    switchCameraPrevious();
+  }, [markInteraction]);
+
+  const handleNextCamera = useCallback(() => {
+    markInteraction();
+    switchCameraNext();
+  }, [markInteraction]);
+
+  useEffect(() => {
+    return () => {
+      callControllerRef.current?.dispose();
+      callControllerRef.current = null;
+    };
+  }, []);
+
   const sendMessage = useCallback(
     async (text: string, replyId = '', keyReply = false) => {
       if (!text.trim() || sending) {
@@ -119,6 +278,19 @@ export function RelaxRoomScreen() {
       pushMessage('user', text);
 
       try {
+        if (isSleeping) {
+          notifyWhileSleeping();
+          const response = await postSleepingUserMessage(text);
+          if (response.event_type === 'error') {
+            pushMessage('system', response.payload?.message ?? 'Backend error');
+            setStatusText('Backend error');
+            return;
+          }
+
+          setStatusText('');
+          return;
+        }
+
         beginReply();
         const response = await postUserMessage(text, replyId, keyReply);
         if (response.event_type === 'error') {
@@ -142,11 +314,14 @@ export function RelaxRoomScreen() {
         }
 
         await playLinesSequentially(lines);
+
         setNormalReplies(response.payload?.normal_replies ?? []);
         setKeyReplies(response.payload?.key_replies ?? []);
         setStatusText('');
       } catch (error) {
-        endReply();
+        if (!isSleeping) {
+          endReply();
+        }
         pushMessage(
           'system',
           error instanceof Error ? error.message : '发送失败',
@@ -156,7 +331,7 @@ export function RelaxRoomScreen() {
         setSending(false);
       }
     },
-    [markInteraction, pushMessage, sending],
+    [isSleeping, markInteraction, pushMessage, sending],
   );
 
   useEffect(() => {
@@ -239,6 +414,11 @@ export function RelaxRoomScreen() {
         return;
       }
 
+      if (event.evt === 'sleep.changed') {
+        setIsSleeping(event.state === 'sleeping');
+        return;
+      }
+
       if (event.evt === 'error') {
         setStatusText(event.text ?? 'Unity bridge error');
       }
@@ -249,7 +429,15 @@ export function RelaxRoomScreen() {
 
   useEffect(() => {
     const timer = setInterval(async () => {
-      if (!unityReady || sending || idleInFlightRef.current || showMoments || showSettings) {
+      if (
+        !unityReady ||
+        sending ||
+        idleInFlightRef.current ||
+        showMoments ||
+        showSettings ||
+        isSleeping ||
+        callSnapshot.phase !== 'idle'
+      ) {
         return;
       }
 
@@ -290,6 +478,8 @@ export function RelaxRoomScreen() {
     sending,
     showMoments,
     showSettings,
+    isSleeping,
+    callSnapshot.phase,
     unityReady,
   ]);
 
@@ -304,57 +494,141 @@ export function RelaxRoomScreen() {
     }
   }, [showMoments, showSettings, unityReady]);
 
+  const callActive = callSnapshot.phase !== 'idle';
+  const unityInCallPip = callActive && callPrimaryPane === 'local';
+  const unityViewStyle = StyleSheet.flatten([
+    styles.unityView,
+    unityReady ? styles.unityVisible : styles.unityHidden,
+    unityInCallPip ? styles.unityPip : null,
+  ]);
+
   return (
     <View style={styles.root}>
-      <UnityView
-        ref={unityRef}
-        style={[StyleSheet.absoluteFillObject, {opacity: unityReady ? 1 : 0}]}
-        androidKeepPlayerMounted={true}
-        fullScreen={true}
-        onUnityMessage={event => handleUnityMessage(event.nativeEvent.message)}
-      />
+      <View
+        pointerEvents={unityInCallPip ? 'none' : 'auto'}
+        style={unityViewStyle}>
+        <UnityView
+          ref={unityRef}
+          style={styles.unityEmbedded}
+          androidKeepPlayerMounted={true}
+          fullScreen={!unityInCallPip}
+          onUnityMessage={event => handleUnityMessage(event.nativeEvent.message)}
+        />
+      </View>
 
       <View style={styles.overlay} pointerEvents="box-none">
-        <SafeAreaView
-          edges={['top']}
-          style={styles.topHudLayer}
-          pointerEvents="box-none">
-          <HomeTopHud
-            home={home}
-            onOpenMoments={() => {
+        {!callActive ? (
+          <>
+            <SafeAreaView
+              edges={['top']}
+              style={styles.topHudLayer}
+              pointerEvents="box-none">
+              <HomeTopHud
+                home={home}
+                onOpenMoments={() => {
+                  markInteraction();
+                  setShowMoments(true);
+                  void refreshMoments();
+                }}
+                onOpenSettings={() => {
+                  markInteraction();
+                  setShowSettings(true);
+                }}
+              />
+            </SafeAreaView>
+
+            <View style={styles.cameraControls} pointerEvents="box-none">
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Previous Unity camera"
+                style={[styles.cameraButton, styles.cameraButtonLeft]}
+                onPress={handlePreviousCamera}>
+                <ChevronLeftIcon />
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Next Unity camera"
+                style={[styles.cameraButton, styles.cameraButtonRight]}
+                onPress={handleNextCamera}>
+                <ChevronRightIcon />
+              </Pressable>
+            </View>
+
+            <InteractionPanel
+              maxHeight={maxHeight}
+              bottomInset={bottomInset}
+              messages={messages}
+              statusText={statusText}
+              sending={sending}
+              normalReplies={normalReplies}
+              keyReplies={keyReplies}
+              draft={draft}
+              onDraftChange={setDraft}
+              onSend={text => {
+                void sendMessage(text);
+              }}
+              onQuickReplySelect={text => {
+                markInteraction();
+                setDraft(text);
+              }}
+              onPhone={() => {
+                markInteraction();
+                if (isSleeping) {
+                  notifyWhileSleeping();
+                  return;
+                }
+
+                playPhoneNotification();
+              }}
+              videoCallActive={false}
+              onVideoCall={() => {
+                void handleVideoCallPress();
+              }}
+            />
+          </>
+        ) : (
+          <VideoCallScreen
+            snapshot={callSnapshot}
+            companionName={home?.companion_name}
+            primaryPane={callPrimaryPane}
+            cameraFacing={phoneCameraFacing}
+            onSwapPanes={() => {
               markInteraction();
-              setShowMoments(true);
-              void refreshMoments();
+              setCallPrimaryPane(current =>
+                current === 'remote' ? 'local' : 'remote',
+              );
             }}
-            onOpenSettings={() => {
+            onToggleMute={() => {
               markInteraction();
-              setShowSettings(true);
+              resolveCallController().toggleMute();
+            }}
+            onToggleCameraFacing={() => {
+              markInteraction();
+              setPhoneCameraFacing(current =>
+                current === 'front' ? 'back' : 'front',
+              );
+            }}
+            onEnd={() => {
+              markInteraction();
+              resolveCallController().end();
+            }}
+            onFrame={event => {
+              const image = event.nativeEvent.image;
+              if (!image) {
+                return;
+              }
+
+              const now = Date.now();
+              if (now - lastCallImageSentAtRef.current >= 1200) {
+                lastCallImageSentAtRef.current = now;
+                resolveCallController().sendImageJpegBase64(image);
+              }
+            }}
+            onCameraError={event => {
+              setStatusText(event.nativeEvent.message);
             }}
           />
-        </SafeAreaView>
-
-        <InteractionPanel
-          maxHeight={maxHeight}
-          bottomInset={bottomInset}
-          messages={messages}
-          statusText={statusText}
-          sending={sending}
-          normalReplies={normalReplies}
-          keyReplies={keyReplies}
-          draft={draft}
-          onDraftChange={setDraft}
-          onSend={text => {
-            void sendMessage(text);
-          }}
-          onQuickReplySelect={text => {
-            markInteraction();
-            setDraft(text);
-          }}
-          onPhone={() => {
-            markInteraction();
-            playPhoneNotification();
-          }}
-        />
+        )}
       </View>
 
       <Modal visible={showMoments} animationType="slide">
@@ -375,6 +649,9 @@ export function RelaxRoomScreen() {
 
       <Modal visible={showSettings} animationType="slide">
         <SettingsScreen
+          isSleeping={isSleeping}
+          onEnterSleep={() => setSleepModeForTest(true)}
+          onExitSleep={() => setSleepModeForTest(false)}
           onClose={() => {
             markInteraction();
             setShowSettings(false);
@@ -413,6 +690,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
+  unityView: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  unityEmbedded: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  unityVisible: {
+    opacity: 1,
+  },
+  unityHidden: {
+    opacity: 0,
+  },
+  unityPip: {
+    top: 92,
+    left: undefined,
+    right: 14,
+    bottom: undefined,
+    width: 116,
+    height: 164,
+    borderRadius: 10,
+    overflow: 'hidden',
+    zIndex: 55,
+    elevation: 55,
+  },
   overlay: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 10,
@@ -425,6 +726,29 @@ const styles = StyleSheet.create({
     right: 0,
     zIndex: 20,
     elevation: 20,
+  },
+  cameraControls: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 18,
+    elevation: 18,
+  },
+  cameraButton: {
+    position: 'absolute',
+    top: '42%',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: colors.panelBg,
+    borderWidth: 1,
+    borderColor: colors.panelBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cameraButtonLeft: {
+    left: 12,
+  },
+  cameraButtonRight: {
+    right: 12,
   },
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,

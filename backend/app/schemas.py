@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class ProviderConfigIn(BaseModel):
     provider_id: str | None = None
-    kind: Literal["llm", "llm_task", "embedding", "tts", "search", "image", "weather", "push"]
+    kind: Literal["llm", "llm_task", "embedding", "tts", "search", "image", "weather", "push", "realtime"]
     provider: str
     label: str = ""
     base_url: str = ""

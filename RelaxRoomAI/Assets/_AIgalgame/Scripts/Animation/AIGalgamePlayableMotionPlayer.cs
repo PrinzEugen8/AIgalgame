@@ -409,6 +409,15 @@ namespace AIgalgame.Motion
             }
         }
 
+        public void ResetAllWeights()
+        {
+            leftHandWeight = 0f;
+            rightHandWeight = 0f;
+            leftFootWeight = 0f;
+            rightFootWeight = 0f;
+            lookAtWeight = 0f;
+        }
+
         public Vector3 GetTargetLocalPosition(MotionIkTarget target)
         {
             EnsureTargets();
@@ -1388,7 +1397,10 @@ namespace AIgalgame.Motion
 
             if (ikAdjuster == null)
             {
-                ikAdjuster = animator.gameObject.AddComponent<AIGalgameHumanoidIKAdjuster>();
+                Debug.LogWarning(
+                    "AIGalgamePlayableMotionPlayer is missing AIGalgameHumanoidIKAdjuster. Add it to the character in the scene if IK handles are needed; runtime AddComponent is disabled.",
+                    this);
+                return null;
             }
 
             ikAdjuster.SetAnimator(animator);

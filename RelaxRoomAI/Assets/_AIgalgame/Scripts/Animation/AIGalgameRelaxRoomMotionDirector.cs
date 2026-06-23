@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Animations;
 using UnityEngine.Playables;
+using UnityEngine.Serialization;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -17,7 +18,9 @@ namespace AIgalgame.Motion
         Reply,
         IdleAction,
         Touch,
-        Speaking
+        Speaking,
+        VideoCall,
+        Sleeping
     }
 
     [DefaultExecutionOrder(-110)]
@@ -54,6 +57,18 @@ namespace AIgalgame.Motion
         [SerializeField] private string phonePutDownMotionHint = "K_sitting_down_phone_Reverse";
         [SerializeField] private string phoneTextingLoopMotionHint = "K_Texting";
         [SerializeField] private string phoneTextingStopMotionHint = "K_Texting_stop_hand";
+
+        [Header("Video call")]
+        [SerializeField] private float videoCallStateReleaseSeconds = 3.05f;
+
+        [Header("Sleep")]
+        [SerializeField] private Transform bedSleepPoint;
+        [SerializeField] private Transform seatPoint;
+        [SerializeField] private Transform sleepMoveRoot;
+        [FormerlySerializedAs("bedSleepingStateName")]
+        [SerializeField] private string bedSleepingParameterName = "bed_sleeping";
+        [SerializeField] private bool resetBedSleepingParameterOnExit = true;
+        [SerializeField] private float sleepingNotificationScreenSeconds = 4.5f;
 
         [Header("Playback")]
         [SerializeField] private float fallbackOneShotSeconds = 2.4f;
@@ -102,6 +117,12 @@ namespace AIgalgame.Motion
         private const string TriggerTouchHead = "Touch_Head";
         private const string TriggerTouchChest = "Touch_Chest";
         private const string TriggerTouchHand = "Touch_Hand";
+        private const string TriggerVideoCallBegin = "VideoCall_Begin";
+        private const string TriggerVideoCallEnd = "VideoCall_End";
+        private const string BoolVideoCallActive = "VideoCall_Active";
+        private const string BoolVideoCallAiSpeaking = "VideoCall_AiSpeaking";
+        private const string BoolVideoCallUserSpeaking = "VideoCall_UserSpeaking";
+        private const float MinimumVideoCallPutDownSeconds = 3.05f;
 
         private static readonly string[] ControllerTriggers =
         {
@@ -121,6 +142,8 @@ namespace AIgalgame.Motion
             TriggerTouchHead,
             TriggerTouchChest,
             TriggerTouchHand,
+            TriggerVideoCallBegin,
+            TriggerVideoCallEnd,
         };
 
         private readonly List<LayerRuntime> layers = new();
@@ -138,6 +161,14 @@ namespace AIgalgame.Motion
         private bool replyWaitingPoseScheduled;
         private bool replyWaitingPoseActive;
         private bool replyVoiceEnded;
+        private bool videoCallActive;
+        private bool videoCallEnding;
+        private bool videoCallAiSpeaking;
+        private bool videoCallUserSpeaking;
+        private bool loggedMissingVideoCallAnimatorContract;
+        private Vector3 preSleepPosition;
+        private Quaternion preSleepRotation = Quaternion.identity;
+        private bool hasPreSleepPose;
         private bool loggedMissingPhoneAttachment;
         private int lastPhoneTypingClipIndex = -1;
         private int lastKeyboardTypingClipIndex = -1;
@@ -263,6 +294,12 @@ namespace AIgalgame.Motion
 
         public void BeginReplyRequest()
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                NotifyWhileSleeping();
+                return;
+            }
+
             var continueWithPhone = replyPhoneHeld || replyWaitingPoseActive || replyWaitingPoseScheduled;
             StopManagedRoutine();
             StopDelayedPutDownRoutine();
@@ -303,6 +340,12 @@ namespace AIgalgame.Motion
 
         public void BeginReplyReceived(bool hasDialogue)
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                NotifyWhileSleeping();
+                return;
+            }
+
             if (!hasDialogue)
             {
                 EndReplyWithoutMessage();
@@ -324,6 +367,11 @@ namespace AIgalgame.Motion
 
         public void EndReplyWithoutMessage()
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                return;
+            }
+
             replyVoiceEnded = true;
             gazeDirector?.SetFocus("user", 1.5f);
             if (!replyPhoneHeld)
@@ -344,6 +392,185 @@ namespace AIgalgame.Motion
             }
 
             StartReplyPutDownNow();
+        }
+
+        public void BeginVideoCall()
+        {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                NotifyWhileSleeping();
+                return;
+            }
+
+            StopManagedRoutine();
+            StopDelayedPutDownRoutine();
+            ClearReplyState();
+            videoCallActive = true;
+            videoCallEnding = false;
+            videoCallAiSpeaking = false;
+            videoCallUserSpeaking = false;
+            mode = RelaxRoomMotionMode.VideoCall;
+            busyUntil = Time.time + 3600f;
+            phonePickup?.SetActiveGrip(RelaxRoomPhoneGrip.VideoCallSelfie);
+            EnsurePhoneInHand(RelaxRoomPhoneGrip.VideoCallSelfie);
+            phoneScreen?.ShowActiveScreen(0f, true);
+            gazeDirector?.SetMotionMode(RelaxRoomMotionMode.VideoCall, "video_call");
+            expressionDirector?.SetAvatarState(AIGalgameAvatarState.Idle);
+            expressionDirector?.SetEmotion("shy", 0.52f);
+            ApplyVideoCallAnimatorState(triggerBegin: true, triggerEnd: false);
+        }
+
+        public void EndVideoCall()
+        {
+            if (!videoCallActive && mode != RelaxRoomMotionMode.VideoCall)
+            {
+                return;
+            }
+
+            videoCallActive = false;
+            videoCallEnding = true;
+            videoCallAiSpeaking = false;
+            videoCallUserSpeaking = false;
+            StopManagedRoutine();
+            StopDelayedPutDownRoutine();
+            ApplyVideoCallAnimatorState(triggerBegin: false, triggerEnd: true);
+            StartManagedRoutine(VideoCallStateReleaseRoutine());
+        }
+
+        public void SetVideoCallAiSpeaking(bool active)
+        {
+            if (videoCallEnding)
+            {
+                return;
+            }
+
+            if (!videoCallActive && active)
+            {
+                BeginVideoCall();
+            }
+
+            if (!videoCallActive)
+            {
+                return;
+            }
+
+            videoCallAiSpeaking = active;
+            expressionDirector?.SetAvatarState(active ? AIGalgameAvatarState.Speaking : AIGalgameAvatarState.Idle);
+            expressionDirector?.SetEmotion(active ? "happy" : "shy", active ? 0.72f : 0.52f);
+            gazeDirector?.SetMotionMode(RelaxRoomMotionMode.VideoCall, "video_call");
+            ApplyVideoCallAnimatorState(triggerBegin: false, triggerEnd: false);
+        }
+
+        public void SetVideoCallUserSpeaking(bool active)
+        {
+            if (videoCallEnding)
+            {
+                return;
+            }
+
+            if (!videoCallActive)
+            {
+                return;
+            }
+
+            videoCallUserSpeaking = active;
+            if (active)
+            {
+                expressionDirector?.AddTransient("thinking", 0.34f, 1.2f);
+            }
+
+            gazeDirector?.SetMotionMode(RelaxRoomMotionMode.VideoCall, "video_call");
+            ApplyVideoCallAnimatorState(triggerBegin: false, triggerEnd: false);
+        }
+
+        public void EnterSleep()
+        {
+            ResolveReferences();
+            StopManagedRoutine();
+            StopDelayedPutDownRoutine();
+            ClearReplyState();
+            ClearVideoCallState();
+
+            if (phonePickup != null && phonePickup.enabled)
+            {
+                phonePickup.PlacePhoneOnTable();
+            }
+
+            PrepareAnimatorControllerDriver();
+
+            var root = GetCharacterRoot();
+            if (root != null)
+            {
+                preSleepPosition = root.position;
+                preSleepRotation = root.rotation;
+                hasPreSleepPose = true;
+            }
+
+            MoveCharacterToSleepPoint();
+
+            phoneAttachment?.PlaceOnBedroomSlot(true);
+            phoneScreen?.SetScreenOn(false);
+
+            mode = RelaxRoomMotionMode.Sleeping;
+            busyUntil = float.MaxValue;
+            gazeDirector?.SetMotionMode(mode, "sleeping");
+            expressionDirector?.SetAvatarState(AIGalgameAvatarState.Idle);
+            expressionDirector?.SetEmotion("relaxed", 0.55f);
+
+            if (!SetSleepAnimatorParameters(true))
+            {
+                Debug.LogError($"RelaxRoom sleep requires Animator Controller parameter '{bedSleepingParameterName}'. Add a Bool or Trigger parameter with that name and transition to the bed_sleeping state from the Controller.", this);
+            }
+        }
+
+        public void ExitSleep()
+        {
+            if (mode != RelaxRoomMotionMode.Sleeping)
+            {
+                SetIdle();
+                return;
+            }
+
+            StopManagedRoutine();
+            StopDelayedPutDownRoutine();
+            PrepareAnimatorControllerDriver();
+            phoneScreen?.SetScreenOn(false);
+
+            if (resetBedSleepingParameterOnExit)
+            {
+                SetSleepAnimatorParameters(false);
+            }
+
+            if (!MoveCharacterToSeatPoint() && hasPreSleepPose)
+            {
+                var root = GetCharacterRoot();
+                if (root != null)
+                {
+                    root.SetPositionAndRotation(preSleepPosition, preSleepRotation);
+                }
+            }
+
+            hasPreSleepPose = false;
+
+            SetPhoneVisible(false);
+            mode = RelaxRoomMotionMode.Idle;
+            busyUntil = 0f;
+            gazeDirector?.SetMotionMode(mode, "idle");
+            expressionDirector?.SetAvatarState(AIGalgameAvatarState.Idle);
+        }
+
+        public void NotifyWhileSleeping(float screenSeconds = -1f)
+        {
+            ResolveReferences();
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                phoneAttachment?.PlaceOnBedroomSlot(true);
+            }
+
+            phoneScreen?.ShowMessage(
+                screenSeconds > 0f ? screenSeconds : sleepingNotificationScreenSeconds,
+                false);
+            PlayPhoneNotificationAudioOnly();
         }
 
         public bool PlaySemanticMotion(string motion, AIGalgameAvatarState state, float transitionSeconds)
@@ -401,9 +628,19 @@ namespace AIgalgame.Motion
 
         public void PlayPhoneNotificationSfx()
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                NotifyWhileSleeping();
+                return;
+            }
+
             ResolveReferences();
             phoneScreen?.ShowMessage(4.5f, false);
+            PlayPhoneNotificationAudioOnly();
+        }
 
+        private void PlayPhoneNotificationAudioOnly()
+        {
             var source = EnsurePhoneAudioSource();
             if (source == null || phoneNotificationClip == null)
             {
@@ -464,6 +701,7 @@ namespace AIgalgame.Motion
             StopManagedRoutine();
             StopDelayedPutDownRoutine();
             ClearReplyState();
+            ClearVideoCallState();
             SetPhoneVisible(false);
             mode = RelaxRoomMotionMode.Idle;
             busyUntil = 0f;
@@ -487,6 +725,11 @@ namespace AIgalgame.Motion
 
         public void PlayTouch(string hitArea, string motionHint = "")
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                return;
+            }
+
             StopManagedRoutine();
             SetPhoneVisible(false);
             mode = RelaxRoomMotionMode.Touch;
@@ -541,6 +784,11 @@ namespace AIgalgame.Motion
 
         public void PlayIdleAction(string motion, float requestedDurationSeconds)
         {
+            if (mode == RelaxRoomMotionMode.Sleeping)
+            {
+                return;
+            }
+
             StopManagedRoutine();
             StopDelayedPutDownRoutine();
             ClearReplyState();
@@ -1088,6 +1336,28 @@ namespace AIgalgame.Motion
             PlaySingle("Sitting Talking", "", loop: true, RelaxRoomMotionMode.Speaking);
         }
 
+        private IEnumerator VideoCallStateReleaseRoutine()
+        {
+            expressionDirector?.SetAvatarState(AIGalgameAvatarState.Idle);
+            expressionDirector?.SetEmotion("calm", 0.45f, 1.2f);
+            yield return new WaitForSeconds(ResolveVideoCallReleaseSeconds());
+
+            ClearVideoCallState();
+            if (mode == RelaxRoomMotionMode.VideoCall)
+            {
+                SetIdle();
+            }
+        }
+
+        private float ResolveVideoCallReleaseSeconds()
+        {
+            var configured = Mathf.Max(0f, videoCallStateReleaseSeconds);
+            var putDownClip = GetPhonePutDownClip(ReplyFolderHint);
+            var clipSeconds = putDownClip != null ? putDownClip.length : 0f;
+            var minimum = Mathf.Max(MinimumVideoCallPutDownSeconds, clipSeconds);
+            return Mathf.Clamp(Mathf.Max(configured, minimum), 0.1f, 8f);
+        }
+
         private float PlayPhonePickupMotion(string folderHint, RelaxRoomMotionMode nextMode)
         {
             var fallbackDuration = SegmentDuration(GetClip("Texting", folderHint), textingPickupRange);
@@ -1497,6 +1767,97 @@ namespace AIgalgame.Motion
             }
         }
 
+        private bool SetSleepAnimatorParameters(bool sleeping)
+        {
+            if (!CanUseAnimatorController())
+            {
+                return false;
+            }
+
+            PrepareAnimatorControllerDriver();
+            if (sleeping)
+            {
+                ResetControllerTriggers();
+            }
+
+            return SetAnimatorParameterValue(
+                bedSleepingParameterName,
+                sleeping,
+                logMissing: true);
+        }
+
+        private void PrepareAnimatorControllerDriver()
+        {
+            ConfigureAnimatorRootMotion();
+            motionPlayer?.ConfigureForAnimatorControllerDriver();
+            motionPlayer?.IkAdjuster?.ResetAllWeights();
+            StopGraph();
+        }
+
+        private bool SetAnimatorParameterValue(string parameterName, bool active, bool logMissing)
+        {
+            if (animator == null || string.IsNullOrWhiteSpace(parameterName))
+            {
+                return false;
+            }
+
+            if (!TryGetControllerParameter(parameterName, out var parameter))
+            {
+                if (logMissing)
+                {
+                    Debug.LogError($"Animator Controller is missing parameter '{parameterName}'.", this);
+                }
+
+                return false;
+            }
+
+            switch (parameter.type)
+            {
+                case AnimatorControllerParameterType.Bool:
+                    animator.SetBool(parameterName, active);
+                    break;
+                case AnimatorControllerParameterType.Trigger:
+                    animator.ResetTrigger(parameterName);
+                    if (active)
+                    {
+                        animator.SetTrigger(parameterName);
+                    }
+                    break;
+                case AnimatorControllerParameterType.Float:
+                    animator.SetFloat(parameterName, active ? 1f : 0f);
+                    break;
+                case AnimatorControllerParameterType.Int:
+                    animator.SetInteger(parameterName, active ? 1 : 0);
+                    break;
+                default:
+                    return false;
+            }
+
+            Debug.Log($"RelaxRoom set Animator parameter '{parameterName}' ({parameter.type}) = {(active ? "on" : "off")}.", this);
+            return true;
+        }
+
+        private bool TryGetControllerParameter(string parameterName, out AnimatorControllerParameter parameter)
+        {
+            parameter = null;
+            if (animator == null || string.IsNullOrWhiteSpace(parameterName))
+            {
+                return false;
+            }
+
+            var parameters = animator.parameters;
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                if (parameters[i].name == parameterName)
+                {
+                    parameter = parameters[i];
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private bool TryTriggerController(string triggerName)
         {
             if (!CanUseAnimatorController())
@@ -1511,6 +1872,18 @@ namespace AIgalgame.Motion
 
             motionPlayer?.ConfigureForAnimatorControllerDriver();
             StopGraph();
+            ResetControllerTriggers();
+            animator.SetTrigger(triggerName);
+            return true;
+        }
+
+        private void ResetControllerTriggers()
+        {
+            if (animator == null)
+            {
+                return;
+            }
+
             for (var i = 0; i < ControllerTriggers.Length; i++)
             {
                 if (HasControllerTrigger(ControllerTriggers[i]))
@@ -1518,14 +1891,30 @@ namespace AIgalgame.Motion
                     animator.ResetTrigger(ControllerTriggers[i]);
                 }
             }
-
-            animator.SetTrigger(triggerName);
-            return true;
         }
 
         private bool HasControllerTrigger(string triggerName)
         {
-            if (animator == null)
+            return HasControllerParameter(triggerName, AnimatorControllerParameterType.Trigger);
+        }
+
+        private bool TrySetControllerBool(string parameterName, bool value)
+        {
+            if (!CanUseAnimatorController() ||
+                !HasControllerParameter(parameterName, AnimatorControllerParameterType.Bool))
+            {
+                return false;
+            }
+
+            motionPlayer?.ConfigureForAnimatorControllerDriver();
+            StopGraph();
+            animator.SetBool(parameterName, value);
+            return true;
+        }
+
+        private bool HasControllerParameter(string parameterName, AnimatorControllerParameterType parameterType)
+        {
+            if (animator == null || string.IsNullOrWhiteSpace(parameterName))
             {
                 return false;
             }
@@ -1533,14 +1922,41 @@ namespace AIgalgame.Motion
             var parameters = animator.parameters;
             for (var i = 0; i < parameters.Length; i++)
             {
-                if (parameters[i].type == AnimatorControllerParameterType.Trigger &&
-                    parameters[i].name == triggerName)
+                if (parameters[i].type == parameterType &&
+                    parameters[i].name == parameterName)
                 {
                     return true;
                 }
             }
 
             return false;
+        }
+
+        private void ApplyVideoCallAnimatorState(bool triggerBegin, bool triggerEnd)
+        {
+            var wroteParameter = false;
+            wroteParameter |= TrySetControllerBool(BoolVideoCallActive, videoCallActive);
+            wroteParameter |= TrySetControllerBool(BoolVideoCallAiSpeaking, videoCallAiSpeaking);
+            wroteParameter |= TrySetControllerBool(BoolVideoCallUserSpeaking, videoCallUserSpeaking);
+
+            if (triggerBegin)
+            {
+                wroteParameter |= TryTriggerController(TriggerVideoCallBegin);
+            }
+
+            if (triggerEnd)
+            {
+                wroteParameter |= TryTriggerController(TriggerVideoCallEnd);
+            }
+
+            if (!wroteParameter && CanUseAnimatorController() && !loggedMissingVideoCallAnimatorContract)
+            {
+                loggedMissingVideoCallAnimatorContract = true;
+                Debug.LogWarning(
+                    "Animator Controller is missing the video-call contract parameters: " +
+                    "VideoCall_Begin, VideoCall_End, VideoCall_Active, VideoCall_AiSpeaking, VideoCall_UserSpeaking.",
+                    this);
+            }
         }
 
         private void StopManagedRoutine()
@@ -1571,6 +1987,15 @@ namespace AIgalgame.Motion
             replyWaitingPoseScheduled = false;
             replyWaitingPoseActive = false;
             replyVoiceEnded = false;
+        }
+
+        private void ClearVideoCallState()
+        {
+            videoCallActive = false;
+            videoCallEnding = false;
+            videoCallAiSpeaking = false;
+            videoCallUserSpeaking = false;
+            ApplyVideoCallAnimatorState(triggerBegin: false, triggerEnd: false);
         }
 
         private static bool IsPhoneIdleActionKey(string key)
@@ -1648,6 +2073,103 @@ namespace AIgalgame.Motion
             }
 
             phoneAttachment?.PlaceOnTable();
+        }
+
+        private Transform GetCharacterRoot()
+        {
+            ResolveReferences();
+            if (sleepMoveRoot != null)
+            {
+                return sleepMoveRoot;
+            }
+
+            if (animator != null)
+            {
+                return animator.transform.IsChildOf(transform) ? transform : animator.transform;
+            }
+
+            return transform;
+        }
+
+        private Transform ResolveBedSleepPoint()
+        {
+            if (bedSleepPoint != null)
+            {
+                return bedSleepPoint;
+            }
+
+            bedSleepPoint = FindSceneTransformByName(
+                "\u5e8a1",
+                "Bed1",
+                "bed1",
+                "Bed_1",
+                "BedSleepPoint",
+                "Bed_SleepPoint",
+                "bed_sleep_point");
+            return bedSleepPoint;
+        }
+
+        private Transform ResolveSeatPoint()
+        {
+            if (seatPoint != null)
+            {
+                return seatPoint;
+            }
+
+            seatPoint = FindSceneTransformByName(
+                "seatpoint",
+                "SeatPoint",
+                "Seat_Point",
+                "SittingPoint",
+                "DeskSeatPoint");
+            return seatPoint;
+        }
+
+        private bool MoveCharacterToSleepPoint()
+        {
+            var sleepPoint = ResolveBedSleepPoint();
+            if (sleepPoint == null)
+            {
+                Debug.LogWarning("RelaxRoom sleep point is not assigned and no scene transform named BedSleepPoint/Bed1/床1 was found. Character position was not changed.", this);
+                return false;
+            }
+
+            return MoveCharacterTo(sleepPoint);
+        }
+
+        private bool MoveCharacterToSeatPoint()
+        {
+            var targetSeatPoint = ResolveSeatPoint();
+            if (targetSeatPoint == null)
+            {
+                Debug.LogWarning("RelaxRoom seat point is not assigned and no scene transform named seatpoint was found. Character parent was not changed.", this);
+                return false;
+            }
+
+            return MoveCharacterTo(targetSeatPoint);
+        }
+
+        private bool MoveCharacterTo(Transform target)
+        {
+            var root = GetCharacterRoot();
+            if (root == null || target == null)
+            {
+                return false;
+            }
+
+            if (target == root || target.IsChildOf(root))
+            {
+                Debug.LogWarning($"RelaxRoom cannot parent character root '{root.name}' under '{target.name}' because the target is inside the character hierarchy.", this);
+                return false;
+            }
+
+            var localScale = root.localScale;
+            root.SetParent(target, false);
+            root.localPosition = Vector3.zero;
+            root.localRotation = Quaternion.identity;
+            root.localScale = localScale;
+            Debug.Log($"RelaxRoom parented character root '{root.name}' under '{target.name}' and reset local position/rotation.", this);
+            return true;
         }
 
         private void EnsurePhoneInHand(RelaxRoomPhoneGrip grip)
@@ -2170,6 +2692,13 @@ namespace AIgalgame.Motion
             }
 
             return null;
+        }
+
+        private static float RandomRange(Vector2 range, float fallbackMin, float fallbackMax)
+        {
+            var min = range.x > 0f ? range.x : fallbackMin;
+            var max = range.y >= min ? range.y : fallbackMax;
+            return UnityEngine.Random.Range(min, max);
         }
 
         private static bool IsIdleKey(string key)

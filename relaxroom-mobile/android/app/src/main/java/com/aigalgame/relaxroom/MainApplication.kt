@@ -18,7 +18,7 @@ class MainApplication : Application(), ReactApplication {
       object : DefaultReactNativeHost(this) {
         override fun getPackages(): List<ReactPackage> =
             PackageList(this).packages.apply {
-              // Autolinked packages only.
+              add(RelaxRoomCameraPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

@@ -15,7 +15,7 @@ namespace AIgalgame.EditorTools
     {
         private const string ExportRelativePath = "../relaxroom-mobile/unity/builds/android";
         private const string ArtifactReportRelativePath = "../relaxroom-mobile/unity/build-artifacts.json";
-        private const string Scene01Path = "Assets/Brick Project Studio/Apartment Kit/Scenes/Scene_01.unity";
+        private const string Scene01Path = "Assets/_AIgalgame/Scenes/Scene_01.unity";
 
         private const string SherpaRuntimeAarRelativePath =
             "../relaxroom-mobile/android/app/libs/sherpa-onnx-static-link-onnxruntime-1.13.2.aar";

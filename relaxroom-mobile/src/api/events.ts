@@ -29,6 +29,28 @@ export async function postUserMessage(
   });
 }
 
+export async function postSleepingUserMessage(
+  text: string,
+): Promise<BackendEventResponse> {
+  const session = getSession();
+  return apiRequest<BackendEventResponse>('/api/events', {
+    method: 'POST',
+    body: JSON.stringify({
+      event_type: 'sleep_user_message',
+      event_id: `rn_sleep_${Date.now()}`,
+      user_id: session.userId,
+      character_id: session.characterId,
+      session_id: session.sessionId,
+      payload: {text},
+      client_context: {
+        source: 'RelaxRoomMobile',
+        avatar_state: 'sleeping',
+        local_time: new Date().toISOString(),
+      },
+    }),
+  });
+}
+
 export async function postQuickReply(reply: LazyReply, keyReply: boolean) {
   return postUserMessage(reply.text, reply.reply_id ?? '', keyReply);
 }

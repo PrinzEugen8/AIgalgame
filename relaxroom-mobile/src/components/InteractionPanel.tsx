@@ -18,10 +18,12 @@ type Props = {
   normalReplies: LazyReply[];
   keyReplies: LazyReply[];
   draft: string;
+  videoCallActive: boolean;
   onDraftChange: (text: string) => void;
   onSend: (text: string) => void;
   onQuickReplySelect: (text: string) => void;
   onPhone: () => void;
+  onVideoCall: () => void;
 };
 
 export function InteractionPanel({
@@ -33,10 +35,12 @@ export function InteractionPanel({
   normalReplies,
   keyReplies,
   draft,
+  videoCallActive,
   onDraftChange,
   onSend,
   onQuickReplySelect,
   onPhone,
+  onVideoCall,
 }: Props) {
   const [voiceMode, setVoiceMode] = useState(false);
   const [imagePreviewUri, setImagePreviewUri] = useState<string | null>(null);
@@ -128,11 +132,13 @@ export function InteractionPanel({
 
         <FunctionButtonRow
           voiceMode={voiceMode}
+          videoCallActive={videoCallActive}
           onToggleVoice={() => setVoiceMode(current => !current)}
           onPickImage={() => {
             void handlePickImage();
           }}
           onPhone={onPhone}
+          onVideoCall={onVideoCall}
         />
       </View>
     </View>

@@ -43,7 +43,6 @@ namespace AIgalgame.Motion
             StopSplashHeartbeat();
             SceneManager.sceneLoaded += OnSceneLoaded;
             Log("process_start");
-            CreateFirstUpdateProbe();
         }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -138,22 +137,6 @@ namespace AIgalgame.Motion
         {
             _beforeSceneLoadReached = true;
             _splashHeartbeatThread = null;
-        }
-
-        private static void CreateFirstUpdateProbe()
-        {
-            var probe = new GameObject("RelaxRoomStartupFirstUpdateProbe");
-            probe.hideFlags = HideFlags.HideAndDontSave;
-            probe.AddComponent<StartupFirstUpdateProbe>();
-        }
-
-        private sealed class StartupFirstUpdateProbe : MonoBehaviour
-        {
-            private void Update()
-            {
-                Log("first_update");
-                Destroy(gameObject);
-            }
         }
 
         private static void ForwardMilestone(string stage, int elapsedMs, string detail)

@@ -6,6 +6,7 @@ const kinds = [
   { id: "search", title: "联网搜索" },
   { id: "weather", title: "天气服务" },
   { id: "image", title: "图片生成" },
+  { id: "realtime", title: "视频通话 Realtime" },
 ];
 
 const state = {

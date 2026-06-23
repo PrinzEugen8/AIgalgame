@@ -1354,12 +1354,16 @@ namespace AIgalgame.Motion
 
             if (vrmInstance != null && expressionDirector == null)
             {
-                expressionDirector = gameObject.AddComponent<AIGalgameRelaxRoomExpressionDirector>();
+                Debug.LogError(
+                    "AIGalgameChatdollController is missing AIGalgameRelaxRoomExpressionDirector. Add it to the character in the scene so it is editable in the Inspector.",
+                    this);
             }
 
             if (vrmInstance != null && gazeDirector == null)
             {
-                gazeDirector = gameObject.AddComponent<AIGalgameRelaxRoomGazeDirector>();
+                Debug.LogError(
+                    "AIGalgameChatdollController is missing AIGalgameRelaxRoomGazeDirector. Add it to the character in the scene so it is editable in the Inspector.",
+                    this);
             }
 
             if (motionPlayer != null && animator != null)

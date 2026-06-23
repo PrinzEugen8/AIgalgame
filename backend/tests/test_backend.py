@@ -3020,6 +3020,52 @@ def test_app_opened_without_proactive_event_returns_no_reply() -> None:
         assert result.event_type == "no_reply"
 
 
+def test_sleep_user_message_records_context_without_reply() -> None:
+    suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
+    user_id = f"sleep_context_user_{suffix}"
+    session_id = f"sleep_context_session_{suffix}"
+    event_id = f"sleep_context_event_{suffix}"
+    text = "她睡着的时候，我把明天早餐想吃三明治这件事留一下。"
+
+    with SessionLocal() as session:
+        ensure_seed(session, user_id=user_id, character_id="atri")
+        user = session.get(User, user_id)
+        assert user is not None
+        user.story_completed = True
+        session.commit()
+
+    payload = client.post(
+        "/api/events",
+        json={
+            "event_type": "sleep_user_message",
+            "event_id": event_id,
+            "user_id": user_id,
+            "character_id": "atri",
+            "session_id": session_id,
+            "payload": {"text": text},
+            "client_context": {"source": "test", "avatar_state": "sleeping"},
+        },
+    ).json()
+
+    assert payload["event_type"] == "no_reply"
+    assert payload["payload"]["reply_mode"] == "sleep_recorded"
+
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Message).where(
+                Message.user_id == user_id,
+                Message.character_id == "atri",
+                Message.session_id == session_id,
+                Message.source_event_id == event_id,
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].sender_type == "user"
+        assert rows[0].content == text
+        assert rows[0].message_mode == "sleep_context"
+        assert rows[0].source == "sleep_user_message"
+
+
 def test_location_upload_reads_existing_weather_without_qweather_refresh() -> None:
     suffix = str(datetime.now(timezone.utc).timestamp()).replace(".", "")
     user_id = f"weather_location_user_{suffix}"

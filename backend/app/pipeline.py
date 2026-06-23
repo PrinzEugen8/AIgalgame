@@ -2473,11 +2473,11 @@ def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
     if user is None or character is None:
         raise ProviderError("User or character is not initialized")
     local_time = _extract_local_time(event)
-    if local_time is not None and event.event_type in {"app_opened", "user_message", "notification_opened", "widget_opened"}:
+    if local_time is not None and event.event_type in {"app_opened", "user_message", "sleep_user_message", "notification_opened", "widget_opened"}:
         mark_interruption(session, user_id=event.user_id, session_id=event.session_id, local_time=local_time)
     if not user.story_completed and event.event_type in {"app_opened", "option_selected"}:
         return _story_response(session, event, user, character)
-    if not user.story_completed and event.event_type == "user_message":
+    if not user.story_completed and event.event_type in {"user_message", "sleep_user_message"}:
         user.story_completed = True
     if event.event_type == "app_opened":
         return _no_reply(event.session_id, pace_reason="普通打开应用且没有明确主动事件，避免反复硬问候。")
@@ -2553,6 +2553,45 @@ def _handle_event_inner(session: Session, event: EventIn) -> AppEventOut:
             ):
                 session.commit()
             output = _event("dialogue", payload.model_dump(), event.session_id)
+            reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
+            return output
+    if event.event_type == "sleep_user_message":
+        text = str(event.payload.get("text") or "")
+        if not text:
+            raise ProviderError("sleep_user_message payload.text is required")
+        request_fingerprint = _event_request_fingerprint(event, text)
+        with diagnostic_span(
+            "reply_trace",
+            feature="回复模块",
+            stage=event.event_type,
+            purpose="Record user input while avatar is sleeping",
+            summary=f"{event.event_type}: {text[:80]}",
+            input={"event_type": event.event_type, "event_id": event.event_id, "session_id": event.session_id, "input_text": text},
+        ) as reply_span:
+            with diagnostic_span(
+                "reply_stage",
+                feature="回复模块",
+                stage="save_user_message",
+                purpose="Save sleep-time user input without immediate reply",
+                summary=f"{event.event_type}: save user input",
+                input={"text": text, "session_id": event.session_id, "request_fingerprint": request_fingerprint},
+            ):
+                _save_message(
+                    session,
+                    event=event,
+                    sender_type="user",
+                    sender_id=event.user_id,
+                    content=text,
+                    mode="sleep_context",
+                    source=event.event_type,
+                    request_fingerprint=request_fingerprint,
+                )
+            session.commit()
+            output = _no_reply(
+                event.session_id,
+                reply_mode="sleep_recorded",
+                pace_reason="角色睡觉中，用户消息已记录为后续主动消息和回复上下文。",
+            )
             reply_span.add(output={"event_type": output.event_type, "payload": output.payload})
             return output
     if event.event_type in {"user_message", "option_selected"}:

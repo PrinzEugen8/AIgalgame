@@ -64,6 +64,7 @@ namespace AIgalgame.Motion
         private AIGalgameRelaxRoomGazeDirector gazeDirector;
         private AIGalgameRelaxRoomTouchController touchController;
         private AIGalgameRelaxRoomRnAsrController asrController;
+        private RelaxRoomCameraDirector cameraDirector;
         private AudioSource audioSource;
         private string backendBaseUrl;
         private bool readySent;
@@ -86,13 +87,12 @@ namespace AIgalgame.Motion
             touchController = targetTouchController;
             audioSource = targetAudioSource;
 
-            asrController = GetComponent<AIGalgameRelaxRoomRnAsrController>();
-            if (asrController == null)
-            {
-                asrController = gameObject.AddComponent<AIGalgameRelaxRoomRnAsrController>();
-            }
+            asrController = ResolveSceneComponent<AIGalgameRelaxRoomRnAsrController>(
+                "Add AIGalgameRelaxRoomRnAsrController to the RelaxRoomBridge scene object.");
+            asrController?.BindBridge(this);
 
-            asrController.BindBridge(this);
+            cameraDirector = ResolveSceneComponent<RelaxRoomCameraDirector>(
+                "Add RelaxRoomCameraDirector to the RelaxRoomBridge scene object.");
 
             backendBaseUrl = defaultBackendBaseUrl;
             touchController?.ConfigureBackend(defaultBackendBaseUrl, defaultUserId, defaultCharacterId, defaultAppearanceId);
@@ -234,6 +234,54 @@ namespace AIgalgame.Motion
                     break;
                 case "motion.phone_notification":
                     motionDirector?.PlayPhoneNotificationSfx();
+                    break;
+                case "sleep.enter":
+                    motionDirector?.EnterSleep();
+                    EmitSleepState("sleeping");
+                    break;
+                case "sleep.exit":
+                    motionDirector?.ExitSleep();
+                    EmitSleepState("idle");
+                    break;
+                case "sleep.notify":
+                    motionDirector?.NotifyWhileSleeping(envelope.duration_seconds);
+                    break;
+                case "camera.next":
+                    EnsureCameraDirector()?.NextCamera();
+                    EmitCameraState();
+                    break;
+                case "camera.prev":
+                    EnsureCameraDirector()?.PreviousCamera();
+                    EmitCameraState();
+                    break;
+                case "camera.set":
+                    EnsureCameraDirector()?.SetCamera(envelope.text);
+                    EmitCameraState();
+                    break;
+                case "video_call.begin":
+                    EnsureCameraDirector()?.BeginVideoCallCamera();
+                    motionDirector?.BeginVideoCall();
+                    EmitCameraState();
+                    break;
+                case "video_call.end":
+                    motionDirector?.EndVideoCall();
+                    EnsureCameraDirector()?.EndVideoCallCamera();
+                    EmitCameraState();
+                    break;
+                case "video_call.ai_speaking_start":
+                    motionDirector?.SetVideoCallAiSpeaking(true);
+                    break;
+                case "video_call.ai_speaking_stop":
+                    motionDirector?.SetVideoCallAiSpeaking(false);
+                    break;
+                case "video_call.user_speaking_start":
+                    motionDirector?.SetVideoCallUserSpeaking(true);
+                    break;
+                case "video_call.user_speaking_stop":
+                    motionDirector?.SetVideoCallUserSpeaking(false);
+                    break;
+                case "video_call.expression":
+                    expressionDirector?.SetEmotion(envelope.emotion, envelope.intensity, envelope.hold_seconds);
                     break;
                 case "expression.set":
                     expressionDirector?.SetEmotion(envelope.emotion, envelope.intensity, envelope.hold_seconds);
@@ -421,6 +469,55 @@ namespace AIgalgame.Motion
         private void Emit(BridgeEvent bridgeEvent)
         {
             ReactNativeMessenger.Send(JsonUtility.ToJson(bridgeEvent));
+        }
+
+        private RelaxRoomCameraDirector EnsureCameraDirector()
+        {
+            if (cameraDirector == null)
+            {
+                cameraDirector = ResolveSceneComponent<RelaxRoomCameraDirector>(
+                    "Add RelaxRoomCameraDirector to the RelaxRoomBridge scene object.");
+            }
+
+            return cameraDirector;
+        }
+
+        private T ResolveSceneComponent<T>(string setupHint) where T : Component
+        {
+            var component = GetComponent<T>();
+            if (component == null)
+            {
+                component = UnityEngine.Object.FindFirstObjectByType<T>(FindObjectsInactive.Include);
+            }
+
+            if (component != null)
+            {
+                return component;
+            }
+
+            Debug.LogError(
+                $"RelaxRoom scene setup is missing {typeof(T).Name}. {setupHint} Runtime AddComponent is disabled.",
+                this);
+            return null;
+        }
+
+        private void EmitSleepState(string state)
+        {
+            Emit(new BridgeEvent
+            {
+                evt = "sleep.changed",
+                state = state ?? ""
+            });
+        }
+
+        private void EmitCameraState()
+        {
+            var director = EnsureCameraDirector();
+            Emit(new BridgeEvent
+            {
+                evt = "camera.changed",
+                state = director != null ? director.CurrentCameraName : ""
+            });
         }
 
         private void EmitError(string message, string id)

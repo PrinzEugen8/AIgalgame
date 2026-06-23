@@ -130,6 +130,36 @@ export type SessionConfig = {
   appearanceId: string;
 };
 
+export type RealtimeCallConfig = {
+  ok?: boolean;
+  configured?: boolean;
+  provider_id?: string;
+  provider_source?: string;
+  model?: string;
+  voice?: string;
+  reason?: string;
+  session?: Record<string, unknown>;
+  transport?: {
+    preferred?: string;
+    websocket_endpoint?: string;
+    audio_event?: string;
+    image_event?: string;
+  };
+  audio?: {
+    input_format?: string;
+    input_sample_rate?: number;
+    output_format?: string;
+    output_sample_rate?: number;
+  };
+  vision?: {
+    image_input?: boolean;
+    active_frame_interval_ms?: number;
+    idle_frame_interval_ms?: number;
+    max_long_edge?: number;
+    jpeg_quality?: number;
+  };
+};
+
 export type ChatMessage = {
   id: string;
   role: 'user' | 'companion' | 'system';
